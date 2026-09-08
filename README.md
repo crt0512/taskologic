@@ -8,9 +8,9 @@ Idea in the end is that you SSH or Telnet into your Taskologic Server where Task
 
 ## What the fuck does a receipt printer and a barcode scanner have to do with kanbanana???
 
-Support for those were added because some people tend to hoard them (aka. me, hi!!!) realizing only after the fact that they actually have no real usecase for them, 
+Support for those were added because some people tend to hoard them (aka. me, hi!!!) realizing only after the fact that they actually have no real usecase for them... 
 
-with this give meaning to the endless hoarding and allow for a bit more dopamine when completing tasks, eg like this :
+with this the goal of giving meaning to the endless hoarding is finally met and it allows for a bit more dopamine when completing tasks, eg like this :
 
 Print the task, scan to start, scan to finish, be less depresso expresso.
 
