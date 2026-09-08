@@ -12,3 +12,4 @@ Cargo.lock
 *.DS_Store
 .vscode
 /TODO.md
+/external
