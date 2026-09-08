@@ -6,7 +6,7 @@ Idea in the end is that you SSH or Telnet into your Taskologic Server where Task
 
 ![Screenshot](assets/README-1.png)
 
-## What the fuck does a receipt printer and a barcode scanner have to do with kanbanana???
+## Why can it talk with receipt printers and barcode scanners?
 
 Support for those were added because some people tend to hoard them (aka. me, hi!!!) realizing only after the fact that they actually have no real usecase for them... 
 
@@ -22,6 +22,26 @@ Print the task, scan to start, scan to finish, be less depresso expresso.
 - Optionally :
   - Receipt Printer
   - Barcode Scanner
+
+## how to install this stuff
+This assumes you are on debian 13 and are currently logged into an user with sudo rights.
+if you simply want to test it install rustup toolchain as described below then run `scrips/dev.sh`
+
+1. Install rustup toolchain :
+```bash
+sudo apt install rustup -y
+rustup toolchain install stable
+```
+2. Clone, build, install, setup
+```bash
+git clone https://github.com/crt0512/taskologic.git && cd taskologic
+make
+make install
+make setup
+```
+3. Sign in with the user created during make setup or add your user to the taskologic group before running `taskologic`
+   1. If you get an error about not being able to access to the socket sign out and back in.
+
 
 ## How it is put together
 
@@ -72,6 +92,10 @@ I believe in that if LLM's were used for a project it should be clearly stated w
 - All code comments have been fully sanetize using Large Language Models, I write literal garbage comments, very little if at all, curse in Swiss German through out all of my code and insult peoples mothers while writing it.
 - Obviously bugs have had LLM's help along many times but the code was inspected and should mostly be decent. (except some of the printing related stuff that i was debugging at 3am)
 - Tests were fully written by an LLM as I was way too lazy to write them myself for this small project, only inspected quicly
+
+## Receipt Printer / Barcode Usage example picture
+
+![alt text](assets/README-2.png)
 
 ## Plans
 
