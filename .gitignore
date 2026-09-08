@@ -10,3 +10,4 @@ Cargo.lock
 *.db-shm
 *.sock
 *.DS_Store
+.vscode
