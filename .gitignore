@@ -11,3 +11,4 @@ Cargo.lock
 *.sock
 *.DS_Store
 .vscode
+/TODO.md
