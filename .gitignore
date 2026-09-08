@@ -1,0 +1,12 @@
+/target
+/dumping-ground
+/scratchpad
+/dev
+/pisspond
+/olesatovh
+Cargo.lock
+*.db
+*.db-wal
+*.db-shm
+*.sock
+*.DS_Store

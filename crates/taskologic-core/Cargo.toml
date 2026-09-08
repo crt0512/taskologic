@@ -1,0 +1,21 @@
+[package]
+name = "taskologic-core"
+description = "Taskologic's well... logic and brain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+thiserror.workspace = true
+
+[features]
+# Exposes the fixture builders in board::test_support and task::test_support
+# to other crates' tests.
+test-support = []
+
+[lints]
+workspace = true

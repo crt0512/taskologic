@@ -1,0 +1,25 @@
+[package]
+name = "taskologic-print"
+description = "receipt printer and barcode rendering for taskologic clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+taskologic-core.workspace = true
+serde.workspace = true
+barcoders.workspace = true
+qrcode.workspace = true
+datamatrix.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+thiserror.workspace = true
+font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
+
+[dev-dependencies]
+taskologic-core = { workspace = true, features = ["test-support"] }
+toml.workspace = true
+
+[lints]
+workspace = true

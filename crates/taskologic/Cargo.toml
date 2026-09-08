@@ -1,0 +1,38 @@
+[package]
+name = "taskologic"
+description = "Taskologic's tui client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "taskologic"
+path = "src/main.rs"
+
+[dependencies]
+taskologic-core.workspace = true
+taskologic-proto.workspace = true
+taskologic-print.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+rat-widget.workspace = true
+rat-focus.workspace = true
+rat-event.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+taskologic-core = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true
