@@ -13,6 +13,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use crate::board::Board;
+use crate::offset::Offset;
 use crate::task::{Task, TaskDraft};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +43,14 @@ pub struct RepeatSpec {
     /// Local time of day the copy is created.
     pub at: NaiveTime,
     pub tz: Tz,
+    /// What the copy's start date is, counted forward from the moment the
+    /// repetition fires. None leaves the copy without one.
+    #[serde(default)]
+    pub start_rule: Option<Offset>,
+    /// The same for its due date. Repetitions written before 0.1.11 carry
+    /// neither, which is what they did anyway: the copy arrived undated.
+    #[serde(default)]
+    pub due_rule: Option<Offset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -167,15 +176,27 @@ fn local_to_utc(tz: Tz, naive: NaiveDateTime) -> DateTime<Utc> {
 }
 
 /// The draft for the next instance of a repeating task. Title, description,
-/// reminder override, assignees, checklist and repetition carry over.
-/// Dependencies, due date and the finished state do not. Assignees who left the board are dropped,
-/// and the checklist starts unticked.
-pub fn next_instance(task: &Task, board: &Board) -> TaskDraft {
+/// reminder overrides, assignees, checklist and repetition carry over.
+/// Dependencies and the finished state do not. Assignees who left the board
+/// are dropped, and the checklist starts unticked.
+///
+/// The start and due dates are worked out from `fired_at` by the repetition's
+/// own rules, so a daily task can arrive dated for that day rather than
+/// arriving blank the way it did before 0.1.11.
+pub fn next_instance(task: &Task, board: &Board, fired_at: DateTime<Utc>) -> TaskDraft {
+    let rules = task.repeat.as_ref();
+    let start_at = rules.and_then(|r| r.start_rule).and_then(|o| o.after(fired_at));
+    let due_at = rules.and_then(|r| r.due_rule).and_then(|o| o.after(fired_at));
     TaskDraft {
         title: task.title.clone(),
         description: task.description.clone(),
-        due_at: None,
-        reminder_minutes: task.reminder_minutes,
+        // A rule that would date the copy as due before it starts is a
+        // broken rule, not a broken task: the copy keeps its start date and
+        // goes out undated rather than being refused at save time.
+        start_at,
+        due_at: due_at.filter(|d| start_at.is_none_or(|s| s <= *d)),
+        reminder_start_minutes: task.reminder_start_minutes,
+        reminder_due_minutes: task.reminder_due_minutes,
         assignees: task
             .assignees
             .iter()
@@ -208,6 +229,8 @@ mod tests {
             rule,
             at: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
             tz: chrono_tz::Europe::Berlin,
+            start_rule: None,
+            due_rule: None,
         }
     }
 
@@ -317,6 +340,8 @@ mod tests {
             },
             at: NaiveTime::from_hms_opt(2, 30, 0).unwrap(),
             tz: chrono_tz::Europe::Berlin,
+            start_rule: None,
+            due_rule: None,
         };
         assert_eq!(
             s.next_fire_after(utc("2026-03-28T00:00:00Z")),
@@ -359,11 +384,73 @@ mod tests {
         task.depends_on = vec![crate::ids::TaskId(5)];
         task.due_at = Some(utc("2026-09-05T00:00:00Z"));
         task.repeat = Some(spec(Repeat::DayOfMonth { day: 1 }));
-        let draft = next_instance(&task, &board);
+        let draft = next_instance(&task, &board, utc("2026-10-01T06:00:00Z"));
         assert_eq!(draft.assignees, vec![1, 2]);
         assert!(draft.depends_on.is_empty());
-        assert_eq!(draft.due_at, None);
+        assert_eq!(draft.due_at, None, "no rule, so the copy arrives undated");
+        assert_eq!(draft.start_at, None);
         assert_eq!(draft.repeat, task.repeat);
         assert_eq!(draft.title, task.title);
+    }
+
+    #[test]
+    fn the_copy_is_dated_from_the_moment_the_repetition_fired() {
+        use crate::board::test_support::board_with_members;
+        use crate::offset::{Offset, OffsetUnit};
+        use crate::task::test_support::task_on;
+        let board = board_with_members(1, &[1]);
+        let mut task = task_on(&board, 1);
+        let fired = utc("2026-10-01T06:00:00Z");
+        let mut s = spec(Repeat::DayOfMonth { day: 1 });
+        s.start_rule = Some(Offset {
+            amount: 2,
+            unit: OffsetUnit::Hours,
+        });
+        s.due_rule = Some(Offset {
+            amount: 1,
+            unit: OffsetUnit::Days,
+        });
+        task.repeat = Some(s);
+
+        let draft = next_instance(&task, &board, fired);
+        assert_eq!(draft.start_at, Some(utc("2026-10-01T08:00:00Z")));
+        assert_eq!(draft.due_at, Some(utc("2026-10-02T06:00:00Z")));
+
+        // One rule without the other dates only that end of the task.
+        let mut only_due = task.clone();
+        only_due.repeat.as_mut().unwrap().start_rule = None;
+        let draft = next_instance(&only_due, &board, fired);
+        assert_eq!(draft.start_at, None);
+        assert_eq!(draft.due_at, Some(utc("2026-10-02T06:00:00Z")));
+    }
+
+    #[test]
+    fn a_rule_that_would_land_due_before_start_drops_the_due_date() {
+        use crate::board::test_support::board_with_members;
+        use crate::offset::{Offset, OffsetUnit};
+        use crate::task::test_support::task_on;
+        let board = board_with_members(1, &[1]);
+        let mut task = task_on(&board, 1);
+        let mut s = spec(Repeat::DayOfMonth { day: 1 });
+        s.start_rule = Some(Offset {
+            amount: 3,
+            unit: OffsetUnit::Days,
+        });
+        s.due_rule = Some(Offset {
+            amount: 1,
+            unit: OffsetUnit::Hours,
+        });
+        task.repeat = Some(s);
+
+        // The copy still arrives. Refusing it would mean a repetition that
+        // silently stops the day somebody mistypes a unit.
+        let draft = next_instance(&task, &board, utc("2026-10-01T06:00:00Z"));
+        assert_eq!(draft.start_at, Some(utc("2026-10-04T06:00:00Z")));
+        assert_eq!(draft.due_at, None);
+        assert_eq!(
+            crate::task::validate_draft(&draft, &board),
+            Ok(()),
+            "whatever it produces has to be savable"
+        );
     }
 }

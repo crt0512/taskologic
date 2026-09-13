@@ -1,9 +1,9 @@
 //! Task templates. A template is a saved [`TaskDraft`] on a board, used to
 //! stamp out recurring kinds of work. What it carries beyond the draft lives
-//! in [`TemplateOptions`]: a rule for prefilling the due date, since a kind
-//! of task has a lead time rather than a date, and dependencies on *other
-//! templates*, which are stamped out alongside so the new task depends on the
-//! tasks they produced.
+//! in [`TemplateOptions`]: rules for prefilling the start and due dates,
+//! since a kind of task has a lead time rather than a date, and dependencies
+//! on *other templates*, which are stamped out alongside so the new task
+//! depends on the tasks they produced.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,64 +11,79 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{BoardId, TemplateId, Uid};
+use crate::offset::Offset;
 use crate::task::TaskDraft;
 
-/// The unit a template's due date offset is counted in.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OffsetUnit {
-    Minutes,
-    #[default]
-    Hours,
-    Days,
-}
-
-impl OffsetUnit {
-    pub const ALL: [OffsetUnit; 3] = [OffsetUnit::Minutes, OffsetUnit::Hours, OffsetUnit::Days];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            OffsetUnit::Minutes => "minutes",
-            OffsetUnit::Hours => "hours",
-            OffsetUnit::Days => "days",
-        }
-    }
-
-    pub fn minutes(self) -> i64 {
-        match self {
-            OffsetUnit::Minutes => 1,
-            OffsetUnit::Hours => 60,
-            OffsetUnit::Days => 24 * 60,
-        }
-    }
-}
-
-/// "Prefill current date and time", plus however far ahead of now the due
-/// date should land. An amount of zero means exactly now.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Deriving the due date from how long this kind of task actually takes,
+/// rather than from a fixed guess. Until enough of them have been finished
+/// to average, the template falls back to its fixed offset.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct DuePrefill {
-    pub amount: u32,
-    pub unit: OffsetUnit,
+pub struct FromAverage {
+    /// How many finished tasks it takes before the average is trusted. Zero
+    /// would mean trusting a single sample, which is how one long afternoon
+    /// becomes everybody's estimate.
+    pub min_samples: u32,
 }
 
-impl DuePrefill {
-    /// The due date this rule produces, or None if the offset overflows.
-    pub fn due_from(self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        let minutes = i64::from(self.amount).checked_mul(self.unit.minutes())?;
-        now.checked_add_signed(TimeDelta::try_minutes(minutes)?)
+impl Default for FromAverage {
+    fn default() -> Self {
+        Self {
+            min_samples: DEFAULT_MIN_SAMPLES,
+        }
     }
 }
+
+/// The sample count a new "due from average" rule starts with.
+pub const DEFAULT_MIN_SAMPLES: u32 = 3;
 
 /// What a template carries beyond the draft itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TemplateOptions {
-    /// Set when the template prefills the due date of the tasks it stamps out.
-    pub due_prefill: Option<DuePrefill>,
+    /// Set when the template prefills the start date of the tasks it stamps
+    /// out, counted forward from the moment it is used.
+    pub start_prefill: Option<Offset>,
+    /// The same for the due date. It doubles as the fallback when
+    /// `due_from_average` is set but there is not enough history yet.
+    pub due_prefill: Option<Offset>,
+    /// Set to date the task by how long these usually take instead of by the
+    /// fixed offset. Needs `due_prefill` as its fallback and a start date to
+    /// count from, so a template with neither gains nothing from it.
+    pub due_from_average: Option<FromAverage>,
     /// Other templates on the same board. Using this template stamps those
     /// out too and makes the new task depend on the tasks they produce.
     pub dep_templates: Vec<TemplateId>,
+}
+
+impl TemplateOptions {
+    /// The start date a task stamped out now begins with.
+    pub fn start_for(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.start_prefill?.after(now)
+    }
+
+    /// The due date to go with it. `history` is how long these tasks have
+    /// taken on average and how many finished ones that average is over,
+    /// which only the daemon can know.
+    ///
+    /// The average is added to the start date, because "this takes two hours"
+    /// is a statement about the work, not about the clock. With no start date
+    /// there is nothing to add it to and the fixed offset stands.
+    pub fn due_for(
+        &self,
+        now: DateTime<Utc>,
+        start: Option<DateTime<Utc>>,
+        history: Option<(TimeDelta, u32)>,
+    ) -> Option<DateTime<Utc>> {
+        if let (Some(rule), Some(start), Some((average, samples))) =
+            (self.due_from_average, start, history)
+            && samples >= rule.min_samples
+            && let Some(from_average) = start.checked_add_signed(average)
+        {
+            return Some(from_average);
+        }
+        self.due_prefill?.after(now)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,10 +98,6 @@ pub struct Template {
     #[serde(default)]
     pub options: TemplateOptions,
 }
-
-/// The largest prefill offset a template may carry, so a typo cannot push a
-/// due date out past what chrono can represent.
-pub const MAX_PREFILL_AMOUNT: u32 = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TemplateError {
@@ -204,19 +215,76 @@ mod tests {
         v.iter().map(|t| t.0).collect()
     }
 
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+    }
+
+    fn hours(n: u32) -> Offset {
+        Offset {
+            amount: n,
+            unit: crate::offset::OffsetUnit::Hours,
+        }
+    }
+
     #[test]
-    fn a_prefill_counts_forward_in_its_own_unit() {
-        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-        let at = |amount, unit| {
-            DuePrefill { amount, unit }
-                .due_from(now)
-                .map(|d| d.timestamp())
+    fn the_prefills_date_a_stamped_task_from_the_moment_it_is_used() {
+        let opts = TemplateOptions {
+            start_prefill: Some(hours(1)),
+            due_prefill: Some(hours(3)),
+            ..Default::default()
         };
-        assert_eq!(at(0, OffsetUnit::Hours), Some(now.timestamp()));
-        assert_eq!(at(90, OffsetUnit::Minutes), Some(now.timestamp() + 5_400));
-        assert_eq!(at(2, OffsetUnit::Hours), Some(now.timestamp() + 7_200));
-        assert_eq!(at(3, OffsetUnit::Days), Some(now.timestamp() + 259_200));
-        assert_eq!(at(u32::MAX, OffsetUnit::Days), None, "past what chrono has");
+        let start = opts.start_for(now());
+        assert_eq!(start, Some(now() + TimeDelta::hours(1)));
+        assert_eq!(
+            opts.due_for(now(), start, None),
+            Some(now() + TimeDelta::hours(3))
+        );
+
+        // A template that prefills neither dates nothing.
+        let bare = TemplateOptions::default();
+        assert_eq!(bare.start_for(now()), None);
+        assert_eq!(bare.due_for(now(), None, None), None);
+    }
+
+    #[test]
+    fn due_from_average_waits_for_enough_finished_tasks() {
+        let opts = TemplateOptions {
+            start_prefill: Some(hours(1)),
+            due_prefill: Some(hours(3)),
+            due_from_average: Some(FromAverage { min_samples: 3 }),
+            ..Default::default()
+        };
+        let start = opts.start_for(now()).unwrap();
+        let fixed = now() + TimeDelta::hours(3);
+        let averaged = start + TimeDelta::minutes(20);
+
+        // Nothing finished yet, and too little to trust: the fixed offset.
+        assert_eq!(opts.due_for(now(), Some(start), None), Some(fixed));
+        assert_eq!(
+            opts.due_for(now(), Some(start), Some((TimeDelta::minutes(20), 2))),
+            Some(fixed)
+        );
+        // Enough samples: the average, counted from the start date.
+        assert_eq!(
+            opts.due_for(now(), Some(start), Some((TimeDelta::minutes(20), 3))),
+            Some(averaged)
+        );
+        // No start date to add it to, so the fixed offset stands.
+        assert_eq!(
+            opts.due_for(now(), None, Some((TimeDelta::minutes(20), 9))),
+            Some(fixed)
+        );
+    }
+
+    #[test]
+    fn options_written_before_the_start_date_existed_still_load() {
+        // 0.1.10 wrote only a due prefill, under the same field name.
+        let old = r#"{"due_prefill":{"amount":2,"unit":"hours"},"dep_templates":[7]}"#;
+        let opts: TemplateOptions = serde_json::from_str(old).unwrap();
+        assert_eq!(opts.due_prefill, Some(hours(2)));
+        assert_eq!(opts.start_prefill, None);
+        assert_eq!(opts.due_from_average, None);
+        assert_eq!(opts.dep_templates, vec![TemplateId(7)]);
     }
 
     #[test]

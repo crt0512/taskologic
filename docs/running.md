@@ -178,6 +178,7 @@ Task title         [x]       [x]       [x]       [ ]
 Barcode: start     [ ]       [ ]       [ ]       [x]     (on for reminders)
 Description        [x]       [ ]       [ ]       [ ]
 Checklist          [x]       [ ]       [ ]       [ ]
+Start date         [ ]       [ ]       [ ]       [x]     (on for reminders)
 Due date           [x]       [ ]       [x]       [x]
 Creator            [ ]       [ ]       [ ]       [ ]
 Assignees          [ ]       [ ]       [ ]       [ ]
@@ -192,9 +193,11 @@ clicking anywhere in a column works that box, and the `^` and `v` at the end
 of each row move it, so the order can be set without touching the keyboard.
 A row at the end of the list has no button in the direction it cannot go.
 
-The two barcodes are the only rows whose defaults differ. Nothing has been
-started when a reminder prints, so it carries the code that starts the task;
-a receipt is for the task in hand, so it carries the one that finishes it.
+The barcodes and the start date are the rows whose defaults differ. Nothing
+has been started when a reminder prints, so it carries the code that starts
+the task and says when that is due to happen; a receipt is handed over as the
+work begins, so it carries the code that finishes it and does not need telling
+when to start.
 
 The custom line is your own words, a shop name or a machine number; it is off
 by default and the field at the bottom sets what it says. The task's short id

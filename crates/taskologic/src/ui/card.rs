@@ -28,7 +28,8 @@ pub struct CardCtx<'a> {
 /// is left out rather than printed as "none", so cards stay as small as
 /// their content.
 fn detail_count(task: &Task, fields: CardFields, deps_total: usize) -> u16 {
-    u16::from(fields.due_date && task.due_at.is_some())
+    u16::from(fields.start_date && task.start_at.is_some())
+        + u16::from(fields.due_date && task.due_at.is_some())
         + u16::from(fields.assignees && !task.assignees.is_empty())
         + u16::from(fields.dependencies && deps_total > 0)
         + u16::from(fields.description && !task.description.trim().is_empty())
@@ -91,6 +92,31 @@ pub fn render_task(
     }
     lines.push(Line::from(Span::styled(clip(&title, w), title_style)));
 
+    if ctx.fields.start_date
+        && let Some(d) = task.start_at
+    {
+        let start = d.with_timezone(&ctx.tz);
+        // Overdue is for the due date. A start date that has come and gone
+        // on a task nobody has picked up is worth the same nudge, though.
+        let late = task.column_id != ctx.finished_col && d < chrono::Utc::now();
+        let style = if late {
+            t.card()
+                .patch(t.severity(taskologic_proto::Severity::Warning))
+        } else {
+            t.card_dim()
+        };
+        lines.push(Line::from(Span::styled(
+            clip(
+                &format!(
+                    "{}start {}",
+                    if late { "! " } else { "" },
+                    start.format("%Y-%m-%d %H:%M")
+                ),
+                w,
+            ),
+            style,
+        )));
+    }
     if ctx.fields.due_date
         && let Some(d) = task.due_at
     {
@@ -275,6 +301,15 @@ mod tests {
         task.assignees = vec![1];
         assert_eq!(task_card_height(&task, f, 2, false), 6);
         assert_eq!(task_card_height(&task, f, 2, true), 7);
+
+        // A start date costs a line only where the board asked for one.
+        task.start_at = Some(chrono::Utc::now());
+        assert_eq!(task_card_height(&task, f, 2, false), 6);
+        let with_start = CardFields {
+            start_date: true,
+            ..f
+        };
+        assert_eq!(task_card_height(&task, with_start, 2, false), 7);
     }
 
     #[test]

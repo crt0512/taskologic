@@ -8,13 +8,14 @@ use chrono::{DateTime, TimeDelta, Utc};
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use taskologic_core::board::{Board, Column, ColumnRemoval, ColumnRole};
-use taskologic_core::event::EventKind;
+use taskologic_core::event::{Event, EventKind};
 use taskologic_core::ids::{
     BoardId, ColumnId, EventId, PrintJobId, ShortId, TaskId, TemplateId, Uid,
 };
 use taskologic_core::prefs::UserPrefs;
-use taskologic_core::print::{DepLine, PrintJob};
+use taskologic_core::print::{DepLine, PrintJob, ReminderKind};
 use taskologic_core::repeat::RepeatSpec;
+use taskologic_core::stats;
 use taskologic_core::task::{Task, TaskDraft};
 use taskologic_core::template::{Template, TemplateOptions};
 use taskologic_core::transition::MovePlan;
@@ -539,9 +540,13 @@ fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
         position: r.get("position")?,
         title: r.get("title")?,
         description: r.get("description")?,
+        start_at: r.get::<_, Option<i64>>("start_at")?.map(dt),
         due_at: r.get::<_, Option<i64>>("due_at")?.map(dt),
-        reminder_minutes: r
-            .get::<_, Option<i64>>("reminder_minutes")?
+        reminder_start_minutes: r
+            .get::<_, Option<i64>>("reminder_start_minutes")?
+            .map(|m| m.max(0) as u32),
+        reminder_due_minutes: r
+            .get::<_, Option<i64>>("reminder_due_minutes")?
             .map(|m| m.max(0) as u32),
         created_by: r.get::<_, i64>("created_by")? as Uid,
         created_at: dt(r.get("created_at")?),
@@ -554,6 +559,8 @@ fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
         depends_on: Vec::new(),
         checklist: serde_json::from_str(&checklist).unwrap_or_default(),
         repeat: None,
+        template_id: r.get::<_, Option<i64>>("template_id")?.map(TemplateId),
+        exclude_from_stats: r.get::<_, i64>("exclude_from_stats")? != 0,
     })
 }
 
@@ -668,20 +675,25 @@ fn write_relations(
     set_repeat(c, task_id, draft.repeat.as_ref(), now)
 }
 
+/// `from_template` records which template stamped this out, when one did.
+/// Analytics groups sibling tasks by it, and it is set once at creation:
+/// editing a task never makes it belong to a template it did not come from.
 pub fn create_task(
     c: &Connection,
     board: &Board,
     column: ColumnId,
     draft: &TaskDraft,
     creator: Uid,
+    from_template: Option<TemplateId>,
     now: DateTime<Utc>,
 ) -> R<Task> {
     taskologic_core::task::validate_draft(draft, board)?;
     let short = fresh_short_id(c)?;
     let pos = next_position(c, column)?;
     c.execute(
-        "INSERT INTO tasks (short_id, board_id, column_id, position, title, description, due_at, created_by, created_at, \
-         finished_at, version, checklist, reminder_minutes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12)",
+        "INSERT INTO tasks (short_id, board_id, column_id, position, title, description, start_at, due_at, created_by, created_at, \
+         finished_at, version, checklist, reminder_start_minutes, reminder_due_minutes, template_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15)",
         params![
             short.as_str(),
             board.id.0,
@@ -689,12 +701,15 @@ pub fn create_task(
             pos,
             draft.title.trim(),
             draft.description,
+            draft.start_at.map(ts),
             draft.due_at.map(ts),
             i64::from(creator),
             ts(now),
             (column == board.finished_col).then(|| ts(now)),
             serde_json::to_string(&draft.checklist).unwrap_or_else(|_| "[]".into()),
-            draft.reminder_minutes.map(i64::from),
+            draft.reminder_start_minutes.map(i64::from),
+            draft.reminder_due_minutes.map(i64::from),
+            from_template.map(|t| t.0),
         ],
     )?;
     let id = TaskId(c.last_insert_rowid());
@@ -704,7 +719,9 @@ pub fn create_task(
         board.id,
         Some(id),
         Some(creator),
-        &EventKind::TaskCreated,
+        &EventKind::TaskCreated {
+            column: Some(column),
+        },
         now,
     )?;
     require_task(c, id)
@@ -713,14 +730,17 @@ pub fn create_task(
 /// The caller has already compared versions and checked permissions.
 pub fn update_task(c: &Connection, task: &Task, draft: &TaskDraft, now: DateTime<Utc>) -> R<Task> {
     c.execute(
-        "UPDATE tasks SET title = ?2, description = ?3, due_at = ?4, checklist = ?5, reminder_minutes = ?6, version = version + 1 WHERE id = ?1",
+        "UPDATE tasks SET title = ?2, description = ?3, start_at = ?4, due_at = ?5, checklist = ?6, \
+         reminder_start_minutes = ?7, reminder_due_minutes = ?8, version = version + 1 WHERE id = ?1",
         params![
             task.id.0,
             draft.title.trim(),
             draft.description,
+            draft.start_at.map(ts),
             draft.due_at.map(ts),
             serde_json::to_string(&draft.checklist).unwrap_or_else(|_| "[]".into()),
-            draft.reminder_minutes.map(i64::from),
+            draft.reminder_start_minutes.map(i64::from),
+            draft.reminder_due_minutes.map(i64::from),
         ],
     )?;
     write_relations(c, task.id, draft, now)?;
@@ -1335,12 +1355,14 @@ pub fn uids_with_pending_print_jobs(c: &Connection, now: DateTime<Utc>) -> R<Vec
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Undone tasks with a due date that `uid` is assigned to, or created and
-/// left unassigned.
+/// Unfinished tasks carrying at least one date that `uid` is assigned to, or
+/// created and left unassigned. A task with neither date owes no reminder, so
+/// it never reaches the scheduler in the first place.
 pub fn reminder_candidates(c: &Connection, uid: Uid) -> R<Vec<Task>> {
     let mut st = c.prepare(
         "SELECT t.* FROM tasks t JOIN boards b ON b.id = t.board_id \
-         WHERE t.archived_at IS NULL AND t.column_id != b.finished_col AND t.due_at IS NOT NULL AND ( \
+         WHERE t.archived_at IS NULL AND t.column_id != b.finished_col \
+           AND (t.due_at IS NOT NULL OR t.start_at IS NOT NULL) AND ( \
            t.id IN (SELECT task_id FROM assignees WHERE uid = ?1) \
            OR (t.created_by = ?1 AND NOT EXISTS (SELECT 1 FROM assignees a WHERE a.task_id = t.id)))",
     )?;
@@ -1350,10 +1372,19 @@ pub fn reminder_candidates(c: &Connection, uid: Uid) -> R<Vec<Task>> {
     rows.into_iter().map(|t| hydrate(c, t)).collect()
 }
 
-pub fn reminder_sent(c: &Connection, task_id: TaskId, uid: Uid, due_at: DateTime<Utc>) -> R<bool> {
+/// Whether this person already had this particular slip. Keyed on the date it
+/// counted back from, so moving a due date earns a fresh reminder instead of
+/// being swallowed by the one already sent.
+pub fn reminder_sent(
+    c: &Connection,
+    task_id: TaskId,
+    uid: Uid,
+    kind: ReminderKind,
+    anchor_at: DateTime<Utc>,
+) -> R<bool> {
     let n: i64 = c.query_row(
-        "SELECT count(*) FROM reminders_sent WHERE task_id = ?1 AND uid = ?2 AND due_at = ?3",
-        params![task_id.0, i64::from(uid), ts(due_at)],
+        "SELECT count(*) FROM reminders_sent WHERE task_id = ?1 AND uid = ?2 AND kind = ?3 AND anchor_at = ?4",
+        params![task_id.0, i64::from(uid), kind.name(), ts(anchor_at)],
         |r| r.get(0),
     )?;
     Ok(n > 0)
@@ -1363,12 +1394,207 @@ pub fn mark_reminder_sent(
     c: &Connection,
     task_id: TaskId,
     uid: Uid,
-    due_at: DateTime<Utc>,
+    kind: ReminderKind,
+    anchor_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> R<()> {
     c.execute(
-        "INSERT OR IGNORE INTO reminders_sent (task_id, uid, due_at, sent_at) VALUES (?1, ?2, ?3, ?4)",
-        params![task_id.0, i64::from(uid), ts(due_at), ts(now)],
+        "INSERT OR IGNORE INTO reminders_sent (task_id, uid, kind, anchor_at, sent_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            task_id.0,
+            i64::from(uid),
+            kind.name(),
+            ts(anchor_at),
+            ts(now)
+        ],
     )?;
     Ok(())
+}
+
+/// Whether the task was ever in the board's started column, from the event
+/// log rather than from where it sits now. A board can have columns past the
+/// started one, so "further along than started" is not a question the current
+/// column can answer.
+pub fn was_ever_started(c: &Connection, task_id: TaskId, started_col: ColumnId) -> R<bool> {
+    let n: i64 = c.query_row(
+        "SELECT count(*) FROM events WHERE task_id = ?1 AND to_col = ?2",
+        params![task_id.0, started_col.0],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Analytics
+//
+// The event log has been filling up since 0.1.0 for exactly this. Nothing
+// below writes; it reads the trail back and hands it to `taskologic_core::stats`,
+// which owns every rule about what the numbers mean.
+// ---------------------------------------------------------------------------
+
+/// Live and archived tasks on the boards `uid` may see, newest first, each
+/// with the name of the board it is on. One board narrows it to that board,
+/// after the same visibility check every other request makes.
+///
+/// Purged tasks are gone from this table by definition, so a row here always
+/// has a title to show even when its events outlive it.
+pub fn analytics_candidates(
+    c: &Connection,
+    uid: Uid,
+    board: Option<BoardId>,
+) -> R<Vec<(Task, String)>> {
+    let sql = format!(
+        "SELECT t.*, b.name AS board_name FROM tasks t JOIN boards b ON b.id = t.board_id \
+         WHERE t.board_id IN ({VISIBLE_BOARDS}) AND (?2 IS NULL OR t.board_id = ?2) \
+         ORDER BY COALESCE(t.finished_at, t.archived_at, t.created_at) DESC, t.id DESC"
+    );
+    let mut st = c.prepare(&sql)?;
+    let rows: Vec<(Task, String)> = st
+        .query_map(params![i64::from(uid), board.map(|b| b.0)], |r| {
+            Ok((task_from_row(r)?, r.get::<_, String>("board_name")?))
+        })?
+        .collect::<Result<_, _>>()?;
+    // Assignees are needed for the "assigned to me" filter; dependencies and
+    // repetitions are not, so the hydrate is deliberately partial.
+    rows.into_iter()
+        .map(|(mut t, name)| {
+            let mut st =
+                c.prepare("SELECT uid FROM assignees WHERE task_id = ?1 ORDER BY uid")?;
+            t.assignees = st
+                .query_map(params![t.id.0], |r| Ok(r.get::<_, i64>(0)? as Uid))?
+                .collect::<Result<_, _>>()?;
+            Ok((t, name))
+        })
+        .collect()
+}
+
+/// Every column change for these tasks, oldest first, ready for
+/// [`taskologic_core::stats::timings`].
+pub fn transitions_for(
+    c: &Connection,
+    tasks: &[TaskId],
+) -> R<HashMap<TaskId, Vec<stats::Transition>>> {
+    let mut out: HashMap<TaskId, Vec<stats::Transition>> = HashMap::new();
+    if tasks.is_empty() {
+        return Ok(out);
+    }
+    // The kinds that move a task between columns, and the creation that put
+    // it in its first one. Anything else leaves the trail unchanged.
+    let mut st = c.prepare(
+        "SELECT task_id, to_col, at FROM events \
+         WHERE task_id = ?1 AND kind IN ('task_created', 'task_moved', 'task_archived', 'task_restored') \
+         ORDER BY at, id",
+    )?;
+    for id in tasks {
+        let rows = st.query_map(params![id.0], |r| {
+            Ok(stats::Transition {
+                at: dt(r.get("at")?),
+                to: r.get::<_, Option<i64>>("to_col")?.map(ColumnId),
+            })
+        })?;
+        let trail: Vec<stats::Transition> = rows.collect::<Result<_, _>>()?;
+        if !trail.is_empty() {
+            out.insert(*id, trail);
+        }
+    }
+    Ok(out)
+}
+
+/// Child to parent for every repetition chain on the boards `uid` may see.
+/// A repeated task is a sibling of the ones before it in its chain, which is
+/// how the averages group them without a template to go by.
+pub fn repeat_parents(c: &Connection, uid: Uid) -> R<HashMap<TaskId, TaskId>> {
+    let sql = format!(
+        "SELECT task_id, detail_json FROM events \
+         WHERE kind = 'repeat_spawned' AND task_id IS NOT NULL AND board_id IN ({VISIBLE_BOARDS})"
+    );
+    let mut st = c.prepare(&sql)?;
+    let rows = st.query_map(params![i64::from(uid)], |r| {
+        Ok((r.get::<_, i64>("task_id")?, r.get::<_, String>("detail_json")?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (child, detail) = row?;
+        if let Ok(EventKind::RepeatSpawned { from_task }) =
+            serde_json::from_str::<EventKind>(&detail)
+        {
+            out.insert(TaskId(child), from_task);
+        }
+    }
+    Ok(out)
+}
+
+/// One task's whole recorded history, oldest first, with the name of whoever
+/// did each thing. The scheduler acts as nobody, which is why the name is
+/// optional rather than a lie about a user.
+pub fn task_history(c: &Connection, task_id: TaskId) -> R<Vec<(Event, Option<String>)>> {
+    let mut st = c.prepare(
+        "SELECT e.id, e.board_id, e.task_id, e.actor_uid, e.detail_json, e.at, u.username \
+         FROM events e LEFT JOIN users u ON u.uid = e.actor_uid \
+         WHERE e.task_id = ?1 ORDER BY e.at, e.id",
+    )?;
+    let rows = st.query_map(params![task_id.0], |r| {
+        let detail: String = r.get("detail_json")?;
+        let kind = serde_json::from_str::<EventKind>(&detail).unwrap_or(EventKind::TaskReordered);
+        Ok((
+            Event {
+                id: EventId(r.get("id")?),
+                board_id: BoardId(r.get("board_id")?),
+                task_id: r.get::<_, Option<i64>>("task_id")?.map(TaskId),
+                actor_uid: r.get::<_, Option<i64>>("actor_uid")?.map(|u| u as Uid),
+                kind,
+                at: dt(r.get("at")?),
+            },
+            r.get::<_, Option<String>>("username")?,
+        ))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Take a task in or out of the averages.
+pub fn set_exclude_from_stats(c: &Connection, task_id: TaskId, excluded: bool) -> R<Task> {
+    c.execute(
+        "UPDATE tasks SET exclude_from_stats = ?2, version = version + 1 WHERE id = ?1",
+        params![task_id.0, i64::from(excluded)],
+    )?;
+    require_task(c, task_id)
+}
+
+/// How long the tasks stamped out of `template` have taken, and over how many
+/// of them, for the template's "due from average" rule. Excluded tasks and
+/// ones that were never started do not count.
+pub fn template_average(
+    c: &Connection,
+    template: TemplateId,
+    now: DateTime<Utc>,
+) -> R<Option<(TimeDelta, u32)>> {
+    let mut st = c.prepare(
+        "SELECT t.id, b.started_col, b.finished_col FROM tasks t JOIN boards b ON b.id = t.board_id \
+         WHERE t.template_id = ?1 AND t.exclude_from_stats = 0 AND t.deleted_at IS NULL",
+    )?;
+    let rows: Vec<(TaskId, ColumnId, ColumnId)> = st
+        .query_map(params![template.0], |r| {
+            Ok((
+                TaskId(r.get("id")?),
+                ColumnId(r.get("started_col")?),
+                ColumnId(r.get("finished_col")?),
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    let ids: Vec<TaskId> = rows.iter().map(|(id, _, _)| *id).collect();
+    let trails = transitions_for(c, &ids)?;
+    let samples: Vec<TimeDelta> = rows
+        .iter()
+        .filter_map(|(id, started, finished)| {
+            let trail = trails.get(id)?;
+            let t = stats::timings(trail, *started, *finished, now);
+            // Only tasks that actually finished say anything about how long
+            // this kind of work takes. One still running would report the
+            // time since it started, which is not the same number.
+            t.finished_at?;
+            t.time_taken
+        })
+        .collect();
+    Ok(stats::average(&samples))
 }

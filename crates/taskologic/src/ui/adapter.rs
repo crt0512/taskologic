@@ -193,13 +193,33 @@ pub fn render_button(f: &mut Frame, area: Rect, label: &str, state: &mut ButtonS
     f.render_stateful_widget(b, area, state);
 }
 
+/// A list inside a popup, form or dialog, on the pale surface those use.
 pub fn list<'a, I>(items: I, t: &Theme) -> List<'a>
 where
     I: IntoIterator,
     I::Item: Into<ratatui::widgets::ListItem<'a>>,
 {
+    styled_list(items, t.surface(), t)
+}
+
+/// A list on the desktop itself, for a screen that takes the body of the
+/// window the way a board does. Same list, without the sheet of white paper
+/// behind it.
+pub fn screen_list<'a, I>(items: I, t: &Theme) -> List<'a>
+where
+    I: IntoIterator,
+    I::Item: Into<ratatui::widgets::ListItem<'a>>,
+{
+    styled_list(items, t.base(), t)
+}
+
+fn styled_list<'a, I>(items: I, base: ratatui::style::Style, t: &Theme) -> List<'a>
+where
+    I: IntoIterator,
+    I::Item: Into<ratatui::widgets::ListItem<'a>>,
+{
     List::new(items)
-        .style(t.surface())
+        .style(base)
         .select_style(t.selected())
         .focus_style(t.selected())
 }

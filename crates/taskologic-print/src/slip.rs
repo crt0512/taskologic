@@ -19,6 +19,7 @@ pub enum SlipSection {
     BarcodeStart,
     Description,
     Checklist,
+    StartDate,
     DueDate,
     Creator,
     Assignee,
@@ -30,13 +31,14 @@ pub enum SlipSection {
 
 impl SlipSection {
     /// Every section, in the order a new profile starts with.
-    pub const ALL: [SlipSection; 12] = [
+    pub const ALL: [SlipSection; 13] = [
         SlipSection::Custom,
         SlipSection::BoardTitle,
         SlipSection::TaskTitle,
         SlipSection::BarcodeStart,
         SlipSection::Description,
         SlipSection::Checklist,
+        SlipSection::StartDate,
         SlipSection::DueDate,
         SlipSection::Creator,
         SlipSection::Assignee,
@@ -53,6 +55,7 @@ impl SlipSection {
             SlipSection::BarcodeStart => "Barcode: start",
             SlipSection::Description => "Description",
             SlipSection::Checklist => "Checklist",
+            SlipSection::StartDate => "Start date",
             SlipSection::DueDate => "Due date",
             SlipSection::Creator => "Creator",
             SlipSection::Assignee => "Assignees",
@@ -119,6 +122,7 @@ impl SlipLayout {
                 SlipRow::new(S::BarcodeStart, false, false, false, true),
                 SlipRow::new(S::Description, true, false, false, false),
                 SlipRow::new(S::Checklist, true, false, false, false),
+                SlipRow::new(S::StartDate, false, false, false, true),
                 SlipRow::new(S::DueDate, true, false, true, true),
                 SlipRow::new(S::Creator, false, false, false, false),
                 SlipRow::new(S::Assignee, false, false, false, false),
@@ -140,6 +144,10 @@ impl SlipLayout {
             match row.section {
                 S::BarcodeStart => row.enabled = true,
                 S::BarcodeFinish => row.enabled = false,
+                // A reminder is often about the start date, so it says when
+                // that is; a receipt is handed over as work begins and does
+                // not need telling.
+                S::StartDate => row.enabled = true,
                 _ => {}
             }
         }
@@ -248,6 +256,17 @@ mod tests {
         assert!(title.enabled && title.bold && title.large && !title.centered);
         let due = row(SlipSection::DueDate);
         assert!(due.enabled && due.large && due.centered);
+        assert!(
+            !row(SlipSection::StartDate).enabled,
+            "a receipt is handed over as the work starts"
+        );
+        assert!(
+            SlipLayout::reminder()
+                .get(SlipSection::StartDate)
+                .unwrap()
+                .enabled,
+            "a reminder may well be about the start date"
+        );
         let deps = row(SlipSection::Dependencies);
         assert!(deps.enabled && deps.large && deps.centered);
         let stamp = row(SlipSection::Timestamp);

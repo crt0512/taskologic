@@ -15,4 +15,9 @@ pub mod message;
 pub use message::*;
 
 /// Bumped on any incompatible change to the message shapes.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 is 0.1.11. The single `reminder_minutes` on a task became one field per
+/// date, so a 0.1.10 client saving a task against this daemon would silently
+/// drop the reminder override rather than keep it. Refusing the connection
+/// says so instead; `make update` installs both halves together anyway.
+pub const PROTOCOL_VERSION: u32 = 2;
