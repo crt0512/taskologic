@@ -168,7 +168,7 @@ fn title_bar(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
             format!(" | {clock}")
         };
         let where_ = match &app.board {
-            Some(b) => format!(" Taskologic{stamp}  -  {}", b.detail.board.name),
+            Some(b) => format!(" Taskologic{stamp} | {}", b.detail.board.name),
             None => format!(" Taskologic{stamp} | Dashboard"),
         };
         f.render_widget(
@@ -192,10 +192,13 @@ fn title_bar(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         Rect::new(area.x, mid, label.len() as u16, 1),
     );
     let mut x = area.x + label.len() as u16;
-    // The label already ends in a space, so the bar goes straight on, and a
-    // trailing one keeps the first tab off the seconds.
+    // The label already ends in a space, so the bar goes straight on. Boxed
+    // tabs need an explicit trailing divider: their border belongs to the
+    // tab and does not read as part of the date/time indicator.
     let stamp = if clock.is_empty() {
         String::new()
+    } else if boxed {
+        format!("| {clock} | ")
     } else {
         format!("| {clock} ")
     };
@@ -1192,6 +1195,41 @@ mod tests {
         assert!(contains_shape(&tabbed, "dd:dd:dd"), "{tabbed}");
         assert!(tabbed.contains("Kitchen"), "{tabbed}");
         assert!(tabbed.contains("alice (admin)"), "{tabbed}");
+    }
+
+    #[test]
+    fn boxed_board_tabs_keep_the_divider_after_the_clock() {
+        let mut app = ready_app(false);
+        if let Some(u) = app.user.as_mut() {
+            u.prefs.ui.touchscreen = true;
+            u.prefs.ui.show_date = true;
+            u.prefs.ui.show_time = true;
+        }
+        open_board(&mut app);
+
+        // The boxed title bar is three rows tall; its labels are in the
+        // middle row. Keep the clock dynamic while checking its punctuation.
+        let out = render(&mut app, 100, 24);
+        let middle = out.lines().nth(1).unwrap_or_default();
+        assert!(
+            contains_shape(middle, "dddd-dd-dd dd:dd:dd | │ Kitchen"),
+            "{middle}"
+        );
+    }
+
+    #[test]
+    fn board_name_uses_a_bar_when_tabs_are_disabled() {
+        let mut app = ready_app(false);
+        if let Some(u) = app.user.as_mut() {
+            u.prefs.ui.show_board_tabs = false;
+        }
+        open_board(&mut app);
+        let board_name = app.board.as_ref().unwrap().detail.board.name.clone();
+
+        let out = render(&mut app, 100, 24);
+        let top = out.lines().next().unwrap_or_default();
+        assert!(top.contains(&format!("Taskologic | {board_name}")), "{top}");
+        assert!(!top.contains(" - "), "{top}");
     }
 
     #[test]
