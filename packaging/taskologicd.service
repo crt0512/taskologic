@@ -1,5 +1,5 @@
 [Unit]
-Description=Taskologic daemon
+Description=Taskologic demon
 After=network.target
 
 [Service]
@@ -10,7 +10,7 @@ ExecStart=/usr/local/bin/taskologicd
 Restart=on-failure
 RestartSec=2
 
-# /run/taskologic for the socket, /var/lib/taskologic for the database. Group members need to reach the socket, nobody but the daemon needs the db.
+# /run/taskologic for the socket, /var/lib/taskologic for the database. Group members need to reach the socket, nobody but the demon needs the db.
 RuntimeDirectory=taskologic
 RuntimeDirectoryMode=0755
 StateDirectory=taskologic
