@@ -90,10 +90,11 @@ Client talks to DEMON using JSON Derulo over a Unix socket.
 I believe in that if LLM's were used for a project it should be clearly stated where and for what! For this project this means :
 
 - All code comments have been fully sanetize using Large Language Models, I write literal garbage comments, very little if at all, curse in Swiss German through out all of my code and insult peoples mothers while writing it.
-- Obviously bugs have had LLM's help along many times but the code was inspected and should mostly be decent. (except some of the printing related stuff that i was debugging at 3am)
+- Obviously bugs and larger feature additions have had LLM's help along many times but the code was inspected and should mostly be decent. (except some of the printing related stuff that i was debugging at 3am)
 - Tests were fully written by an LLM as I was way too lazy to write them myself for this small project, only inspected quicly
 
 ## Receipt Printer / Barcode Usage example picture
+Yes i do infact use this system myself ... as the only one using it most likely expect some goofy ness that you might not expect.
 
 ![alt text](assets/README-2.png)
 
