@@ -12,6 +12,11 @@ chrono.workspace = true
 chrono-tz.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# Only the prefs upgrade test needs it, and that one has to go through real
+# JSON to be worth anything.
+serde_json.workspace = true
+
 [features]
 # Exposes the fixture builders in board::test_support and task::test_support
 # to other crates' tests.

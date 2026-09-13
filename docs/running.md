@@ -257,18 +257,75 @@ so every dependency fingerprint changes, the whole workspace recompiles from
 scratch, and `target/` fills with root owned files your next ordinary build
 cannot overwrite.
 
-That rebuilds, replaces both binaries and the unit file, reloads systemd and
-restarts the daemon. It never touches `/etc/taskologic`, the database, the
-group or the users, so an upgrade cannot lose your data. If the host has no
-install yet it stops and tells you to run `make setup` instead, rather than
-half installing something.
+That rebuilds, replaces both binaries and the unit file, brings the database
+up to the schema the new build expects, reloads systemd and restarts the
+daemon. It never touches `/etc/taskologic`, the group or the users. If the
+host has no install yet it stops and tells you to run `make setup` instead,
+rather than half installing something.
+
+It prints which version it found installed and which one it is putting on, so
+you can see what you came from:
+
+```
+== Checking the install
+  found /usr/local/bin/taskologicd
+  ...
+  installed version: 0.1.9
+== Building and installing
+  0.1.9 -> 0.1.10
+== Database
+  stopping taskologicd so nothing holds the database open
+  backed up to /var/lib/taskologic/taskologic.db.bak-20260913-140301
+  migrated /var/lib/taskologic/taskologic.db from schema version 6 to 7
+```
+
+Versions before 0.1.10 had no `--version` to ask, so upgrading off one of
+those reports the installed version as unknown. Every upgrade from 0.1.10
+onwards knows.
+
+### About the database
+
+New versions sometimes add columns. The daemon has always migrated on start,
+so this is not new; what `make update` adds is doing it **deliberately**, with
+the daemon stopped and a copy taken first, instead of as a side effect of the
+next restart. The copy lands beside the database as
+`taskologic.db.bak-<date>-<time>`, owned by the same account as the database,
+and nothing ever deletes it. Once the new version has proven itself those
+files are yours to remove.
+
+Migrations only run forwards. If you put an **older** build back on a database
+a newer one has already migrated, `--migrate` refuses and says so rather than
+guessing; restore the matching `.bak-` copy.
+
+You can look without changing anything, while the daemon is running:
+
+```bash
+make db-status
+```
+
+To migrate by hand, which you should not normally need:
+
+```bash
+sudo systemctl stop taskologicd
+make migrate
+sudo systemctl start taskologicd
+```
 
 The restart drops client sessions that are open at that moment. To install
 now and restart later:
 
 ```bash
 make update RESTART=no
-sudo systemctl daemon-reload && sudo systemctl restart taskologicd   # when it suits
+```
+
+`RESTART=no` leaves the database alone as well, because migrating out from
+under a daemon that is still running the old binary is the one thing worth
+avoiding here. Finish the job when it suits:
+
+```bash
+sudo systemctl stop taskologicd
+sudo /usr/local/bin/taskologicd --migrate
+sudo systemctl daemon-reload && sudo systemctl start taskologicd
 ```
 
 One thing that catches people out: **a running client keeps the binary it

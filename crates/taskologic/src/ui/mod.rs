@@ -156,12 +156,20 @@ fn title_bar(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
     // Boxed tabs when the bar is tall enough for them.
     let boxed = area.height >= 3;
     let mid = area.y + area.height / 2;
+    let clock = clock_stamp(app);
     app.tab_areas.clear();
 
     if !app.show_tabs() {
+        // A bar of its own either side, so the clock reads as its own thing
+        // rather than as part of the name or of where you are.
+        let stamp = if clock.is_empty() {
+            String::new()
+        } else {
+            format!(" | {clock}")
+        };
         let where_ = match &app.board {
-            Some(b) => format!(" Taskologic  -  {}", b.detail.board.name),
-            None => " Taskologic | Dashboard".to_string(),
+            Some(b) => format!(" Taskologic{stamp}  -  {}", b.detail.board.name),
+            None => format!(" Taskologic{stamp} | Dashboard"),
         };
         f.render_widget(
             Paragraph::new(where_).style(t.title_bar()),
@@ -184,6 +192,23 @@ fn title_bar(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         Rect::new(area.x, mid, label.len() as u16, 1),
     );
     let mut x = area.x + label.len() as u16;
+    // The label already ends in a space, so the bar goes straight on, and a
+    // trailing one keeps the first tab off the seconds.
+    let stamp = if clock.is_empty() {
+        String::new()
+    } else {
+        format!("| {clock} ")
+    };
+    let stamp_w = stamp.chars().count() as u16;
+    // Nothing may run into the username, so a clock without room is left out
+    // rather than clipped.
+    if stamp_w > 0 && x + stamp_w <= right_edge {
+        f.render_widget(
+            Paragraph::new(stamp).style(t.title_bar()),
+            Rect::new(x, mid, stamp_w, 1),
+        );
+        x += stamp_w;
+    }
     for (id, name) in tabs.iter() {
         // Boxed tabs carry their own separator, flat ones need a bar.
         if !boxed {
@@ -230,6 +255,26 @@ fn title_bar(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         x += w;
     }
     f.render_widget(Paragraph::new(who).style(t.title_bar()), who_area);
+}
+
+/// The date and clock that sit right of the Taskologic label, with no
+/// padding of their own: the two callers sit against different things and
+/// pad to suit. Empty unless the user asked for one of them. The client
+/// redraws on a 250 ms tick, so the seconds move along on their own and
+/// nothing here needs a timer.
+fn clock_stamp(app: &App) -> String {
+    let Some(user) = app.user.as_ref() else {
+        return String::new();
+    };
+    let now = chrono::Utc::now().with_timezone(&user.timezone);
+    let mut parts = Vec::new();
+    if user.prefs.ui.show_date {
+        parts.push(now.format("%Y-%m-%d").to_string());
+    }
+    if user.prefs.ui.show_time {
+        parts.push(now.format("%H:%M:%S").to_string());
+    }
+    parts.join(" ")
 }
 
 /// What a menu button actually shows. When the shortcut is not a letter of
@@ -1111,6 +1156,44 @@ mod tests {
         insta::assert_snapshot!(render(&mut app, 100, 24));
     }
 
+    /// True where `line` holds a run matching `shape`, in which `d` stands
+    /// for any digit and everything else is itself.
+    fn contains_shape(line: &str, shape: &str) -> bool {
+        let line: Vec<char> = line.chars().collect();
+        let shape: Vec<char> = shape.chars().collect();
+        line.windows(shape.len()).any(|w| {
+            w.iter().zip(&shape).all(|(c, s)| {
+                if *s == 'd' {
+                    c.is_ascii_digit()
+                } else {
+                    c == s
+                }
+            })
+        })
+    }
+
+    #[test]
+    fn the_top_bar_carries_the_date_and_the_clock_when_asked() {
+        // A snapshot of a running clock would fail a second later, so this
+        // looks at the shape of what was drawn.
+        let mut app = ready_app(false);
+        if let Some(u) = app.user.as_mut() {
+            u.prefs.ui.show_date = true;
+            u.prefs.ui.show_time = true;
+        }
+        let top = |out: String| out.lines().next().unwrap_or_default().to_string();
+        let plain = top(render(&mut app, 100, 24));
+        assert!(contains_shape(&plain, "dddd-dd-dd"), "{plain}");
+        assert!(contains_shape(&plain, "dd:dd:dd"), "{plain}");
+        // The other branch of the bar: tabs only show inside a board.
+        open_board(&mut app);
+        let tabbed = top(render(&mut app, 100, 24));
+        assert!(contains_shape(&tabbed, "dddd-dd-dd"), "{tabbed}");
+        assert!(contains_shape(&tabbed, "dd:dd:dd"), "{tabbed}");
+        assert!(tabbed.contains("Kitchen"), "{tabbed}");
+        assert!(tabbed.contains("alice (admin)"), "{tabbed}");
+    }
+
     #[test]
     fn ascii_mode_uses_no_box_drawing() {
         let mut app = ready_app(false);
@@ -1192,3 +1275,4 @@ mod tests {
         assert!(matches!(app.overlay, Some(Overlay::Help)));
     }
 }
+

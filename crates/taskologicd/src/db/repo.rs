@@ -16,7 +16,7 @@ use taskologic_core::prefs::UserPrefs;
 use taskologic_core::print::{DepLine, PrintJob};
 use taskologic_core::repeat::RepeatSpec;
 use taskologic_core::task::{Task, TaskDraft};
-use taskologic_core::template::Template;
+use taskologic_core::template::{Template, TemplateOptions};
 use taskologic_core::transition::MovePlan;
 use taskologic_core::user::{User, UserSummary};
 use taskologic_proto::{BoardSummary, CreateBoard, SearchHit, UpdateBoard};
@@ -540,6 +540,9 @@ fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
         title: r.get("title")?,
         description: r.get("description")?,
         due_at: r.get::<_, Option<i64>>("due_at")?.map(dt),
+        reminder_minutes: r
+            .get::<_, Option<i64>>("reminder_minutes")?
+            .map(|m| m.max(0) as u32),
         created_by: r.get::<_, i64>("created_by")? as Uid,
         created_at: dt(r.get("created_at")?),
         finished_at: r.get::<_, Option<i64>>("finished_at")?.map(dt),
@@ -678,7 +681,7 @@ pub fn create_task(
     let pos = next_position(c, column)?;
     c.execute(
         "INSERT INTO tasks (short_id, board_id, column_id, position, title, description, due_at, created_by, created_at, \
-         finished_at, version, checklist) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11)",
+         finished_at, version, checklist, reminder_minutes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12)",
         params![
             short.as_str(),
             board.id.0,
@@ -691,6 +694,7 @@ pub fn create_task(
             ts(now),
             (column == board.finished_col).then(|| ts(now)),
             serde_json::to_string(&draft.checklist).unwrap_or_else(|_| "[]".into()),
+            draft.reminder_minutes.map(i64::from),
         ],
     )?;
     let id = TaskId(c.last_insert_rowid());
@@ -709,13 +713,14 @@ pub fn create_task(
 /// The caller has already compared versions and checked permissions.
 pub fn update_task(c: &Connection, task: &Task, draft: &TaskDraft, now: DateTime<Utc>) -> R<Task> {
     c.execute(
-        "UPDATE tasks SET title = ?2, description = ?3, due_at = ?4, checklist = ?5, version = version + 1 WHERE id = ?1",
+        "UPDATE tasks SET title = ?2, description = ?3, due_at = ?4, checklist = ?5, reminder_minutes = ?6, version = version + 1 WHERE id = ?1",
         params![
             task.id.0,
             draft.title.trim(),
             draft.description,
             draft.due_at.map(ts),
             serde_json::to_string(&draft.checklist).unwrap_or_else(|_| "[]".into()),
+            draft.reminder_minutes.map(i64::from),
         ],
     )?;
     write_relations(c, task.id, draft, now)?;
@@ -1073,12 +1078,14 @@ pub fn stop_repeat(c: &Connection, task: &Task) -> R<Task> {
 
 fn template_from_row(r: &Row) -> rusqlite::Result<Template> {
     let payload: String = r.get("payload_json")?;
+    let options: String = r.get("options_json")?;
     Ok(Template {
         id: TemplateId(r.get("id")?),
         board_id: BoardId(r.get("board_id")?),
         owner_uid: r.get::<_, i64>("owner_uid")? as Uid,
         name: r.get("name")?,
         draft: serde_json::from_str(&payload).unwrap_or_default(),
+        options: serde_json::from_str(&options).unwrap_or_default(),
     })
 }
 
@@ -1091,14 +1098,17 @@ pub fn list_templates(c: &Connection, board_id: BoardId) -> R<Vec<Template>> {
     Ok(rows)
 }
 
-pub fn require_template(c: &Connection, id: TemplateId) -> R<Template> {
-    c.query_row(
+pub fn get_template(c: &Connection, id: TemplateId) -> R<Option<Template>> {
+    Ok(c.query_row(
         "SELECT * FROM templates WHERE id = ?1",
         params![id.0],
         template_from_row,
     )
-    .optional()?
-    .ok_or_else(|| AppError::NotFound("template not found".into()))
+    .optional()?)
+}
+
+pub fn require_template(c: &Connection, id: TemplateId) -> R<Template> {
+    get_template(c, id)?.ok_or_else(|| AppError::NotFound("template not found".into()))
 }
 
 pub fn create_template(
@@ -1107,14 +1117,16 @@ pub fn create_template(
     owner: Uid,
     name: &str,
     draft: &TaskDraft,
+    options: &TemplateOptions,
 ) -> R<Template> {
     c.execute(
-        "INSERT INTO templates (board_id, owner_uid, name, payload_json) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO templates (board_id, owner_uid, name, payload_json, options_json) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             board_id.0,
             i64::from(owner),
             name,
-            serde_json::to_string(draft)?
+            serde_json::to_string(draft)?,
+            serde_json::to_string(options)?
         ],
     )?;
     require_template(c, TemplateId(c.last_insert_rowid()))
@@ -1125,12 +1137,30 @@ pub fn update_template(
     id: TemplateId,
     name: &str,
     draft: &TaskDraft,
+    options: &TemplateOptions,
 ) -> R<Template> {
     c.execute(
-        "UPDATE templates SET name = ?2, payload_json = ?3 WHERE id = ?1",
-        params![id.0, name, serde_json::to_string(draft)?],
+        "UPDATE templates SET name = ?2, payload_json = ?3, options_json = ?4 WHERE id = ?1",
+        params![
+            id.0,
+            name,
+            serde_json::to_string(draft)?,
+            serde_json::to_string(options)?
+        ],
     )?;
     require_template(c, id)
+}
+
+/// Every template on a board mapped to the templates it depends on. Used to
+/// check for cycles and to work out what a template stamps out.
+pub fn template_deps_graph(
+    c: &Connection,
+    board_id: BoardId,
+) -> R<HashMap<TemplateId, Vec<TemplateId>>> {
+    Ok(list_templates(c, board_id)?
+        .into_iter()
+        .map(|t| (t.id, t.options.dep_templates))
+        .collect())
 }
 
 pub fn delete_template(c: &Connection, id: TemplateId) -> R<()> {
@@ -1141,7 +1171,9 @@ pub fn delete_template(c: &Connection, id: TemplateId) -> R<()> {
 /// Who has already had this task printed for them automatically.
 pub fn autoprinted_uids(c: &Connection, task: TaskId) -> R<Vec<Uid>> {
     let mut q = c.prepare("SELECT uid FROM task_autoprint WHERE task_id = ?1")?;
-    let uids = q.query_map(params![task.0], |r| r.get::<_, Uid>(0))?.collect::<Result<_, _>>()?;
+    let uids = q
+        .query_map(params![task.0], |r| r.get::<_, Uid>(0))?
+        .collect::<Result<_, _>>()?;
     Ok(uids)
 }
 

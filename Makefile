@@ -19,7 +19,7 @@ else
 SUDO :=
 endif
 
-.PHONY: all help build test install setup update uninstall
+.PHONY: all help build test install setup update db-status migrate uninstall
 
 # Bare `make` builds, as it does everywhere else.
 all: build
@@ -32,6 +32,8 @@ help:
 	@echo "  make install    install binaries and the systemd unit (asks for sudo)"
 	@echo "  make setup      interactive first time setup: group, daemon user, service, first user (asks for sudo)"
 	@echo "  make update     upgrade an existing install in place, keeps config and data (asks for sudo)"
+	@echo "  make db-status  show the database schema version and any pending migrations"
+	@echo "  make migrate    back up the database and apply pending migrations (asks for sudo)"
 	@echo "  make uninstall  remove binaries and the service, keeps config and data (asks for sudo)"
 	@echo
 	@echo "Do not put sudo in front of these yourself: they elevate the few steps"
@@ -63,6 +65,20 @@ setup:
 # RESTART=no installs without restarting the running daemon.
 update:
 	@BINDIR=$(BINDIR) UNITDIR=$(UNITDIR) RESTART=$(RESTART) ./scripts/update.sh
+
+# The installed daemon answers both of these without starting up, so they are
+# safe to run while it is serving. `migrate` is not: stop the daemon first, or
+# it carries on against a schema that moved under it. `make update` does the
+# stop, the migration and the restart in the right order, and is what you
+# normally want; these two are for looking, and for fixing up by hand.
+db-status:
+	@test -x $(BINDIR)/taskologicd || { echo "error: no taskologicd at $(BINDIR), run 'make install' first" >&2; exit 1; }
+	@$(BINDIR)/taskologicd --db-status
+
+migrate:
+	@test -x $(BINDIR)/taskologicd || { echo "error: no taskologicd at $(BINDIR), run 'make install' first" >&2; exit 1; }
+	@echo "This wants the daemon stopped: sudo systemctl stop taskologicd"
+	$(SUDO) $(BINDIR)/taskologicd --migrate
 
 uninstall:
 	-$(SUDO) systemctl disable --now taskologicd 2>/dev/null

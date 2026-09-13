@@ -18,7 +18,7 @@ use taskologic_core::board::{Board, ColumnRole};
 use taskologic_core::ids::{ColumnId, PrintJobId, TaskId, Uid};
 use taskologic_core::prefs::{CardFields, CustomColors, ThemePreset};
 use taskologic_core::print::PrintJob;
-use taskologic_core::task::{Task, TaskDraft};
+use taskologic_core::task::Task;
 use taskologic_core::user::User;
 use taskologic_print::DeviceProfile;
 use taskologic_proto::{
@@ -35,7 +35,7 @@ use crate::forms::members::{MembersOutcome, MembersPanel};
 use crate::forms::printer::{PrinterForm, PrinterOutcome};
 use crate::forms::repeats::{RepeatsOutcome, RepeatsPanel};
 use crate::forms::settings::{SettingsForm, SettingsOutcome};
-use crate::forms::task::{FormMode, FormOutcome, TaskForm};
+use crate::forms::task::{FormMode, FormOutcome, TaskForm, TaskSave};
 use crate::forms::templates::{TemplatesOutcome, TemplatesPanel};
 use crate::forms::users::{UsersOutcome, UsersPanel};
 use crate::scan;
@@ -403,9 +403,15 @@ impl BoardView {
 
     fn task_at(&self, x: u16, y: u16) -> Option<(usize, usize, TaskId)> {
         for (i, col) in self.task_areas.iter().enumerate() {
+            let idx = i + self.col_offset;
+            // task_areas only holds the cards that are actually on screen, and
+            // those start at the column's scroll offset. Without adding it back
+            // a click in a scrolled column selects the card that many places
+            // above the one under the pointer.
+            let scrolled = self.col_scroll.get(idx).copied().unwrap_or(0);
             for (row, (id, area)) in col.iter().enumerate() {
                 if area.contains(Position::new(x, y)) {
-                    return Some((i + self.col_offset, row, *id));
+                    return Some((idx, row + scrolled, *id));
                 }
             }
         }
@@ -1551,7 +1557,14 @@ impl App {
             KeyCode::Char('n') => {
                 if let Some(column) = b.column_id(b.col) {
                     let board = b.detail.board.id;
-                    return self.open_task_form(FormMode::Create { board, column }, None);
+                    return self.open_task_form(
+                        FormMode::Create {
+                            board,
+                            column,
+                            from_template: None,
+                        },
+                        None,
+                    );
                 }
             }
             KeyCode::Char('e') => {
@@ -1771,7 +1784,10 @@ impl App {
                 })
             }
             None => match mode {
-                FormMode::Create { board, column } => TaskForm::create(board, column, tz),
+                // A form stamped from a template is built by the templates
+                // panel, which has the template to hand; this path only ever
+                // opens a blank one.
+                FormMode::Create { board, column, .. } => TaskForm::create(board, column, tz),
                 FormMode::TemplateNew { board } => TaskForm::template_new(board, tz),
                 FormMode::Edit { .. } | FormMode::TemplateEdit { .. } => return Vec::new(),
             },
@@ -1799,17 +1815,34 @@ impl App {
                     Pending::FormDepSearch,
                 )]
             }
-            FormOutcome::Save(draft) => {
+            FormOutcome::Save(save) => {
                 form.saving = true;
                 let mode = form.mode.clone();
-                self.save_task(mode, draft)
+                self.save_task(mode, *save)
             }
         }
     }
 
-    fn save_task(&mut self, mode: FormMode, draft: TaskDraft) -> Vec<Cmd> {
+    fn save_task(&mut self, mode: FormMode, save: TaskSave) -> Vec<Cmd> {
+        let TaskSave { draft, options } = save;
         let req = match mode {
-            FormMode::Create { board, column } => Request::CreateTask {
+            // Stamped from a template: the daemon stamps out the templates
+            // this one depends on first and links the new task to them, which
+            // it can only do atomically on its own side.
+            FormMode::Create {
+                column,
+                from_template: Some(template),
+                ..
+            } => Request::CreateFromTemplate {
+                template_id: template,
+                column_id: Some(column),
+                draft,
+            },
+            FormMode::Create {
+                board,
+                column,
+                from_template: None,
+            } => Request::CreateTask {
                 board_id: board,
                 column_id: Some(column),
                 draft,
@@ -1827,6 +1860,7 @@ impl App {
                         board_id: board,
                         name,
                         draft,
+                        options,
                     },
                     Pending::TemplateOp,
                 )];
@@ -1838,6 +1872,7 @@ impl App {
                         template_id: template,
                         name,
                         draft,
+                        options,
                     },
                     Pending::TemplateOp,
                 )];
@@ -2048,10 +2083,21 @@ impl App {
             }
             TemplatesOutcome::New => {
                 let board = panel.board_id;
-                self.open_task_form(FormMode::TemplateNew { board }, None)
+                // Grab the neighbours before opening the form: doing so
+                // replaces the overlay, and the panel goes with it.
+                let choices = panel.all();
+                let mut cmds = self.open_task_form(FormMode::TemplateNew { board }, None);
+                if let Some(Overlay::TaskForm(form)) = &mut self.overlay {
+                    form.set_template_choices(&choices);
+                } else {
+                    cmds.clear();
+                }
+                cmds
             }
             TemplatesOutcome::Edit(tpl) => {
-                let form = TaskForm::template_edit(&tpl, tz);
+                let choices = panel.all();
+                let mut form = TaskForm::template_edit(&tpl, tz);
+                form.set_template_choices(&choices);
                 self.overlay = Some(Overlay::TaskForm(Box::new(form)));
                 vec![self.send(
                     Request::ListMembers {
@@ -2312,6 +2358,7 @@ impl App {
             title: "Test print".into(),
             description: "If you can read this, the printer profile works. Umlauts: äöü ß".into(),
             due_at: Some(now + chrono::TimeDelta::hours(1)),
+            reminder_minutes: None,
             created_by: user.uid,
             created_at: now,
             finished_at: None,
@@ -2872,7 +2919,14 @@ impl App {
                     b.clamp();
                     if let Some(column) = b.column_id(idx) {
                         let board = b.detail.board.id;
-                        return self.open_task_form(FormMode::Create { board, column }, None);
+                        return self.open_task_form(
+                            FormMode::Create {
+                                board,
+                                column,
+                                from_template: None,
+                            },
+                            None,
+                        );
                     }
                     return Vec::new();
                 }
@@ -3057,7 +3111,64 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use taskologic_core::barcode::{Magic, ScanAction, ScanPayload};
+    use taskologic_core::board::test_support::board_with_members;
     use taskologic_core::ids::{BoardId, ShortId};
+    use taskologic_core::task::test_support::task_on;
+
+    /// A column taller than the screen used to hand clicks the wrong task:
+    /// the hit test counted rows from the top of the drawn cards but the
+    /// drawn cards start at the scroll offset, so every click landed that
+    /// many places too high.
+    #[test]
+    fn clicking_a_card_in_a_scrolled_column_selects_the_card_under_the_pointer() {
+        let mut app = ready_app(false);
+        let board = board_with_members(1, &[1, 2]);
+        let tasks: Vec<Task> = (0..12)
+            .map(|i| {
+                let mut t = task_on(&board, 1);
+                t.id = TaskId(100 + i);
+                t.short_id = ShortId::from_index(2000 + i as u64);
+                t.title = format!("Task {i}");
+                t.column_id = ColumnId(1);
+                t.position = i * 10;
+                t
+            })
+            .collect();
+        let cmds = press(&mut app, KeyCode::Enter);
+        let Some(Cmd::Send(req)) = cmds.first() else {
+            panic!("{cmds:?}")
+        };
+        app.update(server(ServerMessage::Ok {
+            id: req.id,
+            response: Response::Board(BoardDetail { board, tasks }),
+        }));
+
+        // The view is what records where the cards landed, so it has to run.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::view(&mut app, f)).unwrap();
+        // Walk to the bottom of the column, dragging the view down with it.
+        for _ in 0..11 {
+            press(&mut app, KeyCode::Down);
+        }
+        term.draw(|f| crate::ui::view(&mut app, f)).unwrap();
+
+        let b = app.board.as_ref().unwrap();
+        assert!(b.col_scroll[0] > 0, "the column should have scrolled");
+        let (want, rect) = b.task_areas[0][0];
+        assert_ne!(want, TaskId(100), "the first card has scrolled off");
+
+        app.update(Msg::Term(TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y + 1,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert_eq!(
+            app.board.as_ref().unwrap().selected_task().map(|t| t.id),
+            Some(want),
+            "a click must select the card under the pointer"
+        );
+    }
 
     fn payload() -> String {
         ScanPayload {

@@ -30,6 +30,10 @@ pub struct Task {
     pub description: String,
     /// Date and time, not just a date, because reminders are in hours.
     pub due_at: Option<DateTime<Utc>>,
+    /// Overrides the user's default reminder lead time for this task only.
+    /// Minutes before `due_at`; None means the user's default applies.
+    #[serde(default)]
+    pub reminder_minutes: Option<u32>,
     pub created_by: Uid,
     pub created_at: DateTime<Utc>,
     /// Set when the task enters the finished column, cleared when it leaves.
@@ -83,6 +87,9 @@ pub struct TaskDraft {
     pub title: String,
     pub description: String,
     pub due_at: Option<DateTime<Utc>>,
+    /// Overrides the user's default reminder lead time for this task only.
+    /// Minutes before `due_at`; None means the user's default applies.
+    pub reminder_minutes: Option<u32>,
     pub assignees: Vec<Uid>,
     pub depends_on: Vec<TaskId>,
     pub checklist: Vec<ChecklistItem>,
@@ -97,6 +104,8 @@ pub enum TaskError {
     TitleTooLong,
     #[error("uid {0} is not a member of this board and cannot be assigned")]
     AssigneeNotMember(Uid),
+    #[error("a reminder cannot be more than a year before the due date")]
+    ReminderTooEarly,
     #[error("{0}")]
     Repeat(#[from] crate::repeat::RepeatError),
 }
@@ -121,6 +130,12 @@ pub fn validate_draft(draft: &TaskDraft, board: &Board) -> Result<(), TaskError>
             return Err(TaskError::AssigneeNotMember(*uid));
         }
     }
+    if draft
+        .reminder_minutes
+        .is_some_and(|m| m > crate::prefs::MAX_REMINDER_MINUTES)
+    {
+        return Err(TaskError::ReminderTooEarly);
+    }
     if let Some(r) = &draft.repeat {
         r.validate()?;
     }
@@ -142,6 +157,7 @@ pub mod test_support {
             title: "Test task".into(),
             description: String::new(),
             due_at: None,
+            reminder_minutes: None,
             created_by: creator,
             created_at: board.created_at,
             finished_at: None,
@@ -180,5 +196,18 @@ mod tests {
         assert_eq!(validate_draft(&d, &board), Err(TaskError::EmptyTitle));
         d.title = "x".repeat(MAX_TITLE_CHARS + 1);
         assert_eq!(validate_draft(&d, &board), Err(TaskError::TitleTooLong));
+    }
+
+    #[test]
+    fn a_reminder_override_is_capped_at_the_same_year_the_prefs_are() {
+        let board = board_with_members(1, &[1]);
+        let mut d = TaskDraft {
+            title: "Water plants".into(),
+            reminder_minutes: Some(crate::prefs::MAX_REMINDER_MINUTES),
+            ..Default::default()
+        };
+        assert_eq!(validate_draft(&d, &board), Ok(()));
+        d.reminder_minutes = Some(crate::prefs::MAX_REMINDER_MINUTES + 1);
+        assert_eq!(validate_draft(&d, &board), Err(TaskError::ReminderTooEarly));
     }
 }

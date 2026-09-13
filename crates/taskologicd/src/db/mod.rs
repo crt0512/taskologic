@@ -25,6 +25,9 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0004_board_description.sql")),
         M::up(include_str!("../../migrations/0005_checklist.sql")),
         M::up(include_str!("../../migrations/0006_autoprint_once.sql")),
+        M::up(include_str!(
+            "../../migrations/0007_reminders_and_template_options.sql"
+        )),
     ])
 }
 

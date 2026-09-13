@@ -85,6 +85,12 @@ impl TemplatesPanel {
             .map(|(t, _)| t)
     }
 
+    /// Every template on this board. The task form needs the list so a
+    /// template can be told to depend on its neighbours.
+    pub fn all(&self) -> Vec<Template> {
+        self.templates.iter().map(|(t, _)| t.clone()).collect()
+    }
+
     fn can_manage(&self, t: &Template) -> bool {
         self.privileged || t.owner_uid == self.me
     }
@@ -214,6 +220,7 @@ mod tests {
             owner_uid: owner,
             name: format!("t{id}"),
             draft: TaskDraft::default(),
+            options: Default::default(),
         }
     }
 

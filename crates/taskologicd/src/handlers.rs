@@ -7,13 +7,13 @@ use chrono::Utc;
 use taskologic_core::barcode::{ScanParseError, ScanPayload};
 use taskologic_core::board::{Board, plan_column_removal};
 use taskologic_core::event::EventKind;
-use taskologic_core::ids::{ColumnId, TaskId, Uid};
+use taskologic_core::ids::{ColumnId, TaskId, TemplateId, Uid};
 use taskologic_core::permission::{
     Actor, BoardAction, TaskAction, check_board, check_task, check_template_manage,
 };
 use taskologic_core::print::{AutoprintTrigger, build_task_job, wants_autoprint};
 use taskologic_core::task::{Task, TaskDraft};
-use taskologic_core::template::Template;
+use taskologic_core::template::{self, Template, TemplateError, TemplateOptions};
 use taskologic_core::transition::{self, plan_move};
 use taskologic_core::user::UserSummary;
 use taskologic_proto::{
@@ -600,12 +600,16 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             board_id,
             name,
             draft,
+            options,
         } => {
             let board = load_board(state, s, board_id)?;
             check_board(BoardAction::AddTask, &s.actor(), &board)?;
-            let (name, draft) = template_input(&board, name, draft)?;
             let template = state.db.tx(|c| {
-                let t = repo::create_template(c, board.id, s.uid, &name, &draft)?;
+                // Nothing to point at yet, and the table starts at 1, so no
+                // saved template can collide with the sentinel.
+                let (name, draft) =
+                    template_input(c, &board, TemplateId(0), name, draft, &options)?;
+                let t = repo::create_template(c, board.id, s.uid, &name, &draft, &options)?;
                 repo::record_event(
                     c,
                     board.id,
@@ -622,12 +626,13 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             template_id,
             name,
             draft,
+            options,
         } => {
             let (board, tpl) = load_template(state, s, template_id)?;
             check_template_manage(&s.actor(), &board, tpl.owner_uid)?;
-            let (name, draft) = template_input(&board, name, draft)?;
             let template = state.db.tx(|c| {
-                let t = repo::update_template(c, tpl.id, &name, &draft)?;
+                let (name, draft) = template_input(c, &board, tpl.id, name, draft, &options)?;
+                let t = repo::update_template(c, tpl.id, &name, &draft, &options)?;
                 repo::record_event(
                     c,
                     board.id,
@@ -639,6 +644,62 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                 Ok(t)
             })?;
             Ok(Response::Template { template })
+        }
+        Request::CreateFromTemplate {
+            template_id,
+            column_id,
+            draft,
+        } => {
+            let (board, tpl) = load_template(state, s, template_id)?;
+            check_board(BoardAction::AddTask, &s.actor(), &board)?;
+            let column = match column_id {
+                Some(c) if board.has_column(c) => c,
+                Some(c) => return Err(AppError::bad(format!("column {c} is not on this board"))),
+                None => board
+                    .first_column()
+                    .map(|c| c.id)
+                    .ok_or_else(|| AppError::bad("board has no columns"))?,
+            };
+            let now = Utc::now();
+            let (deps, task) = state.db.tx(|c| {
+                let graph = repo::template_deps_graph(c, board.id)?;
+                let mut deps: Vec<Task> = Vec::new();
+                for id in template::expansion_order(&graph, tpl.id) {
+                    // A dependency template deleted since it was linked is
+                    // skipped: one stale link must not block the save.
+                    let Some(dep_tpl) = repo::get_template(c, id)? else {
+                        continue;
+                    };
+                    let mut dep_draft = dep_tpl.draft;
+                    dep_draft.due_at = dep_tpl.options.due_prefill.and_then(|p| p.due_from(now));
+                    deps.push(repo::create_task(
+                        c, &board, column, &dep_draft, s.uid, now,
+                    )?);
+                }
+                // The root template's own prefill is already in the draft:
+                // the client put it in the form the user just saved.
+                let mut main = draft;
+                for dep in &deps {
+                    if !main.depends_on.contains(&dep.id) {
+                        main.depends_on.push(dep.id);
+                    }
+                }
+                check_deps(c, s, TaskId(0), &main)?;
+                let task = repo::create_task(c, &board, column, &main, s.uid, now)?;
+                Ok((deps, task))
+            })?;
+            for made in deps.iter().chain(std::iter::once(&task)) {
+                state.publish_board(
+                    &board,
+                    Event::TaskChanged {
+                        task: made.clone(),
+                        change: TaskChange::Created,
+                        actor: Some(s.uid),
+                    },
+                );
+                autoprint(state, &board, made, AutoprintTrigger::AddedToBoard);
+            }
+            Ok(Response::Task { task })
         }
         Request::DeleteTemplate { template_id } => {
             let (board, tpl) = load_template(state, s, template_id)?;
@@ -814,11 +875,17 @@ fn load_template(
 }
 
 /// Validates a template and strips what templates do not carry: a due date
-/// and dependencies belong to one instance, not to the kind of task.
+/// and dependencies belong to one instance, not to the kind of task. What
+/// replaces them lives in `options`, and checking those needs the board's
+/// other templates, so this runs inside the saving transaction. `id` is the
+/// template being saved, which is what a self dependency is measured against.
 fn template_input(
+    c: &rusqlite::Connection,
     board: &Board,
+    id: TemplateId,
     name: String,
     mut draft: TaskDraft,
+    options: &TemplateOptions,
 ) -> Result<(String, TaskDraft), AppError> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -826,6 +893,25 @@ fn template_input(
     }
     draft.due_at = None;
     draft.depends_on.clear();
+    let refuse = |e: TemplateError| AppError::bad(e.to_string());
+    if options
+        .due_prefill
+        .is_some_and(|p| p.amount > template::MAX_PREFILL_AMOUNT)
+    {
+        return Err(refuse(TemplateError::PrefillTooLarge));
+    }
+    let graph = repo::template_deps_graph(c, board.id)?;
+    for dep in &options.dep_templates {
+        if *dep == id {
+            return Err(refuse(TemplateError::SelfDependency));
+        }
+        if !graph.contains_key(dep) {
+            return Err(refuse(TemplateError::NotOnBoard(*dep)));
+        }
+    }
+    if let Some(dep) = template::first_cycle(&graph, id, &options.dep_templates) {
+        return Err(refuse(TemplateError::Cycle(dep)));
+    }
     taskologic_core::task::validate_draft(&draft, board)?;
     Ok((name, draft))
 }
@@ -1038,6 +1124,7 @@ mod tests {
     use crate::config::Config;
     use crate::db::Db;
     use taskologic_core::board::{DEFAULT_ARCHIVE_AFTER_SECS, DEFAULT_PURGE_DELETED_AFTER_SECS};
+    use taskologic_core::template::{DuePrefill, OffsetUnit};
     use taskologic_proto::{CreateBoard, ErrorBody, ErrorCode};
 
     fn state() -> Arc<AppState> {
@@ -1121,7 +1208,10 @@ mod tests {
     fn wants_prints_on_start(st: &Arc<AppState>, uid: Uid) {
         st.db
             .with(|c| {
-                let mut user = repo::list_users(c)?.into_iter().find(|u| u.uid == uid).unwrap();
+                let mut user = repo::list_users(c)?
+                    .into_iter()
+                    .find(|u| u.uid == uid)
+                    .unwrap();
                 user.prefs.print.mode = taskologic_core::prefs::PrintMode::OnStart;
                 repo::update_prefs(c, uid, &user.prefs)?;
                 Ok(())
@@ -1130,14 +1220,22 @@ mod tests {
     }
 
     fn queued_slips(st: &Arc<AppState>, uid: Uid) -> usize {
-        st.db.with(|c| repo::pending_print_jobs(c, uid, Utc::now())).unwrap().len()
+        st.db
+            .with(|c| repo::pending_print_jobs(c, uid, Utc::now()))
+            .unwrap()
+            .len()
     }
 
     fn move_to(st: &Arc<AppState>, uid: Uid, task: TaskId, to_column: ColumnId) {
         handle(
             st,
             &session(uid),
-            Request::MoveTask { task_id: task, to_column, position: None, override_deps: false },
+            Request::MoveTask {
+                task_id: task,
+                to_column,
+                position: None,
+                override_deps: false,
+            },
         )
         .unwrap();
     }
@@ -1200,6 +1298,7 @@ mod tests {
                 board_id: board.id,
                 name: "Weekly clean".into(),
                 draft,
+                options: Default::default(),
             },
         )
         .unwrap()
@@ -1222,6 +1321,7 @@ mod tests {
                 template_id: tpl.id,
                 name: "Mine now".into(),
                 draft: draft.clone(),
+                options: Default::default(),
             },
         )
         .unwrap_err();
@@ -1243,6 +1343,7 @@ mod tests {
                 template_id: tpl.id,
                 name: "Deep clean".into(),
                 draft,
+                options: Default::default(),
             },
         )
         .unwrap();
@@ -1293,6 +1394,7 @@ mod tests {
                 board_id: board.id,
                 name: "Secret".into(),
                 draft,
+                options: Default::default(),
             },
         )
         .unwrap()
@@ -1316,6 +1418,190 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(code(err), ErrorCode::NotFound);
+    }
+
+    fn make_template(
+        st: &Arc<AppState>,
+        uid: Uid,
+        board: &Board,
+        name: &str,
+        options: TemplateOptions,
+    ) -> Template {
+        let draft = TaskDraft {
+            title: name.into(),
+            ..Default::default()
+        };
+        match handle(
+            st,
+            &session(uid),
+            Request::CreateTemplate {
+                board_id: board.id,
+                name: name.into(),
+                draft,
+                options,
+            },
+        )
+        .unwrap()
+        {
+            Response::Template { template } => template,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn deps_of(st: &Arc<AppState>, board: &Board, task: &Task) -> Vec<String> {
+        let tasks = st
+            .db
+            .with(|c| repo::list_tasks(c, board.id, false))
+            .unwrap();
+        task.depends_on
+            .iter()
+            .map(|d| {
+                tasks
+                    .iter()
+                    .find(|t| t.id == *d)
+                    .map(|t| t.title.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn using_a_template_stamps_out_the_templates_it_needs() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let soap = make_template(
+            &st,
+            1,
+            &board,
+            "Buy soap",
+            TemplateOptions {
+                due_prefill: Some(DuePrefill {
+                    amount: 2,
+                    unit: OffsetUnit::Hours,
+                }),
+                dep_templates: Vec::new(),
+            },
+        );
+        let sink = make_template(&st, 1, &board, "Fill sink", TemplateOptions::default());
+        let wash = make_template(
+            &st,
+            1,
+            &board,
+            "Wash up",
+            TemplateOptions {
+                due_prefill: None,
+                dep_templates: vec![soap.id, sink.id],
+            },
+        );
+
+        let column = board.columns[1].id;
+        let draft = TaskDraft {
+            title: "Wash up".into(),
+            ..Default::default()
+        };
+        let task = match handle(
+            &st,
+            &session(1),
+            Request::CreateFromTemplate {
+                template_id: wash.id,
+                column_id: Some(column),
+                draft,
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        };
+
+        let tasks = st
+            .db
+            .with(|c| repo::list_tasks(c, board.id, false))
+            .unwrap();
+        assert_eq!(tasks.len(), 3, "one task per template");
+        assert!(
+            tasks.iter().all(|t| t.column_id == column),
+            "all of them land in the column that was asked for"
+        );
+        let mut deps = deps_of(&st, &board, &task);
+        deps.sort();
+        assert_eq!(deps, ["Buy soap", "Fill sink"]);
+
+        // A dependency template with a prefill rule gets a due date too.
+        let soap_task = tasks.iter().find(|t| t.title == "Buy soap").unwrap();
+        let ahead = soap_task.due_at.unwrap() - Utc::now();
+        assert!(
+            ahead.num_minutes() > 110 && ahead.num_minutes() <= 120,
+            "two hours ahead, was {ahead}"
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|t| t.title == "Fill sink")
+                .unwrap()
+                .due_at,
+            None,
+            "a template without a prefill rule still carries no due date"
+        );
+    }
+
+    #[test]
+    fn a_template_may_not_depend_on_itself_or_close_a_cycle() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let sink = make_template(&st, 1, &board, "Fill sink", TemplateOptions::default());
+        let wash = make_template(
+            &st,
+            1,
+            &board,
+            "Wash up",
+            TemplateOptions {
+                due_prefill: None,
+                dep_templates: vec![sink.id],
+            },
+        );
+
+        let err = handle(
+            &st,
+            &session(1),
+            Request::UpdateTemplate {
+                template_id: wash.id,
+                name: wash.name.clone(),
+                draft: wash.draft.clone(),
+                options: TemplateOptions {
+                    due_prefill: None,
+                    dep_templates: vec![wash.id],
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            ErrorBody::from(err).reason,
+            "a template cannot depend on itself"
+        );
+
+        // Filling the sink after washing up is a loop, and is refused.
+        let err = handle(
+            &st,
+            &session(1),
+            Request::UpdateTemplate {
+                template_id: sink.id,
+                name: sink.name.clone(),
+                draft: sink.draft.clone(),
+                options: TemplateOptions {
+                    due_prefill: None,
+                    dep_templates: vec![wash.id],
+                },
+            },
+        )
+        .unwrap_err();
+        let body = ErrorBody::from(err);
+        assert_eq!(body.code, ErrorCode::BadRequest);
+        assert!(body.reason.contains("would create a cycle"), "{body:?}");
+
+        // The refusal left the template alone.
+        let still = st.db.with(|c| repo::require_template(c, sink.id)).unwrap();
+        assert!(still.options.dep_templates.is_empty());
     }
 
     #[test]

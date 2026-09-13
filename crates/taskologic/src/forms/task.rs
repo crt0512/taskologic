@@ -1,9 +1,14 @@
 //! The task form, for creating and editing.
 //!
 //! Every field the README lists is here: title, multi line description,
-//! due date and time, dependencies across visible boards, assignees limited
-//! to members, and repetition. The form validates with the same rules as
-//! `taskologic_core`, but the daemon is still the authority on the save.
+//! due date and time, a reminder override, dependencies across visible
+//! boards, assignees limited to members, and repetition. The form validates
+//! with the same rules as `taskologic_core`, but the daemon is still the
+//! authority on the save.
+//!
+//! In template mode the due and dependency rows become the template's own:
+//! a rule for prefilling the due date, and other templates on the board to
+//! stamp out alongside.
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
@@ -12,9 +17,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Clear, ListItem, Paragraph};
 use taskologic_core::ids::{BoardId, ColumnId, TaskId, TemplateId, Uid};
+use taskologic_core::prefs::{parse_reminder_hours, reminder_hours_text};
 use taskologic_core::repeat::{Repeat, RepeatSpec};
 use taskologic_core::task::{ChecklistItem, Task, TaskDraft, validate_title};
-use taskologic_core::template::Template;
+use taskologic_core::template::{
+    DuePrefill, MAX_PREFILL_AMOUNT, OffsetUnit, Template, TemplateError, TemplateOptions,
+};
 use taskologic_core::user::UserSummary;
 use taskologic_proto::SearchHit;
 
@@ -42,13 +50,18 @@ pub enum FormMode {
     Create {
         board: BoardId,
         column: ColumnId,
+        /// Set when the form was stamped from a template, so saving goes
+        /// through the daemon's template path and the template's own
+        /// dependency templates get stamped out too.
+        from_template: Option<TemplateId>,
     },
     Edit {
         task: TaskId,
         version: u64,
     },
     /// A template being written. The title doubles as the template name,
-    /// and the form hides due date and dependencies: templates carry neither.
+    /// and the due and dependency rows carry the template's own: a prefill
+    /// rule rather than a date, other templates rather than tasks.
     TemplateNew {
         board: BoardId,
     },
@@ -58,11 +71,19 @@ pub enum FormMode {
     },
 }
 
+/// Everything a save carries: the draft, plus the options that only a
+/// template has.
+#[derive(Debug, PartialEq)]
+pub struct TaskSave {
+    pub draft: TaskDraft,
+    pub options: TemplateOptions,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum FormOutcome {
     Continue,
     Changed,
-    Save(TaskDraft),
+    Save(Box<TaskSave>),
     Cancel,
     /// The dependency picker wants search results for this query.
     SearchDeps(String),
@@ -81,18 +102,34 @@ pub struct TaskForm {
     self_task: Option<TaskId>,
     /// Assignees to tick once the member list arrives.
     preselect: Vec<Uid>,
+    /// Dependency templates to tick once the template list arrives.
+    preselect_templates: Vec<TemplateId>,
     title: TextInputState,
     description: TextAreaState,
     /// One item per line. `[x]` at the start marks it done; plain lines are
     /// open items, so typing a quick list needs no markers at all.
     checklist: TextAreaState,
     due: TextInputState,
+    /// Drops the current date and time into the due field.
+    insert_now: ButtonState,
+    /// Template mode: the due date rule the stamped tasks start with.
+    prefill: CheckboxState,
+    prefill_amount: TextInputState,
+    prefill_unit: ChoiceState<OffsetUnit>,
+    /// The reminder lead time for this task alone, overriding the user's
+    /// default.
+    remind_override: CheckboxState,
+    remind_hours: TextInputState,
     members: Vec<Member>,
     dep_search: TextInputState,
     dep_hits: Vec<SearchHit>,
     dep_hits_list: ListState,
     deps: Vec<(TaskId, String)>,
     deps_list: ListState,
+    /// Template mode: the other templates on this board, and whether this
+    /// one depends on them.
+    dep_templates: Vec<(TemplateId, String, bool)>,
+    dep_templates_list: ListState,
     repeat_kind: ChoiceState<RepeatKind>,
     repeat_from: Option<NaiveDate>,
     every_n: TextInputState,
@@ -137,6 +174,11 @@ impl TaskForm {
         every_n.set_text("1");
         let mut repeat_kind = ChoiceState::named("repeat_kind");
         repeat_kind.set_value(RepeatKind::None);
+        // Ticking the box alone means "now", which the offset says as zero.
+        let mut prefill_amount = TextInputState::named("prefill_amount");
+        prefill_amount.set_text("0");
+        let mut prefill_unit = ChoiceState::named("prefill_unit");
+        prefill_unit.set_value(OffsetUnit::Hours);
         let title = TextInputState::named("title");
         title.focus().set(true);
         Self {
@@ -144,16 +186,25 @@ impl TaskForm {
             tz,
             self_task: None,
             preselect: Vec::new(),
+            preselect_templates: Vec::new(),
             title,
             description: TextAreaState::named("description"),
             checklist: TextAreaState::named("checklist"),
             due: TextInputState::named("due"),
+            insert_now: ButtonState::new(),
+            prefill: CheckboxState::named("prefill"),
+            prefill_amount,
+            prefill_unit,
+            remind_override: CheckboxState::named("remind_override"),
+            remind_hours: TextInputState::named("remind_hours"),
             members: Vec::new(),
             dep_search: TextInputState::named("dep_search"),
             dep_hits: Vec::new(),
             dep_hits_list: ListState::named("dep_hits"),
             deps: Vec::new(),
             deps_list: ListState::named("deps"),
+            dep_templates: Vec::new(),
+            dep_templates_list: ListState::named("dep_templates"),
             repeat_kind,
             repeat_from: None,
             every_n,
@@ -172,13 +223,35 @@ impl TaskForm {
     }
 
     pub fn create(board: BoardId, column: ColumnId, tz: Tz) -> Self {
-        Self::blank(FormMode::Create { board, column }, tz)
+        Self::blank(
+            FormMode::Create {
+                board,
+                column,
+                from_template: None,
+            },
+            tz,
+        )
     }
 
-    /// A new task prefilled from a template, saved like any other create.
+    /// A new task prefilled from a template. The save goes through the
+    /// daemon's template path, so the template's own dependency templates
+    /// are stamped out alongside; they are not shown here.
     pub fn create_from_template(board: BoardId, column: ColumnId, tz: Tz, tpl: &Template) -> Self {
-        let mut f = Self::blank(FormMode::Create { board, column }, tz);
+        let mut f = Self::blank(
+            FormMode::Create {
+                board,
+                column,
+                from_template: Some(tpl.id),
+            },
+            tz,
+        );
         f.apply_draft(&tpl.draft);
+        // The rule is the template's, the date it lands on is this moment,
+        // and the user can still edit it before saving.
+        if let Some(due) = tpl.options.due_prefill.and_then(|p| p.due_from(Utc::now())) {
+            f.due
+                .set_text(due.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string());
+        }
         f
     }
 
@@ -195,7 +268,41 @@ impl TaskForm {
             tz,
         );
         f.apply_draft(&tpl.draft);
+        f.preselect_templates = tpl.options.dep_templates.clone();
+        if let Some(p) = tpl.options.due_prefill {
+            f.prefill.set_checked(true);
+            f.prefill_amount.set_text(p.amount.to_string());
+            f.prefill_unit.set_value(p.unit);
+        }
         f
+    }
+
+    /// The templates on this board that this one may depend on, with the
+    /// ones it already depends on ticked. The form excludes itself.
+    pub fn set_template_choices(&mut self, templates: &[Template]) {
+        let me = match self.mode {
+            FormMode::TemplateEdit { template, .. } => Some(template),
+            _ => None,
+        };
+        self.dep_templates = templates
+            .iter()
+            .filter(|t| Some(t.id) != me)
+            .map(|t| {
+                (
+                    t.id,
+                    t.name.clone(),
+                    self.preselect_templates.contains(&t.id),
+                )
+            })
+            .collect();
+        self.dep_templates_list
+            .select((!self.dep_templates.is_empty()).then_some(0));
+    }
+
+    fn toggle_dep_template(&mut self, i: usize) {
+        if let Some((_, _, on)) = self.dep_templates.get_mut(i) {
+            *on = !*on;
+        }
     }
 
     fn is_template(&self) -> bool {
@@ -206,12 +313,13 @@ impl TaskForm {
     }
 
     /// Fill the fields from a draft: title, description, checklist, the
-    /// assignee preselection and the repetition. Due date and dependencies
-    /// stay empty, this is only used for templates.
+    /// assignee preselection, the reminder override and the repetition. Due
+    /// date and dependencies stay empty, this is only used for templates.
     fn apply_draft(&mut self, draft: &TaskDraft) {
         self.preselect = draft.assignees.clone();
         self.title.set_text(draft.title.clone());
         self.description.set_text(&draft.description);
+        self.apply_reminder(draft.reminder_minutes);
         if !draft.checklist.is_empty() {
             let text: Vec<String> = draft
                 .checklist
@@ -222,6 +330,15 @@ impl TaskForm {
         }
         if let Some(spec) = &draft.repeat {
             self.apply_repeat(spec);
+        }
+    }
+
+    /// An override that is set means the box is ticked: the stored minutes
+    /// come back as the hours the user typed.
+    fn apply_reminder(&mut self, minutes: Option<u32>) {
+        if let Some(m) = minutes {
+            self.remind_override.set_checked(true);
+            self.remind_hours.set_text(reminder_hours_text(m));
         }
     }
 
@@ -277,6 +394,7 @@ impl TaskForm {
             f.due
                 .set_text(due.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string());
         }
+        f.apply_reminder(task.reminder_minutes);
         f.deps = task
             .depends_on
             .iter()
@@ -361,13 +479,24 @@ impl TaskForm {
         b.widget(&self.title);
         b.widget_navigate(&self.description, Navigation::Regular);
         b.widget_navigate(&self.checklist, Navigation::Regular);
-        if !self.is_template() {
-            b.widget(&self.due);
+        if self.is_template() {
+            b.widget(&self.prefill);
+            if self.prefill.checked() {
+                b.widget(&self.prefill_amount).widget(&self.prefill_unit);
+            }
+        } else {
+            b.widget(&self.due).widget(&self.insert_now);
+        }
+        b.widget(&self.remind_override);
+        if self.remind_override.checked() {
+            b.widget(&self.remind_hours);
         }
         for m in &self.members {
             b.widget(&m.check);
         }
-        if !self.is_template() {
+        if self.is_template() {
+            b.widget(&self.dep_templates_list);
+        } else {
             b.widget(&self.dep_search)
                 .widget(&self.dep_hits_list)
                 .widget(&self.deps_list);
@@ -405,10 +534,10 @@ impl TaskForm {
             Event::Key(k) if k.kind != KeyEventKind::Release => Some(k.code),
             _ => None,
         };
+        // An open dropdown eats Esc to close itself.
+        let popup_open = self.repeat_kind.is_popup_active() || self.prefill_unit.is_popup_active();
         match key {
-            Some(KeyCode::Esc) if !self.repeat_kind.is_popup_active() => {
-                return FormOutcome::Cancel;
-            }
+            Some(KeyCode::Esc) if !popup_open => return FormOutcome::Cancel,
             Some(KeyCode::F(2)) => return self.try_save(),
             _ => {}
         }
@@ -424,6 +553,38 @@ impl TaskForm {
         }
         if self.cancel.handle(ev, Regular) == ButtonOutcome::Pressed {
             return FormOutcome::Cancel;
+        }
+        if self.insert_now.handle(ev, Regular) == ButtonOutcome::Pressed {
+            // Written the way `parse_due` reads it back, so the field stays
+            // editable rather than turning into a magic value.
+            self.due.set_text(
+                Utc::now()
+                    .with_timezone(&self.tz)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string(),
+            );
+            return FormOutcome::Changed;
+        }
+
+        // Template dependencies are ticked, not searched for.
+        if self.dep_templates_list.is_focused()
+            && matches!(key, Some(KeyCode::Char(' ') | KeyCode::Enter))
+        {
+            if let Some(i) = self.dep_templates_list.selected() {
+                self.toggle_dep_template(i);
+            }
+            return FormOutcome::Changed;
+        }
+        if let Event::Mouse(m) = ev
+            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(i) = self
+                .dep_templates_list
+                .row_areas
+                .iter()
+                .position(|r| r.contains(ratatui::layout::Position::new(m.column, m.row)))
+        {
+            self.toggle_dep_template(i);
+            return FormOutcome::Changed;
         }
 
         // Dependency picker: Enter searches or picks, Delete drops.
@@ -484,11 +645,22 @@ impl TaskForm {
         self.title.handle(ev, Regular);
         text_area_event(&mut self.description, ev);
         text_area_event(&mut self.checklist, ev);
-        if !self.is_template() {
+        if self.is_template() {
+            self.prefill.handle(ev, Regular);
+            if self.prefill.checked() {
+                self.prefill_amount.handle(ev, Regular);
+                self.prefill_unit.handle(ev, Regular);
+            }
+            self.dep_templates_list.handle(ev, Regular);
+        } else {
             self.due.handle(ev, Regular);
             self.dep_search.handle(ev, Regular);
             self.dep_hits_list.handle(ev, Regular);
             self.deps_list.handle(ev, Regular);
+        }
+        self.remind_override.handle(ev, Regular);
+        if self.remind_override.checked() {
+            self.remind_hours.handle(ev, Regular);
         }
         for m in &mut self.members {
             m.check.handle(ev, Regular);
@@ -519,9 +691,9 @@ impl TaskForm {
 
     fn try_save(&mut self) -> FormOutcome {
         match self.values() {
-            Ok(draft) => {
+            Ok(save) => {
                 self.error = None;
-                FormOutcome::Save(draft)
+                FormOutcome::Save(Box::new(save))
             }
             Err(e) => {
                 self.error = Some(e);
@@ -530,12 +702,14 @@ impl TaskForm {
         }
     }
 
-    /// The draft as the fields stand, or the first validation problem.
-    pub fn values(&self) -> Result<TaskDraft, String> {
+    /// The draft and template options as the fields stand, or the first
+    /// validation problem.
+    pub fn values(&self) -> Result<TaskSave, String> {
         let title = self.title.text().trim().to_string();
         validate_title(&title).map_err(|e| e.to_string())?;
-        // Templates carry no due date and no dependencies; those fields are
-        // hidden, this only makes the draft say the same.
+        // A template carries a prefill rule rather than a date, and other
+        // templates rather than task dependencies; those fields are hidden,
+        // this only makes the draft say the same.
         let due_at = if self.is_template() {
             None
         } else {
@@ -554,15 +728,60 @@ impl TaskForm {
         };
         let checklist = parse_checklist(&self.checklist.text());
         let repeat = self.repeat_spec()?;
-        Ok(TaskDraft {
-            title,
-            description: self.description.text(),
-            due_at,
-            assignees,
-            depends_on,
-            checklist,
-            repeat,
+        let reminder_minutes = self.reminder_minutes()?;
+        let options = TemplateOptions {
+            due_prefill: self.due_prefill()?,
+            dep_templates: self
+                .dep_templates
+                .iter()
+                .filter(|(_, _, on)| *on)
+                .map(|(id, _, _)| *id)
+                .collect(),
+        };
+        Ok(TaskSave {
+            draft: TaskDraft {
+                title,
+                description: self.description.text(),
+                due_at,
+                reminder_minutes,
+                assignees,
+                depends_on,
+                checklist,
+                repeat,
+            },
+            options,
         })
+    }
+
+    /// Ticking the box and leaving the field blank is unfinished rather than
+    /// "use the default", so it is an error and not a silent None.
+    fn reminder_minutes(&self) -> Result<Option<u32>, String> {
+        if !self.remind_override.checked() {
+            return Ok(None);
+        }
+        match parse_reminder_hours(self.remind_hours.text())? {
+            Some(m) => Ok(Some(m)),
+            None => Err("remind needs a number of hours, fractions allowed".into()),
+        }
+    }
+
+    fn due_prefill(&self) -> Result<Option<DuePrefill>, String> {
+        if !self.prefill.checked() {
+            return Ok(None);
+        }
+        let amount: u32 = self
+            .prefill_amount
+            .text()
+            .trim()
+            .parse()
+            .map_err(|_| "the prefill offset needs a whole number".to_string())?;
+        if amount > MAX_PREFILL_AMOUNT {
+            return Err(TemplateError::PrefillTooLarge.to_string());
+        }
+        Ok(Some(DuePrefill {
+            amount,
+            unit: self.prefill_unit.value(),
+        }))
     }
 
     fn repeat_spec(&self) -> Result<Option<RepeatSpec>, String> {
@@ -616,7 +835,7 @@ impl TaskForm {
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
         let bh = button_h(t);
-        let p = popup(area, 78, 27 + bh);
+        let p = popup(area, 78, 29 + bh);
         f.render_widget(Clear, p);
         let title = match self.mode {
             FormMode::Create { .. } => " New task ",
@@ -648,6 +867,8 @@ impl TaskForm {
             Constraint::Length(3), // checklist
             gap,
             Constraint::Length(1), // due
+            gap,
+            Constraint::Length(1), // reminder
             gap,
             Constraint::Length(member_rows), // assignees
             gap,
@@ -685,25 +906,64 @@ impl TaskForm {
         );
 
         let (l, w) = split(rows[6]);
+        super::label(f, l, "Due", t);
+        let mut r = Row::new(w);
+        // The unit list opens over the rows below, so it is drawn last.
+        let mut unit_popup = None;
         if self.is_template() {
-            super::label(f, l, "Due", t);
-            f.render_widget(
-                Paragraph::new("templates carry no due date, each task gets its own")
-                    .style(t.surface_dim()),
-                w,
+            let cb = r.take(super::check_w("prefill current date and time"));
+            f.render_stateful_widget(
+                checkbox_at("prefill current date and time".into(), cb, t),
+                cb,
+                &mut self.prefill,
             );
+            if self.prefill.checked() {
+                f.render_widget(
+                    Paragraph::new("plus").style(t.surface_dim()),
+                    r.text("plus"),
+                );
+                f.render_stateful_widget(field(t), r.take(5), &mut self.prefill_amount);
+                let unit_area = r.take(11);
+                let units = OffsetUnit::ALL.map(|u| (u, u.label()));
+                let (unit_w, popup) = dropdown(units, unit_area, t);
+                f.render_stateful_widget(unit_w, unit_area, &mut self.prefill_unit);
+                dropdown_marker(f, &self.prefill_unit, t);
+                unit_popup = Some((popup, unit_area));
+            }
         } else {
-            super::label(f, l, "Due", t);
-            let [w, hint] =
-                Layout::horizontal([Constraint::Length(17), Constraint::Min(1)]).areas(w);
-            f.render_stateful_widget(field(t), w, &mut self.due);
+            let pad = if t.touch { 2 } else { 0 };
+            f.render_stateful_widget(field(t), r.take(17), &mut self.due);
+            let btn = r.take(super::button_w(" Insert current ") + pad);
+            render_button(f, btn, " Insert current ", &mut self.insert_now, t);
             f.render_widget(
-                Paragraph::new(" YYYY-MM-DD HH:MM, optional").style(t.surface_dim()),
-                hint,
+                Paragraph::new(" YYYY-MM-DD HH:MM").style(t.surface_dim()),
+                r.rest(),
             );
         }
 
         let (l, w) = split(rows[8]);
+        super::label(f, l, "Remind", t);
+        let mut r = Row::new(w);
+        let cb = r.take(super::check_w("custom "));
+        f.render_stateful_widget(
+            checkbox_at("Custom".into(), cb, t),
+            cb,
+            &mut self.remind_override,
+        );
+        if self.remind_override.checked() {
+            f.render_stateful_widget(field(t), r.take(6), &mut self.remind_hours);
+            f.render_widget(
+                Paragraph::new("hours before it is due").style(t.surface_dim()),
+                r.rest(),
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new("the default from your settings applies").style(t.surface_dim()),
+                r.rest(),
+            );
+        }
+
+        let (l, w) = split(rows[10]);
         super::label(f, l, "Assignees", t);
         if self.members.is_empty() {
             f.render_widget(
@@ -727,12 +987,11 @@ impl TaskForm {
             x += cw;
         }
 
-        let (l, w) = split(rows[10]);
+        let (l, w) = split(rows[12]);
         super::label(f, l, "Depends on", t);
         if self.is_template() {
             f.render_widget(
-                Paragraph::new("templates carry no dependencies, they belong to one task")
-                    .style(t.surface_dim()),
+                Paragraph::new("Space ticks the templates this one needs").style(t.surface_dim()),
                 w,
             );
         } else {
@@ -748,8 +1007,20 @@ impl TaskForm {
             );
         }
 
-        if !self.is_template() {
-            let (_, w) = split(rows[11]);
+        let (_, w) = split(rows[13]);
+        if self.is_template() {
+            let items: Vec<ListItem> = if self.dep_templates.is_empty() {
+                vec![ListItem::new("no other templates on this board").style(t.surface_dim())]
+            } else {
+                self.dep_templates
+                    .iter()
+                    .map(|(_, name, on)| {
+                        ListItem::new(format!("{} {name}", if *on { "[x]" } else { "[ ]" }))
+                    })
+                    .collect()
+            };
+            f.render_stateful_widget(list(items, t), w, &mut self.dep_templates_list);
+        } else {
             let [hits, chosen] =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .areas(w);
@@ -773,7 +1044,7 @@ impl TaskForm {
             f.render_stateful_widget(list(chosen_items, t), chosen, &mut self.deps_list);
         }
 
-        let (l, w) = split(rows[13]);
+        let (l, w) = split(rows[15]);
         super::label(f, l, "Repeat", t);
         let items = [
             (RepeatKind::None, "never"),
@@ -788,7 +1059,7 @@ impl TaskForm {
         dropdown_marker(f, &self.repeat_kind, t);
         let repeat_area = w;
 
-        let (_, w) = split(rows[14]);
+        let (_, w) = split(rows[16]);
         match self.repeat_kind.value() {
             RepeatKind::None => {}
             RepeatKind::EveryDays => {
@@ -834,12 +1105,17 @@ impl TaskForm {
         }
 
         if let Some(e) = &self.error {
-            f.render_widget(Paragraph::new(e.clone()).style(t.error()), rows[15]);
+            f.render_widget(Paragraph::new(e.clone()).style(t.error()), rows[17]);
         }
 
-        let (save, cancel) = button_row(rows[16], " Save ", " Cancel ", t);
+        let (save, cancel) = button_row(rows[18], " Save ", " Cancel ", t);
         render_button(f, save, " Save ", &mut self.save, t);
         render_button(f, cancel, " Cancel ", &mut self.cancel, t);
+        // Open dropdown lists draw over everything else.
+        if let Some((popup, unit_area)) = unit_popup {
+            f.render_stateful_widget(popup, unit_area, &mut self.prefill_unit);
+            dropdown_popup_hover(f, &self.prefill_unit, t);
+        }
         f.render_stateful_widget(repeat_popup, repeat_area, &mut self.repeat_kind);
         dropdown_popup_hover(f, &self.repeat_kind, t);
 
@@ -848,6 +1124,8 @@ impl TaskForm {
             self.description.screen_cursor(),
             self.checklist.screen_cursor(),
             self.due.screen_cursor(),
+            self.prefill_amount.screen_cursor(),
+            self.remind_hours.screen_cursor(),
             self.dep_search.screen_cursor(),
             self.every_n.screen_cursor(),
             self.day_of_month.screen_cursor(),
@@ -924,7 +1202,7 @@ pub fn conflict_lines(
 ) -> Vec<String> {
     let mut out = Vec::new();
     let draft = match form.values() {
-        Ok(d) => d,
+        Ok(s) => s.draft,
         Err(e) => return vec![format!("your form is not valid yet: {e}")],
     };
     if draft.title != current.title {
@@ -949,6 +1227,17 @@ pub fn conflict_lines(
             "Due: yours {}, theirs {}",
             show(draft.due_at),
             show(current.due_at)
+        ));
+    }
+    if draft.reminder_minutes != current.reminder_minutes {
+        let show = |m: Option<u32>| {
+            m.map(|m| format!("{} hours before", reminder_hours_text(m)))
+                .unwrap_or_else(|| "the default".into())
+        };
+        out.push(format!(
+            "Reminder: yours {}, theirs {}",
+            show(draft.reminder_minutes),
+            show(current.reminder_minutes)
         ));
     }
     let mut a = draft.assignees.clone();
@@ -999,6 +1288,20 @@ mod tests {
         }
     }
 
+    fn template(id: i64, name: &str, options: TemplateOptions) -> Template {
+        Template {
+            id: TemplateId(id),
+            board_id: BoardId(1),
+            owner_uid: 1,
+            name: name.into(),
+            draft: TaskDraft {
+                title: name.into(),
+                ..Default::default()
+            },
+            options,
+        }
+    }
+
     #[test]
     fn checklist_lines_parse_and_round_trip() {
         assert_eq!(parse_checklist(""), vec![]);
@@ -1029,7 +1332,7 @@ mod tests {
         let mut task = task_on(&board, 1);
         task.checklist = items;
         let form = TaskForm::edit(&task, chrono_tz::UTC, &|_| None);
-        assert_eq!(form.values().unwrap().checklist, task.checklist);
+        assert_eq!(form.values().unwrap().draft.checklist, task.checklist);
     }
 
     #[test]
@@ -1039,7 +1342,7 @@ mod tests {
         assert!(form.error.as_deref().unwrap_or("").contains("title"));
         type_str(&mut form, "Water plants");
         match form.handle(&key(KeyCode::F(2))) {
-            FormOutcome::Save(d) => assert_eq!(d.title, "Water plants"),
+            FormOutcome::Save(s) => assert_eq!(s.draft.title, "Water plants"),
             other => panic!("{other:?}"),
         }
     }
@@ -1091,7 +1394,7 @@ mod tests {
                 is_admin: false,
             },
         ]);
-        let draft = form.values().unwrap();
+        let draft = form.values().unwrap().draft;
         assert_eq!(draft.title, "Taxes");
         assert_eq!(draft.description, "Q3\nand Q4");
         assert_eq!(draft.assignees, vec![2]);
@@ -1144,6 +1447,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            options: TemplateOptions::default(),
         };
         let mut form = TaskForm::template_edit(&tpl, chrono_tz::UTC);
         form.set_members(&[
@@ -1158,23 +1462,28 @@ mod tests {
                 is_admin: false,
             },
         ]);
-        let draft = form.values().unwrap();
+        let draft = form.values().unwrap().draft;
         assert_eq!(draft.title, "Weekly clean");
         assert_eq!(draft.assignees, vec![2]);
         assert_eq!(draft.checklist, tpl.draft.checklist);
         assert_eq!(draft.repeat, tpl.draft.repeat);
         assert_eq!(draft.due_at, None);
         assert!(draft.depends_on.is_empty());
-        // Using a template starts a plain create with the same content.
+        // Using a template starts a create that remembers where it came
+        // from, with the same content.
         let form = TaskForm::create_from_template(BoardId(1), ColumnId(1), chrono_tz::UTC, &tpl);
         assert_eq!(
             form.mode,
             FormMode::Create {
                 board: BoardId(1),
-                column: ColumnId(1)
+                column: ColumnId(1),
+                from_template: Some(TemplateId(5))
             }
         );
-        assert_eq!(form.values().unwrap().description, "kitchen and hallway");
+        assert_eq!(
+            form.values().unwrap().draft.description,
+            "kitchen and hallway"
+        );
     }
 
     #[test]
@@ -1206,9 +1515,9 @@ mod tests {
     #[test]
     fn dependency_picker_searches_then_adds() {
         let mut form = TaskForm::create(BoardId(1), ColumnId(1), chrono_tz::UTC);
-        // Tab from title: description, checklist, due, then (no members yet)
-        // the search box.
-        for _ in 0..4 {
+        // Tab from title: description, checklist, due, Insert current, the
+        // reminder box, then (no members yet) the search box.
+        for _ in 0..6 {
             form.handle(&key(KeyCode::Tab));
         }
         assert!(form.dep_search.is_focused());
@@ -1231,5 +1540,123 @@ mod tests {
         assert!(form.dep_hits.is_empty());
         type_str(&mut form, "");
         assert_eq!(form.handle(&key(KeyCode::Esc)), FormOutcome::Cancel);
+    }
+
+    #[test]
+    fn insert_current_fills_a_due_date_the_form_reads_back() {
+        let mut form = TaskForm::create(BoardId(1), ColumnId(1), chrono_tz::Europe::Berlin);
+        type_str(&mut form, "Feed the cat");
+        // Tab from title: description, checklist, due, then the button.
+        for _ in 0..4 {
+            form.handle(&key(KeyCode::Tab));
+        }
+        assert!(form.insert_now.is_focused());
+        form.handle(&key(KeyCode::Enter));
+        let due = form.values().unwrap().draft.due_at.expect("a due date");
+        assert!((Utc::now() - due).num_minutes().abs() <= 1);
+    }
+
+    #[test]
+    fn a_reminder_override_is_typed_in_hours_and_saved_in_minutes() {
+        let mut form = TaskForm::create(BoardId(1), ColumnId(1), chrono_tz::UTC);
+        type_str(&mut form, "Take the bins out");
+        // Tab from title: description, checklist, due, Insert current, then
+        // the reminder box.
+        for _ in 0..5 {
+            form.handle(&key(KeyCode::Tab));
+        }
+        assert!(form.remind_override.is_focused());
+        form.handle(&key(KeyCode::Char(' ')));
+        form.handle(&key(KeyCode::Tab));
+        assert!(form.remind_hours.is_focused());
+        type_str(&mut form, "1.5");
+        assert_eq!(form.values().unwrap().draft.reminder_minutes, Some(90));
+        // Ticked and blank is unfinished, not "use the default".
+        form.remind_hours.set_text("");
+        assert!(form.values().is_err());
+    }
+
+    #[test]
+    fn a_changed_reminder_shows_up_in_the_conflict_dialog() {
+        let board = board_with_members(1, &[1]);
+        let mut task = task_on(&board, 1);
+        task.reminder_minutes = Some(90);
+        let form = TaskForm::edit(&task, chrono_tz::UTC, &|_| None);
+        assert_eq!(form.values().unwrap().draft.reminder_minutes, Some(90));
+        task.reminder_minutes = None;
+        let lines = conflict_lines(&form, &task, &|u| format!("u{u}"));
+        assert!(
+            lines.contains(&"Reminder: yours 1.5 hours before, theirs the default".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_template_keeps_its_prefill_rule_and_the_templates_it_needs() {
+        let tpl = template(
+            1,
+            "Order parts",
+            TemplateOptions {
+                due_prefill: Some(DuePrefill {
+                    amount: 2,
+                    unit: OffsetUnit::Days,
+                }),
+                dep_templates: vec![TemplateId(2)],
+            },
+        );
+        let mut form = TaskForm::template_edit(&tpl, chrono_tz::UTC);
+        form.set_template_choices(&[
+            tpl.clone(),
+            template(2, "Empty the van", TemplateOptions::default()),
+            template(3, "Book the lift", TemplateOptions::default()),
+        ]);
+        // A template is never offered as a dependency of itself.
+        assert_eq!(form.dep_templates.len(), 2);
+        assert_eq!(form.values().unwrap().options, tpl.options);
+        // The list only knows how far it can move once it has been drawn, so
+        // arrow keys do nothing until the form has been through a render.
+        let theme = crate::ui::theme::Theme::default();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| form.render(f, f.area(), &theme)).unwrap();
+        // Tab from title: description, checklist, the prefill box, its
+        // amount and unit, the reminder box, then the template list.
+        for _ in 0..7 {
+            form.handle(&key(KeyCode::Tab));
+        }
+        assert!(form.dep_templates_list.is_focused());
+        form.handle(&key(KeyCode::Down));
+        form.handle(&key(KeyCode::Char(' ')));
+        assert_eq!(
+            form.values().unwrap().options.dep_templates,
+            vec![TemplateId(2), TemplateId(3)]
+        );
+    }
+
+    #[test]
+    fn using_a_template_with_a_prefill_rule_fills_the_due_field() {
+        let tpl = template(
+            4,
+            "Weekly order",
+            TemplateOptions {
+                due_prefill: Some(DuePrefill {
+                    amount: 3,
+                    unit: OffsetUnit::Hours,
+                }),
+                dep_templates: Vec::new(),
+            },
+        );
+        let form = TaskForm::create_from_template(
+            BoardId(1),
+            ColumnId(1),
+            chrono_tz::Europe::Berlin,
+            &tpl,
+        );
+        let due = form.values().unwrap().draft.due_at.expect("a due date");
+        let ahead = (due - Utc::now()).num_minutes();
+        assert!((179..=180).contains(&ahead), "{ahead} minutes ahead");
+        // Without the rule the due field stays empty.
+        let plain = template(5, "Ad hoc", TemplateOptions::default());
+        let form = TaskForm::create_from_template(BoardId(1), ColumnId(1), chrono_tz::UTC, &plain);
+        assert_eq!(form.values().unwrap().draft.due_at, None);
     }
 }

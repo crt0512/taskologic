@@ -137,10 +137,9 @@ fn fire_repeats(state: &Arc<AppState>) -> Result<(), AppError> {
 fn print_reminders(state: &Arc<AppState>) -> Result<(), AppError> {
     let now = Utc::now();
     let users = state.db.with(repo::list_users)?;
-    for user in users
-        .into_iter()
-        .filter(|u| u.prefs.print.reminder_hours.is_some())
-    {
+    // Deliberately not filtered on a default lead time: a task can carry its
+    // own override, which has to fire for someone who has no default at all.
+    for user in users {
         let tasks = state.db.with(|c| repo::reminder_candidates(c, user.uid))?;
         for task in tasks {
             let (Some(at), Some(due)) = (reminder_at(&task, &user.prefs.print), task.due_at) else {

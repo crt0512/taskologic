@@ -40,8 +40,21 @@ fn init_logging() {
         .init();
 }
 
+/// This binary is somebody's login shell, so it gets handed all sorts of
+/// arguments it has never cared about and must keep ignoring. The one
+/// exception is a bare `--version`, which `scripts/update.sh` asks for to
+/// find out what is installed before it overwrites it.
+fn version_asked() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    matches!(args.as_slice(), [one] if one == "--version" || one == "-V")
+}
+
 #[tokio::main]
 async fn main() {
+    if version_asked() {
+        println!("taskologic {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     term::install_panic_hook();
     let code = match run().await {
         Ok(()) => 0,

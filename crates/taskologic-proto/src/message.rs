@@ -6,7 +6,7 @@ use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, TaskId, TemplateId, Ui
 use taskologic_core::prefs::{CardFields, UserPrefs};
 use taskologic_core::print::PrintJob;
 use taskologic_core::task::{Task, TaskDraft};
-use taskologic_core::template::Template;
+use taskologic_core::template::{Template, TemplateOptions};
 use taskologic_core::user::{User, UserSummary};
 
 pub type RequestId = u64;
@@ -230,16 +230,30 @@ pub enum Request {
         board_id: BoardId,
     },
     /// Any member can save a template. The draft's due date and dependencies
-    /// are ignored, templates do not carry them.
+    /// are still ignored: a template carries a due date *prefill rule* and
+    /// dependencies on other *templates* instead, both in `options`.
     CreateTemplate {
         board_id: BoardId,
         name: String,
         draft: TaskDraft,
+        #[serde(default)]
+        options: TemplateOptions,
     },
     /// Template creator, board owner or admin.
     UpdateTemplate {
         template_id: TemplateId,
         name: String,
+        draft: TaskDraft,
+        #[serde(default)]
+        options: TemplateOptions,
+    },
+    /// Stamp a task out of a template. The template's dependency templates
+    /// are stamped out first, in dependency order, and the new task depends
+    /// on the tasks they produced. The draft is what the user had in the
+    /// form, so an edit before saving still counts.
+    CreateFromTemplate {
+        template_id: TemplateId,
+        column_id: Option<ColumnId>,
         draft: TaskDraft,
     },
     /// Template creator, board owner or admin.
@@ -578,6 +592,39 @@ mod tests {
                 include_archived: false
             }
         );
+        let line = r#"{"id":9,"request":{"type":"create_template","board_id":1,"name":"Weekly","draft":{"title":"Water plants"}}}"#;
+        let msg: ClientMessage = decode(line).unwrap();
+        assert_eq!(
+            msg.request,
+            Request::CreateTemplate {
+                board_id: BoardId(1),
+                name: "Weekly".into(),
+                draft: TaskDraft {
+                    title: "Water plants".into(),
+                    ..Default::default()
+                },
+                options: TemplateOptions::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn stamping_a_task_out_of_a_template_round_trips() {
+        let msg = ClientMessage {
+            id: 4,
+            request: Request::CreateFromTemplate {
+                template_id: TemplateId(2),
+                column_id: Some(ColumnId(3)),
+                draft: TaskDraft {
+                    title: "Water plants".into(),
+                    reminder_minutes: Some(90),
+                    ..Default::default()
+                },
+            },
+        };
+        let line = encode(&msg).unwrap();
+        assert!(line.contains(r#""type":"create_from_template""#), "{line}");
+        assert_eq!(decode::<ClientMessage>(&line).unwrap(), msg);
     }
 
     #[test]

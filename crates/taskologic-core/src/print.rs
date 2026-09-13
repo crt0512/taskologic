@@ -215,11 +215,13 @@ pub fn wants_autoprint(
     by_assignment || by_creation
 }
 
-/// When a reminder should print for this task, if the user wants one.
+/// When a reminder should print for this task. A task can override the
+/// user's default lead time, and an override works even when the user has no
+/// default, because ticking it on one task is a deliberate act.
 pub fn reminder_at(task: &Task, prefs: &PrintPrefs) -> Option<DateTime<Utc>> {
-    let hours = prefs.reminder_hours?;
+    let minutes = task.reminder_minutes.or(prefs.reminder_minutes)?;
     let due = task.due_at?;
-    due.checked_sub_signed(TimeDelta::hours(i64::from(hours)))
+    due.checked_sub_signed(TimeDelta::minutes(i64::from(minutes)))
 }
 
 #[cfg(test)]
@@ -257,8 +259,15 @@ mod tests {
         let job = build_task_job(&task, &board, &[], &names, &user(1, prefs.clone()), now);
         assert_eq!(job.description.as_deref(), Some("Two lines\nof text"));
         assert_eq!(job.assignees, Some(vec!["user2".to_string()]));
-        assert_eq!(job.created_by.as_deref(), Some("user1"), "sent even though few slips show it");
-        assert_eq!(job.dependencies, None, "a task with no dependencies has none to send");
+        assert_eq!(
+            job.created_by.as_deref(),
+            Some("user1"),
+            "sent even though few slips show it"
+        );
+        assert_eq!(
+            job.dependencies, None,
+            "a task with no dependencies has none to send"
+        );
         assert_eq!(job.checklist, task.checklist);
 
         // Barcodes ride along whatever the scanner prefs say; the layout
@@ -285,7 +294,11 @@ mod tests {
         assert_eq!(job.kind, PrintJobKind::Reminder);
         // A reminder is not a different document, it is the same one with a
         // different layout in front of it, so it carries the same fields.
-        assert_eq!(job.barcodes.len(), 2, "start and finish, as a task slip has");
+        assert_eq!(
+            job.barcodes.len(),
+            2,
+            "start and finish, as a task slip has"
+        );
         assert!(job.barcodes[0].payload.starts_with("--1S"));
         assert_eq!(job.due_at, task.due_at);
         assert_eq!(job.checklist, task.checklist);
@@ -381,7 +394,7 @@ mod tests {
         let board = board_with_members(1, &[1]);
         let mut task = task_on(&board, 1);
         let prefs = PrintPrefs {
-            reminder_hours: Some(2),
+            reminder_minutes: Some(120),
             ..Default::default()
         };
         assert_eq!(reminder_at(&task, &prefs), None);
@@ -391,5 +404,26 @@ mod tests {
             Some(DateTime::from_timestamp(10_000 - 7200, 0).unwrap())
         );
         assert_eq!(reminder_at(&task, &PrintPrefs::default()), None);
+    }
+
+    #[test]
+    fn a_tasks_own_lead_time_beats_the_default_and_stands_without_one() {
+        let board = board_with_members(1, &[1]);
+        let mut task = task_on(&board, 1);
+        task.due_at = Some(DateTime::from_timestamp(10_000, 0).unwrap());
+        task.reminder_minutes = Some(30);
+        let prefs = PrintPrefs {
+            reminder_minutes: Some(120),
+            ..Default::default()
+        };
+        assert_eq!(
+            reminder_at(&task, &prefs),
+            Some(DateTime::from_timestamp(10_000 - 1800, 0).unwrap())
+        );
+        assert_eq!(
+            reminder_at(&task, &PrintPrefs::default()),
+            Some(DateTime::from_timestamp(10_000 - 1800, 0).unwrap()),
+            "ticking it on one task is a deliberate act, default or not"
+        );
     }
 }

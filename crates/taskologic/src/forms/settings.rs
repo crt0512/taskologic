@@ -10,7 +10,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use taskologic_core::barcode::Magic;
 use taskologic_core::prefs::{
     AutoprintFilter, CardFields, CustomColors, PrintMode, PrintPrefs, ScannerPrefs, ThemePreset,
-    UiPrefs, UserPrefs,
+    UiPrefs, UserPrefs, parse_reminder_hours, reminder_hours_text,
 };
 use taskologic_core::print::Symbology;
 use taskologic_core::user::User;
@@ -71,6 +71,8 @@ pub struct SettingsForm {
     board_tabs: CheckboxState,
     touchscreen: CheckboxState,
     scanner: CheckboxState,
+    show_date: CheckboxState,
+    show_time: CheckboxState,
     timezone: TextInputState,
     original_tz: Tz,
     card_default: CheckboxState,
@@ -108,8 +110,8 @@ impl SettingsForm {
         let mut timezone = TextInputState::named("timezone");
         timezone.set_text(user.timezone.name());
         let mut reminder_hours = TextInputState::named("reminder_hours");
-        if let Some(h) = p.print.reminder_hours {
-            reminder_hours.set_text(h.to_string());
+        if let Some(m) = p.print.reminder_minutes {
+            reminder_hours.set_text(reminder_hours_text(m));
         }
         let mut mode = ChoiceState::named("mode");
         mode.set_value(p.print.mode);
@@ -130,6 +132,8 @@ impl SettingsForm {
             board_tabs,
             touchscreen: check("touchscreen", p.ui.touchscreen),
             scanner: check("scanner", p.ui.scanner_enabled),
+            show_date: check("show_date", p.ui.show_date),
+            show_time: check("show_time", p.ui.show_time),
             timezone,
             original_tz: user.timezone,
             card_default: check("card_default", p.ui.card_fields.is_none()),
@@ -169,6 +173,8 @@ impl SettingsForm {
         b.widget(&self.board_tabs)
             .widget(&self.touchscreen)
             .widget(&self.scanner)
+            .widget(&self.show_date)
+            .widget(&self.show_time)
             .widget(&self.timezone)
             .widget(&self.card_default);
         if !self.card_default.checked() {
@@ -236,6 +242,8 @@ impl SettingsForm {
             &mut self.board_tabs,
             &mut self.touchscreen,
             &mut self.scanner,
+            &mut self.show_date,
+            &mut self.show_time,
             &mut self.card_default,
             &mut self.card_due,
             &mut self.card_assignees,
@@ -292,16 +300,7 @@ impl SettingsForm {
     }
 
     pub fn values(&self) -> Result<(UserPrefs, Option<Tz>), String> {
-        let reminder = self.reminder_hours.text().trim().to_string();
-        let reminder_hours = if reminder.is_empty() {
-            None
-        } else {
-            Some(
-                reminder
-                    .parse::<u32>()
-                    .map_err(|_| "reminder hours must be a whole number".to_string())?,
-            )
-        };
+        let reminder_minutes = parse_reminder_hours(self.reminder_hours.text())?;
         let tz_text = self.timezone.text().trim().to_string();
         let tz: Tz = tz_text
             .parse()
@@ -320,10 +319,12 @@ impl SettingsForm {
                 }),
                 touchscreen: self.touchscreen.checked(),
                 scanner_enabled: self.scanner.checked(),
+                show_date: self.show_date.checked(),
+                show_time: self.show_time.checked(),
             },
             print: PrintPrefs {
                 show_print_button: self.print_button.checked(),
-                reminder_hours,
+                reminder_minutes,
                 mode: self.mode.value(),
                 autoprint_filter: self.filter_on.checked().then(|| AutoprintFilter {
                     assigned_to_me: self.filter_assigned.checked(),
@@ -345,7 +346,7 @@ impl SettingsForm {
     pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
         let bh = button_h(t);
         let pad = if t.touch { 2 } else { 0 };
-        let p = popup(area, 78, 19 + bh);
+        let p = popup(area, 78, 20 + bh);
         f.render_widget(Clear, p);
         let hint = if self.saving {
             " saving... "
@@ -355,7 +356,7 @@ impl SettingsForm {
         let block = frame_block(" Settings ", hint, t);
         let inner = block.inner(p);
         f.render_widget(block, p);
-        let mut constraints = vec![Constraint::Length(1); 17];
+        let mut constraints = vec![Constraint::Length(1); 18];
         constraints.push(Constraint::Length(bh));
         let rows = Layout::vertical(constraints).split(inner);
         let lw = 11;
@@ -399,7 +400,23 @@ impl SettingsForm {
             &mut self.scanner,
         );
 
+        // Five checkboxes do not fit on one row, so Interface runs on.
         let (_, w) = split_label(rows[2], lw);
+        let mut r = Row::new(w);
+        let cb = r.take(check_w("show date"));
+        f.render_stateful_widget(
+            checkbox_at("show date".into(), cb, t),
+            cb,
+            &mut self.show_date,
+        );
+        let cb = r.take(check_w("show time"));
+        f.render_stateful_widget(
+            checkbox_at("show time".into(), cb, t),
+            cb,
+            &mut self.show_time,
+        );
+
+        let (_, w) = split_label(rows[3], lw);
         let mouse = if self.mouse_seen {
             "mouse events are arriving, clicking and dragging work"
         } else {
@@ -407,7 +424,7 @@ impl SettingsForm {
         };
         f.render_widget(Paragraph::new(mouse).style(t.surface_dim()), w);
 
-        let (l, w) = split_label(rows[3], lw);
+        let (l, w) = split_label(rows[4], lw);
         label(f, l, "Timezone", t);
         let mut r = Row::new(w);
         f.render_stateful_widget(field(t), r.take(26), &mut self.timezone);
@@ -416,7 +433,7 @@ impl SettingsForm {
             r.rest(),
         );
 
-        let (l, w) = split_label(rows[4], lw);
+        let (l, w) = split_label(rows[5], lw);
         label(f, l, "Cards show", t);
         let mut r = Row::new(w);
         let cb = r.take(check_w("what the board says"));
@@ -431,7 +448,7 @@ impl SettingsForm {
                 r.rest(),
             );
         }
-        let (_, w) = split_label(rows[5], lw);
+        let (_, w) = split_label(rows[6], lw);
         if !self.card_default.checked() {
             let mut r = Row::new(w);
             let cb = r.take(check_w("due date"));
@@ -462,7 +479,7 @@ impl SettingsForm {
             f.render_stateful_widget(checkbox_at("id".into(), cb, t), cb, &mut self.card_short_id);
         }
 
-        let (l, w) = split_label(rows[6], lw);
+        let (l, w) = split_label(rows[7], lw);
         label(f, l, "Slips show", t);
         let mut r = Row::new(w);
         let cb = r.take(check_w("print button"));
@@ -477,17 +494,17 @@ impl SettingsForm {
             r.rest(),
         );
 
-        let (l, w) = split_label(rows[8], lw);
+        let (l, w) = split_label(rows[9], lw);
         label(f, l, "Remind", t);
         let mut r = Row::new(w);
-        f.render_stateful_widget(field(t), r.take(5), &mut self.reminder_hours);
+        f.render_stateful_widget(field(t), r.take(6), &mut self.reminder_hours);
         f.render_widget(
-            Paragraph::new("hours before a task is due, empty for no reminders")
+            Paragraph::new("hours before a task is due, fractions ok, empty for none")
                 .style(t.surface_dim()),
             r.rest(),
         );
 
-        let (l, w) = split_label(rows[9], lw);
+        let (l, w) = split_label(rows[10], lw);
         label(f, l, "Auto print", t);
         let mut r = Row::new(w);
         let mode_area = r.take(16);
@@ -501,7 +518,7 @@ impl SettingsForm {
             &mut self.filter_on,
         );
 
-        let (_, w) = split_label(rows[10], lw);
+        let (_, w) = split_label(rows[11], lw);
         if self.filter_on.checked() {
             let mut r = Row::new(w);
             let cb = r.take(check_w("assigned to me"));
@@ -524,7 +541,7 @@ impl SettingsForm {
             );
         }
 
-        let (l, w) = split_label(rows[11], lw);
+        let (l, w) = split_label(rows[12], lw);
         label(f, l, "Scanner", t);
         let mut r = Row::new(w);
         let cb = r.take(check_w("presses Enter"));
@@ -545,7 +562,7 @@ impl SettingsForm {
         );
         f.render_stateful_widget(field(t), r.take(10), &mut self.prefix);
 
-        let (l, w) = split_label(rows[12], lw);
+        let (l, w) = split_label(rows[13], lw);
         label(f, l, "Barcodes", t);
         let mut r = Row::new(w);
         let format_area = r.take(14);
@@ -561,7 +578,7 @@ impl SettingsForm {
         f.render_stateful_widget(magic_w, magic_area, &mut self.magic);
         dropdown_marker(f, &self.magic, t);
 
-        let (l, w) = split_label(rows[14], lw);
+        let (l, w) = split_label(rows[15], lw);
         label(f, l, "Printer", t);
         let mut r = Row::new(w);
         let pb = r.take(super::button_w(" Printer setup ") + pad);
@@ -572,9 +589,9 @@ impl SettingsForm {
         );
 
         if let Some(e) = &self.error {
-            f.render_widget(Paragraph::new(e.clone()).style(t.error()), rows[15]);
+            f.render_widget(Paragraph::new(e.clone()).style(t.error()), rows[16]);
         }
-        let (save, cancel) = button_row(rows[17], " Save ", " Cancel ", t);
+        let (save, cancel) = button_row(rows[18], " Save ", " Cancel ", t);
         render_button(f, save, " Save ", &mut self.save, t);
         render_button(f, cancel, " Cancel ", &mut self.cancel, t);
 
@@ -609,7 +626,7 @@ mod tests {
 
     fn user() -> User {
         let mut prefs = UserPrefs::default();
-        prefs.print.reminder_hours = Some(3);
+        prefs.print.reminder_minutes = Some(180);
         User {
             uid: 1,
             username: "alice".into(),
@@ -645,6 +662,24 @@ mod tests {
             SettingsOutcome::Save { prefs, .. } => assert!(!prefs.ui.show_board_tabs),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_hour_and_a_half_is_kept_as_ninety_minutes() {
+        let u = user();
+        let mut form = SettingsForm::new(&u, None, false);
+        form.reminder_hours.set_text("1.5");
+        assert_eq!(form.values().unwrap().0.print.reminder_minutes, Some(90));
+    }
+
+    #[test]
+    fn the_clock_checkboxes_reach_the_prefs() {
+        let u = user();
+        let mut form = SettingsForm::new(&u, None, false);
+        form.show_date.set_checked(true);
+        form.show_time.set_checked(true);
+        let ui = form.values().unwrap().0.ui;
+        assert!(ui.show_date && ui.show_time);
     }
 
     #[test]

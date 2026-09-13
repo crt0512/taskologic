@@ -167,14 +167,15 @@ fn local_to_utc(tz: Tz, naive: NaiveDateTime) -> DateTime<Utc> {
 }
 
 /// The draft for the next instance of a repeating task. Title, description,
-/// assignees, checklist and repetition carry over. Dependencies, due date
-/// and the finished state do not. Assignees who left the board are dropped,
+/// reminder override, assignees, checklist and repetition carry over.
+/// Dependencies, due date and the finished state do not. Assignees who left the board are dropped,
 /// and the checklist starts unticked.
 pub fn next_instance(task: &Task, board: &Board) -> TaskDraft {
     TaskDraft {
         title: task.title.clone(),
         description: task.description.clone(),
         due_at: None,
+        reminder_minutes: task.reminder_minutes,
         assignees: task
             .assignees
             .iter()
