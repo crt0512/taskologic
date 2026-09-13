@@ -80,7 +80,9 @@ pub fn view(app: &mut App, f: &mut Frame) {
     .areas(area);
     title_bar(app, f, title, &bg);
     menu_bar(app, f, menu, &bg);
-    if app.board.is_some() {
+    if let Some(panel) = &mut app.analytics {
+        panel.render(f, body, &bg);
+    } else if app.board.is_some() {
         board_body(app, f, body, &bg);
     } else {
         dashboard_body(app, f, body, &bg);
@@ -167,9 +169,10 @@ fn title_bar(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         } else {
             format!(" | {clock}")
         };
-        let where_ = match &app.board {
-            Some(b) => format!(" Taskologic{stamp} | {}", b.detail.board.name),
-            None => format!(" Taskologic{stamp} | Dashboard"),
+        let where_ = match (&app.analytics, &app.board) {
+            (Some(a), _) => format!(" Taskologic{stamp} | Analytics: {}", a.scope_label()),
+            (None, Some(b)) => format!(" Taskologic{stamp} | {}", b.detail.board.name),
+            (None, None) => format!(" Taskologic{stamp} | Dashboard"),
         };
         f.render_widget(
             Paragraph::new(where_).style(t.title_bar()),
@@ -320,7 +323,12 @@ fn menu_items(app: &App) -> Vec<MenuItem> {
         .as_ref()
         .is_some_and(|b| b.selected_task().is_some());
     if app.board.is_some() {
-        let mut v: Vec<MenuItem> = vec![("Boards", 'b'), ("New task", 'n'), ("Templates", 'T')];
+        let mut v: Vec<MenuItem> = vec![
+            ("Boards", 'b'),
+            ("New task", 'n'),
+            ("Templates", 'T'),
+            ("Analytics", 'A'),
+        ];
         if has_task {
             v.push(("Edit", 'e'));
             v.push(("Delete", 'd'));
@@ -331,7 +339,12 @@ fn menu_items(app: &App) -> Vec<MenuItem> {
         v.push(("Help", '?'));
         v
     } else {
-        vec![("New board", 'N'), ("Search", '/'), ("Help", '?')]
+        vec![
+            ("New board", 'N'),
+            ("Analytics", 'A'),
+            ("Search", '/'),
+            ("Help", '?'),
+        ]
     }
 }
 
@@ -341,6 +354,16 @@ pub fn more_items(app: &App) -> Vec<(String, char)> {
     let privileged = app.privileged_on_open_board();
     let admin = app.user.as_ref().is_some_and(|u| u.is_admin);
     let mut v: Vec<(String, char)> = Vec::new();
+    // On the analytics screen the board's own entries would act on a board
+    // that is not on screen, so only what is always true is offered.
+    if app.analytics.is_some() {
+        if admin {
+            v.push(("Users and admins".into(), 'u'));
+        }
+        v.push(("Settings".into(), 'S'));
+        v.push(("Quit".into(), 'q'));
+        return v;
+    }
     if app.board.is_some() {
         v.push(("Archive".into(), 'a'));
         v.push(("Members".into(), 'm'));
@@ -361,9 +384,19 @@ pub fn more_items(app: &App) -> Vec<(String, char)> {
 }
 
 fn menu_bar(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
-    let items = menu_items(app);
+    // The analytics screen names its own buttons, because which ones make
+    // sense depends on whether the table, the filter or a history is up.
+    let items: Vec<(String, char)> = match &app.analytics {
+        Some(panel) => panel.menu_items(),
+        None => menu_items(app)
+            .into_iter()
+            .map(|(l, k)| (l.to_string(), k))
+            .collect(),
+    };
     app.menu_areas.clear();
-    let back = app.board.is_some();
+    // Leaving is the first button, marked with a `<`, on any screen you can
+    // leave: a board, and the analytics table.
+    let back = app.board.is_some() || app.analytics.is_some();
 
     // More sits at the right edge, so reserve its space before laying out.
     let more = "More";
@@ -791,7 +824,11 @@ fn status_bar(app: &App, f: &mut Frame, area: Rect, t: &Theme) {
         return;
     }
     let mut parts: Vec<&str> = Vec::new();
-    if app.board.as_ref().is_some_and(|b| b.picked.is_some()) {
+    if app.analytics.is_some() {
+        // The panel's own footer says what the keys do; this says what the
+        // numbers mean, which is the thing people ask about first.
+        parts.push("time taken is time in the started column, pauses left out");
+    } else if app.board.as_ref().is_some_and(|b| b.picked.is_some()) {
         parts.push("arrows move the task");
         parts.push("Space drops it");
         parts.push("Esc cancels");
@@ -995,6 +1032,12 @@ fn overlay(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
                     t.surface_dim(),
                 )),
             ];
+            if let Some(start) = task.start_at {
+                lines.push(Line::from(format!(
+                    "Start: {}",
+                    start.with_timezone(&tz).format("%Y-%m-%d %H:%M")
+                )));
+            }
             if let Some(due) = task.due_at {
                 lines.push(Line::from(format!(
                     "Due: {}",
@@ -1085,6 +1128,7 @@ const HELP: &[&str] = &[
     "d               Delete task, to the archive",
     "a               Archive (v views, D purges)",
     "t               Sort column by due date",
+    "A               Analytics (time taken)",
     "/               Search   i  include archived",
     "N               New board (dashboard)",
     "D               Delete board (dashboard)",

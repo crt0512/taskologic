@@ -76,12 +76,15 @@ pub struct SettingsForm {
     timezone: TextInputState,
     original_tz: Tz,
     card_default: CheckboxState,
+    card_start: CheckboxState,
     card_due: CheckboxState,
     card_assignees: CheckboxState,
     card_deps: CheckboxState,
     card_description: CheckboxState,
     card_short_id: CheckboxState,
     print_button: CheckboxState,
+    /// Lead times before each of a task's two dates, in hours.
+    reminder_start_hours: TextInputState,
     reminder_hours: TextInputState,
     mode: ChoiceState<PrintMode>,
     filter_on: CheckboxState,
@@ -109,8 +112,12 @@ impl SettingsForm {
         board_tabs.focus().set(true);
         let mut timezone = TextInputState::named("timezone");
         timezone.set_text(user.timezone.name());
+        let mut reminder_start_hours = TextInputState::named("reminder_start_hours");
+        if let Some(m) = p.print.reminder_start_minutes {
+            reminder_start_hours.set_text(reminder_hours_text(m));
+        }
         let mut reminder_hours = TextInputState::named("reminder_hours");
-        if let Some(m) = p.print.reminder_minutes {
+        if let Some(m) = p.print.reminder_due_minutes {
             reminder_hours.set_text(reminder_hours_text(m));
         }
         let mut mode = ChoiceState::named("mode");
@@ -137,12 +144,14 @@ impl SettingsForm {
             timezone,
             original_tz: user.timezone,
             card_default: check("card_default", p.ui.card_fields.is_none()),
+            card_start: check("card_start", cards.start_date),
             card_due: check("card_due", cards.due_date),
             card_assignees: check("card_assignees", cards.assignees),
             card_deps: check("card_deps", cards.dependencies),
             card_description: check("card_description", cards.description),
             card_short_id: check("card_short_id", cards.short_id),
             print_button: check("print_button", p.print.show_print_button),
+            reminder_start_hours,
             reminder_hours,
             mode,
             filter_on: check("filter_on", p.print.autoprint_filter.is_some()),
@@ -178,13 +187,15 @@ impl SettingsForm {
             .widget(&self.timezone)
             .widget(&self.card_default);
         if !self.card_default.checked() {
-            b.widget(&self.card_due)
+            b.widget(&self.card_start)
+                .widget(&self.card_due)
                 .widget(&self.card_assignees)
                 .widget(&self.card_deps)
                 .widget(&self.card_description)
                 .widget(&self.card_short_id);
         }
         b.widget(&self.print_button)
+            .widget(&self.reminder_start_hours)
             .widget(&self.reminder_hours)
             .widget(&self.mode)
             .widget(&self.filter_on);
@@ -245,6 +256,7 @@ impl SettingsForm {
             &mut self.show_date,
             &mut self.show_time,
             &mut self.card_default,
+            &mut self.card_start,
             &mut self.card_due,
             &mut self.card_assignees,
             &mut self.card_deps,
@@ -261,6 +273,7 @@ impl SettingsForm {
             c.handle(ev, Regular);
         }
         self.timezone.handle(ev, Regular);
+        self.reminder_start_hours.handle(ev, Regular);
         self.reminder_hours.handle(ev, Regular);
         self.prefix.handle(ev, Regular);
         self.mode.handle(ev, Regular);
@@ -300,7 +313,8 @@ impl SettingsForm {
     }
 
     pub fn values(&self) -> Result<(UserPrefs, Option<Tz>), String> {
-        let reminder_minutes = parse_reminder_hours(self.reminder_hours.text())?;
+        let reminder_start_minutes = parse_reminder_hours(self.reminder_start_hours.text())?;
+        let reminder_due_minutes = parse_reminder_hours(self.reminder_hours.text())?;
         let tz_text = self.timezone.text().trim().to_string();
         let tz: Tz = tz_text
             .parse()
@@ -311,6 +325,7 @@ impl SettingsForm {
                 theme: self.theme.value(),
                 custom_colors: self.colors.clone(),
                 card_fields: (!self.card_default.checked()).then(|| CardFields {
+                    start_date: self.card_start.checked(),
                     due_date: self.card_due.checked(),
                     assignees: self.card_assignees.checked(),
                     dependencies: self.card_deps.checked(),
@@ -324,7 +339,8 @@ impl SettingsForm {
             },
             print: PrintPrefs {
                 show_print_button: self.print_button.checked(),
-                reminder_minutes,
+                reminder_start_minutes,
+                reminder_due_minutes,
                 mode: self.mode.value(),
                 autoprint_filter: self.filter_on.checked().then(|| AutoprintFilter {
                     assigned_to_me: self.filter_assigned.checked(),
@@ -451,6 +467,12 @@ impl SettingsForm {
         let (_, w) = split_label(rows[6], lw);
         if !self.card_default.checked() {
             let mut r = Row::new(w);
+            let cb = r.take(check_w("start"));
+            f.render_stateful_widget(
+                checkbox_at("start".into(), cb, t),
+                cb,
+                &mut self.card_start,
+            );
             let cb = r.take(check_w("due date"));
             f.render_stateful_widget(
                 checkbox_at("due date".into(), cb, t),
@@ -497,9 +519,14 @@ impl SettingsForm {
         let (l, w) = split_label(rows[9], lw);
         label(f, l, "Remind", t);
         let mut r = Row::new(w);
+        f.render_stateful_widget(field(t), r.take(6), &mut self.reminder_start_hours);
+        f.render_widget(
+            Paragraph::new("h before it starts,").style(t.surface_dim()),
+            r.text("h before it starts,"),
+        );
         f.render_stateful_widget(field(t), r.take(6), &mut self.reminder_hours);
         f.render_widget(
-            Paragraph::new("hours before a task is due, fractions ok, empty for none")
+            Paragraph::new("h before it is due; fractions ok, empty for none")
                 .style(t.surface_dim()),
             r.rest(),
         );
@@ -607,6 +634,7 @@ impl SettingsForm {
 
         if let Some(p) = [
             self.timezone.screen_cursor(),
+            self.reminder_start_hours.screen_cursor(),
             self.reminder_hours.screen_cursor(),
             self.prefix.screen_cursor(),
         ]
@@ -626,7 +654,7 @@ mod tests {
 
     fn user() -> User {
         let mut prefs = UserPrefs::default();
-        prefs.print.reminder_minutes = Some(180);
+        prefs.print.reminder_due_minutes = Some(180);
         User {
             uid: 1,
             username: "alice".into(),
@@ -669,7 +697,10 @@ mod tests {
         let u = user();
         let mut form = SettingsForm::new(&u, None, false);
         form.reminder_hours.set_text("1.5");
-        assert_eq!(form.values().unwrap().0.print.reminder_minutes, Some(90));
+        form.reminder_start_hours.set_text("0.5");
+        let print = form.values().unwrap().0.print;
+        assert_eq!(print.reminder_due_minutes, Some(90));
+        assert_eq!(print.reminder_start_minutes, Some(30));
     }
 
     #[test]

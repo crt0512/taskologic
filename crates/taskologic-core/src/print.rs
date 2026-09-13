@@ -81,6 +81,8 @@ pub struct PrintJob {
     /// layout to decide, so that one panel answers for the shape of a slip
     /// and the daemon does not have to guess. Empty means the task has none.
     pub description: Option<String>,
+    #[serde(default)]
+    pub start_at: Option<DateTime<Utc>>,
     pub due_at: Option<DateTime<Utc>>,
     pub dependencies: Option<Vec<DepLine>>,
     pub created_by: Option<String>,
@@ -145,6 +147,7 @@ pub fn build_task_job(
         board_name: board.name.clone(),
         title: task.title.clone(),
         description: (!task.description.trim().is_empty()).then(|| task.description.clone()),
+        start_at: task.start_at,
         due_at: task.due_at,
         dependencies: (!deps.is_empty()).then(|| deps.to_vec()),
         created_by: Some(names(task.created_by)),
@@ -172,6 +175,7 @@ pub fn build_reminder_job(task: &Task, board: &Board, user: &User, now: DateTime
         board_name: board.name.clone(),
         title: task.title.clone(),
         description: (!task.description.trim().is_empty()).then(|| task.description.clone()),
+        start_at: task.start_at,
         due_at: task.due_at,
         dependencies: None,
         created_by: None,
@@ -215,13 +219,84 @@ pub fn wants_autoprint(
     by_assignment || by_creation
 }
 
+/// Which of a task's two dates a reminder counts back from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReminderKind {
+    Start,
+    Due,
+}
+
+impl ReminderKind {
+    pub const ALL: [ReminderKind; 2] = [ReminderKind::Start, ReminderKind::Due];
+
+    /// Stable name for the column that remembers a slip was sent.
+    pub fn name(self) -> &'static str {
+        match self {
+            ReminderKind::Start => "start",
+            ReminderKind::Due => "due",
+        }
+    }
+}
+
 /// When a reminder should print for this task. A task can override the
 /// user's default lead time, and an override works even when the user has no
 /// default, because ticking it on one task is a deliberate act.
-pub fn reminder_at(task: &Task, prefs: &PrintPrefs) -> Option<DateTime<Utc>> {
-    let minutes = task.reminder_minutes.or(prefs.reminder_minutes)?;
-    let due = task.due_at?;
-    due.checked_sub_signed(TimeDelta::minutes(i64::from(minutes)))
+pub fn reminder_at(task: &Task, prefs: &PrintPrefs, kind: ReminderKind) -> Option<DateTime<Utc>> {
+    let (minutes, anchor) = match kind {
+        ReminderKind::Start => (
+            task.reminder_start_minutes.or(prefs.reminder_start_minutes),
+            task.start_at,
+        ),
+        ReminderKind::Due => (
+            task.reminder_due_minutes.or(prefs.reminder_due_minutes),
+            task.due_at,
+        ),
+    };
+    anchor?.checked_sub_signed(TimeDelta::minutes(i64::from(minutes?)))
+}
+
+/// One slip a task owes somebody: when it prints, which date it counts back
+/// from, and which kind of slip it is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PlannedReminder {
+    pub kind: ReminderKind,
+    pub at: DateTime<Utc>,
+    pub job: PrintJobKind,
+}
+
+/// Everything this task owes this user, whether or not the time has come.
+/// The scheduler filters by the clock, by what it already sent and by
+/// whether the task was ever started; the shape of the answer is decided
+/// here, where it can be tested without a database.
+///
+/// A task with neither date owes nothing, which is why a task nobody dated
+/// stays quiet until somebody starts it. With one date it owes a reminder
+/// before that date. With both it owes a reminder before the start and then
+/// the task slip before the due date, because by then the point is not
+/// "this is coming up" but "here is the paper you finish with".
+pub fn plan_reminders(task: &Task, prefs: &PrintPrefs) -> Vec<PlannedReminder> {
+    let both_dates = task.start_at.is_some() && task.due_at.is_some();
+    let mut out = Vec::new();
+    if let Some(at) = reminder_at(task, prefs, ReminderKind::Start) {
+        out.push(PlannedReminder {
+            kind: ReminderKind::Start,
+            at,
+            job: PrintJobKind::Reminder,
+        });
+    }
+    if let Some(at) = reminder_at(task, prefs, ReminderKind::Due) {
+        out.push(PlannedReminder {
+            kind: ReminderKind::Due,
+            at,
+            job: if both_dates {
+                PrintJobKind::Task
+            } else {
+                PrintJobKind::Reminder
+            },
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -389,41 +464,153 @@ mod tests {
         ));
     }
 
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).unwrap()
+    }
+
     #[test]
     fn reminder_time() {
         let board = board_with_members(1, &[1]);
         let mut task = task_on(&board, 1);
         let prefs = PrintPrefs {
-            reminder_minutes: Some(120),
+            reminder_due_minutes: Some(120),
             ..Default::default()
         };
-        assert_eq!(reminder_at(&task, &prefs), None);
-        task.due_at = Some(DateTime::from_timestamp(10_000, 0).unwrap());
+        assert_eq!(reminder_at(&task, &prefs, ReminderKind::Due), None);
+        task.due_at = Some(at(10_000));
         assert_eq!(
-            reminder_at(&task, &prefs),
-            Some(DateTime::from_timestamp(10_000 - 7200, 0).unwrap())
+            reminder_at(&task, &prefs, ReminderKind::Due),
+            Some(at(10_000 - 7200))
         );
-        assert_eq!(reminder_at(&task, &PrintPrefs::default()), None);
+        assert_eq!(
+            reminder_at(&task, &PrintPrefs::default(), ReminderKind::Due),
+            None
+        );
+    }
+
+    #[test]
+    fn the_two_lead_times_count_back_from_their_own_date() {
+        let board = board_with_members(1, &[1]);
+        let mut task = task_on(&board, 1);
+        task.start_at = Some(at(10_000));
+        task.due_at = Some(at(20_000));
+        let prefs = PrintPrefs {
+            reminder_start_minutes: Some(30),
+            reminder_due_minutes: Some(120),
+            ..Default::default()
+        };
+        assert_eq!(
+            reminder_at(&task, &prefs, ReminderKind::Start),
+            Some(at(10_000 - 1800))
+        );
+        assert_eq!(
+            reminder_at(&task, &prefs, ReminderKind::Due),
+            Some(at(20_000 - 7200))
+        );
+
+        // One lead time set and not the other leaves that date silent.
+        let only_start = PrintPrefs {
+            reminder_start_minutes: Some(30),
+            ..Default::default()
+        };
+        assert!(reminder_at(&task, &only_start, ReminderKind::Start).is_some());
+        assert_eq!(reminder_at(&task, &only_start, ReminderKind::Due), None);
     }
 
     #[test]
     fn a_tasks_own_lead_time_beats_the_default_and_stands_without_one() {
         let board = board_with_members(1, &[1]);
         let mut task = task_on(&board, 1);
-        task.due_at = Some(DateTime::from_timestamp(10_000, 0).unwrap());
-        task.reminder_minutes = Some(30);
+        task.due_at = Some(at(10_000));
+        task.reminder_due_minutes = Some(30);
         let prefs = PrintPrefs {
-            reminder_minutes: Some(120),
+            reminder_due_minutes: Some(120),
             ..Default::default()
         };
         assert_eq!(
-            reminder_at(&task, &prefs),
-            Some(DateTime::from_timestamp(10_000 - 1800, 0).unwrap())
+            reminder_at(&task, &prefs, ReminderKind::Due),
+            Some(at(10_000 - 1800))
         );
         assert_eq!(
-            reminder_at(&task, &PrintPrefs::default()),
-            Some(DateTime::from_timestamp(10_000 - 1800, 0).unwrap()),
+            reminder_at(&task, &PrintPrefs::default(), ReminderKind::Due),
+            Some(at(10_000 - 1800)),
             "ticking it on one task is a deliberate act, default or not"
+        );
+
+        // The start override is its own switch and does not borrow the due one.
+        task.start_at = Some(at(5_000));
+        assert_eq!(
+            reminder_at(&task, &PrintPrefs::default(), ReminderKind::Start),
+            None
+        );
+        task.reminder_start_minutes = Some(15);
+        assert_eq!(
+            reminder_at(&task, &PrintPrefs::default(), ReminderKind::Start),
+            Some(at(5_000 - 900))
+        );
+    }
+
+    #[test]
+    fn a_task_with_no_dates_owes_nothing() {
+        let board = board_with_members(1, &[1]);
+        let task = task_on(&board, 1);
+        let prefs = PrintPrefs {
+            reminder_start_minutes: Some(30),
+            reminder_due_minutes: Some(6),
+            ..Default::default()
+        };
+        assert_eq!(plan_reminders(&task, &prefs), vec![]);
+    }
+
+    #[test]
+    fn one_date_prints_a_reminder_and_two_print_the_slip_you_finish_with() {
+        let board = board_with_members(1, &[1]);
+        let prefs = PrintPrefs {
+            reminder_start_minutes: Some(30),
+            reminder_due_minutes: Some(6),
+            ..Default::default()
+        };
+
+        // Only a start date: one reminder, before the start.
+        let mut task = task_on(&board, 1);
+        task.start_at = Some(at(10_000));
+        assert_eq!(
+            plan_reminders(&task, &prefs),
+            vec![PlannedReminder {
+                kind: ReminderKind::Start,
+                at: at(10_000 - 1800),
+                job: PrintJobKind::Reminder,
+            }]
+        );
+
+        // Only a due date: one reminder, before the due date.
+        let mut task = task_on(&board, 1);
+        task.due_at = Some(at(20_000));
+        assert_eq!(
+            plan_reminders(&task, &prefs),
+            vec![PlannedReminder {
+                kind: ReminderKind::Due,
+                at: at(20_000 - 360),
+                job: PrintJobKind::Reminder,
+            }]
+        );
+
+        // Both: a reminder to start, then the task slip to work from.
+        task.start_at = Some(at(10_000));
+        assert_eq!(
+            plan_reminders(&task, &prefs),
+            vec![
+                PlannedReminder {
+                    kind: ReminderKind::Start,
+                    at: at(10_000 - 1800),
+                    job: PrintJobKind::Reminder,
+                },
+                PlannedReminder {
+                    kind: ReminderKind::Due,
+                    at: at(20_000 - 360),
+                    job: PrintJobKind::Task,
+                },
+            ]
         );
     }
 }

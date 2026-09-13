@@ -134,6 +134,11 @@ fn section(out: &mut Vec<Op>, row: &SlipRow, job: &PrintJob, cols: usize) {
                 out.extend(row.lines(&format!("{mark} {}", item.text), cols));
             }
         }
+        SlipSection::StartDate => {
+            if let Some(start) = job.start_at {
+                out.push(row.line(format!("Start: {}", local(start, job))));
+            }
+        }
         SlipSection::DueDate => {
             if let Some(due) = job.due_at {
                 out.push(row.line(format!("Due: {}", local(due, job))));
@@ -238,6 +243,7 @@ mod tests {
             board_name: "Kitchen".into(),
             title: "Water".into(),
             description: Some("Balcony".into()),
+            start_at: Some(DateTime::from_timestamp(1_799_996_400, 0).unwrap()),
             due_at: Some(DateTime::from_timestamp(1_800_000_000, 0).unwrap()),
             dependencies: Some(vec![DepLine {
                 short_id: ShortId::from_index(1),

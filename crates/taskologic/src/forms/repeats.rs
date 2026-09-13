@@ -186,6 +186,8 @@ mod tests {
             },
             at: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
             tz: chrono_tz::Europe::Berlin,
+            start_rule: None,
+            due_rule: None,
         });
         let mut p = RepeatsPanel::new(board.id, chrono_tz::Europe::Berlin);
         let next = Some(Utc.with_ymd_and_hms(2026, 9, 7, 7, 0, 0).unwrap());

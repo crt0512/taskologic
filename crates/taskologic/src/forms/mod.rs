@@ -2,6 +2,7 @@
 //! for one screenful of input. The app owns one as an overlay and forwards
 //! raw terminal events to it; it answers with an outcome enum.
 
+pub mod analytics;
 pub mod archive;
 pub mod board;
 pub mod colors;

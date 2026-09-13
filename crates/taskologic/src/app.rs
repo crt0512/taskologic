@@ -15,7 +15,7 @@ use crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use taskologic_core::barcode::{Feed, ScanAction, ScanDetector};
 use taskologic_core::board::{Board, ColumnRole};
-use taskologic_core::ids::{ColumnId, PrintJobId, TaskId, Uid};
+use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, TaskId, Uid};
 use taskologic_core::prefs::{CardFields, CustomColors, ThemePreset};
 use taskologic_core::print::PrintJob;
 use taskologic_core::task::Task;
@@ -26,6 +26,7 @@ use taskologic_proto::{
     Request, RequestId, Response, ScanOutcome, SearchHit, ServerMessage, Severity, TaskChange,
 };
 
+use crate::forms::analytics::{AnalyticsOutcome, AnalyticsPanel};
 use crate::forms::archive::{ArchiveOutcome, ArchivePanel};
 use crate::forms::board::{BoardForm, BoardOutcome};
 use crate::forms::colors::{ColorsForm, ColorsOutcome};
@@ -153,6 +154,9 @@ pub(crate) enum Pending {
     TemplateOp,
     RepeatsPanel,
     StopRepeat,
+    Analytics,
+    TaskHistory { task: TaskId },
+    ExcludeFromStats,
 }
 
 pub enum Overlay {
@@ -427,6 +431,10 @@ pub struct App {
     pub user: Option<User>,
     pub users: HashMap<Uid, String>,
     pub boards: Vec<BoardSummary>,
+    /// The analytics screen, when it is the one showing. It sits beside the
+    /// dashboard and the board rather than over them: it is a place you go,
+    /// not a dialog you answer.
+    pub analytics: Option<Box<AnalyticsPanel>>,
     pub board_sel: usize,
     pub board_areas: Vec<Rect>,
     pub dash_scroll: usize,
@@ -465,6 +473,7 @@ impl App {
             user: None,
             users: HashMap::new(),
             boards: Vec::new(),
+            analytics: None,
             board_sel: 0,
             board_areas: Vec::new(),
             dash_scroll: 0,
@@ -518,7 +527,10 @@ impl App {
     }
 
     pub fn show_tabs(&self) -> bool {
-        self.board.is_some()
+        // Board tabs would offer to switch to a board while you are reading
+        // numbers across all of them, which is not what the click would do.
+        self.analytics.is_none()
+            && self.board.is_some()
             && self
                 .user
                 .as_ref()
@@ -603,6 +615,21 @@ impl App {
                     | Overlay::Repeats(_)
             )
         )
+    }
+
+    /// The user's zone, for anything that renders a timestamp.
+    fn timezone(&self) -> chrono_tz::Tz {
+        self.user
+            .as_ref()
+            .map(|u| u.timezone)
+            .unwrap_or(chrono_tz::UTC)
+    }
+
+    fn board_name(&self, id: BoardId) -> Option<String> {
+        self.boards
+            .iter()
+            .find(|b| b.id == id)
+            .map(|b| b.name.clone())
     }
 
     fn user_name(&self, uid: Uid) -> String {
@@ -960,6 +987,36 @@ impl App {
                     None => Vec::new(),
                 }
             }
+            (Some(Pending::Analytics), Response::Analytics { rows }) => {
+                if let Some(panel) = &mut self.analytics {
+                    panel.set_rows(rows);
+                }
+                Vec::new()
+            }
+            (
+                Some(Pending::TaskHistory { task }),
+                Response::History { entries, columns },
+            ) => {
+                if let Some(panel) = &mut self.analytics {
+                    panel.set_history(task, entries, columns);
+                }
+                Vec::new()
+            }
+            (Some(Pending::ExcludeFromStats), Response::Task { .. }) => {
+                // The flag changes what the averages say, so the whole table
+                // is asked for again rather than patched in place.
+                match &mut self.analytics {
+                    Some(panel) => {
+                        panel.loading = true;
+                        let (board_id, filter) = (panel.requested_board(), panel.filter.clone());
+                        vec![self.send(
+                            Request::Analytics { board_id, filter },
+                            Pending::Analytics,
+                        )]
+                    }
+                    None => Vec::new(),
+                }
+            }
             (Some(Pending::RepeatsPanel), Response::Repeats { entries }) => {
                 let Some(board_id) = self.board.as_ref().map(|b| b.detail.board.id) else {
                     return Vec::new();
@@ -1301,6 +1358,9 @@ impl App {
             Some(_) => return self.overlay_key(k),
             None => {}
         }
+        if self.analytics.is_some() {
+            return self.analytics_event(TermEvent::Key(k));
+        }
         if self.search.is_focused() {
             return self.search_key(k);
         }
@@ -1458,6 +1518,8 @@ impl App {
                 }
             }
             KeyCode::Char('N') => return self.open_board_form_create(),
+            // From the dashboard the table covers every board in reach.
+            KeyCode::Char('A') => return self.open_analytics(None),
             _ => {}
         }
         Vec::new()
@@ -1619,6 +1681,10 @@ impl App {
             KeyCode::Char('R') => {
                 let board_id = b.detail.board.id;
                 return vec![self.send(Request::ListRepeats { board_id }, Pending::RepeatsPanel)];
+            }
+            KeyCode::Char('A') => {
+                let board_id = b.detail.board.id;
+                return self.open_analytics(Some(board_id));
             }
             KeyCode::Char('p') => {
                 if !can_print {
@@ -2163,6 +2229,78 @@ impl App {
         }
     }
 
+    /// Open the analytics table. `board` None means every board the user can
+    /// see, which is what opening it from the dashboard means.
+    fn open_analytics(&mut self, board: Option<BoardId>) -> Vec<Cmd> {
+        let scope = match board.and_then(|id| self.board_name(id)) {
+            Some(name) => name,
+            None => "all boards".to_string(),
+        };
+        let mut panel = AnalyticsPanel::new(board, scope, self.timezone());
+        panel.set_boards(
+            self.boards
+                .iter()
+                .filter(|b| b.is_member)
+                .map(|b| (b.id, b.name.clone()))
+                .collect(),
+        );
+        let filter = panel.filter.clone();
+        self.analytics = Some(Box::new(panel));
+        vec![self.send(
+            Request::Analytics {
+                board_id: board,
+                filter,
+            },
+            Pending::Analytics,
+        )]
+    }
+
+    fn analytics_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
+        let Some(panel) = &mut self.analytics else {
+            return Vec::new();
+        };
+        let outcome = panel.handle(&ev);
+        self.analytics_outcome(outcome)
+    }
+
+    /// A press of one of the analytics buttons in the menu bar.
+    fn analytics_menu_key(&mut self, key: char) -> Vec<Cmd> {
+        let Some(panel) = &mut self.analytics else {
+            return Vec::new();
+        };
+        let outcome = panel.menu_key(key);
+        self.analytics_outcome(outcome)
+    }
+
+    fn analytics_outcome(&mut self, outcome: AnalyticsOutcome) -> Vec<Cmd> {
+        let Some(panel) = &mut self.analytics else {
+            return Vec::new();
+        };
+        match outcome {
+            AnalyticsOutcome::Changed => Vec::new(),
+            AnalyticsOutcome::Cancel => {
+                self.analytics = None;
+                Vec::new()
+            }
+            AnalyticsOutcome::Reload => {
+                let (board_id, filter) = (panel.requested_board(), panel.filter.clone());
+                vec![self.send(Request::Analytics { board_id, filter }, Pending::Analytics)]
+            }
+            AnalyticsOutcome::OpenDetail(task_id) => {
+                vec![self.send(
+                    Request::TaskHistory { task_id },
+                    Pending::TaskHistory { task: task_id },
+                )]
+            }
+            AnalyticsOutcome::SetExcluded(task_id, excluded) => {
+                vec![self.send(
+                    Request::SetExcludeFromStats { task_id, excluded },
+                    Pending::ExcludeFromStats,
+                )]
+            }
+        }
+    }
+
     fn confirm_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
         let Some(Overlay::Confirm { dialog, .. }) = &mut self.overlay else {
             return Vec::new();
@@ -2357,8 +2495,10 @@ impl App {
             position: 0,
             title: "Test print".into(),
             description: "If you can read this, the printer profile works. Umlauts: äöü ß".into(),
+            start_at: Some(now),
             due_at: Some(now + chrono::TimeDelta::hours(1)),
-            reminder_minutes: None,
+            reminder_start_minutes: None,
+            reminder_due_minutes: None,
             created_by: user.uid,
             created_at: now,
             finished_at: None,
@@ -2370,6 +2510,8 @@ impl App {
             depends_on: Vec::new(),
             checklist: Vec::new(),
             repeat: None,
+            template_id: None,
+            exclude_from_stats: false,
         };
         let name = user.username.clone();
         let mut job = taskologic_core::print::build_task_job(
@@ -2783,7 +2925,15 @@ impl App {
                 .find(|(a, _)| a.contains(Position::new(x, y)))
         {
             let key = *key;
+            // The analytics buttons are its own, and 'M' still opens More.
+            if self.analytics.is_some() && key != 'M' {
+                return self.analytics_menu_key(key);
+            }
             return self.normal_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        // Everything else on the analytics screen belongs to the panel.
+        if self.analytics.is_some() {
+            return self.analytics_event(TermEvent::Mouse(m));
         }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind
             && let Some((_, id)) = self

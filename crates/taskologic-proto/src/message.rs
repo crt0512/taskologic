@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use taskologic_core::barcode::ScanAction;
 use taskologic_core::board::{Board, ColumnRole};
-use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, TaskId, TemplateId, Uid};
+use taskologic_core::event::EventKind;
+use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, ShortId, TaskId, TemplateId, Uid};
 use taskologic_core::prefs::{CardFields, UserPrefs};
 use taskologic_core::print::PrintJob;
 use taskologic_core::task::{Task, TaskDraft};
@@ -288,6 +289,23 @@ pub enum Request {
         job_id: PrintJobId,
         error: Option<String>,
     },
+    /// The analytics table. `board_id` None covers every board the caller can
+    /// see, which is what opening it from the dashboard means.
+    Analytics {
+        #[serde(default)]
+        board_id: Option<BoardId>,
+        #[serde(default)]
+        filter: AnalyticsFilter,
+    },
+    /// Everything recorded about one task, for the analytics detail view.
+    TaskHistory {
+        task_id: TaskId,
+    },
+    /// Take one task in or out of the averages. Needs edit rights on it.
+    SetExcludeFromStats {
+        task_id: TaskId,
+        excluded: bool,
+    },
     UpdatePrefs {
         prefs: UserPrefs,
     },
@@ -330,8 +348,119 @@ pub enum Response {
     Repeats {
         entries: Vec<RepeatEntry>,
     },
+    Analytics {
+        rows: Vec<AnalyticsRow>,
+    },
+    History {
+        entries: Vec<HistoryEntry>,
+        /// The columns of the task's board, so the history can say where a
+        /// move went rather than just that one happened. Sent alongside the
+        /// entries rather than baked into them, because several kinds of
+        /// event name a column and they all want the same answer.
+        #[serde(default)]
+        columns: Vec<(ColumnId, String)>,
+    },
     /// Plain acknowledgement.
     Done,
+}
+
+/// Which tasks the analytics table lists.
+///
+/// The default is what somebody opening it wants to see: work that is done,
+/// because unfinished work has no duration yet. The three state switches are
+/// independent of each other, and a task in the finished column is always
+/// listed however they are set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsFilter {
+    /// Include tasks that have not been finished. Off: they have no time
+    /// taken to report yet, only a clock that is still running.
+    pub show_unfinished: bool,
+    /// Include tasks that were finished and have since aged into the archive.
+    pub show_archived: bool,
+    /// Include tasks that were deleted. They still happened.
+    pub show_deleted: bool,
+    pub assigned_to_me: bool,
+    pub created_by_me: bool,
+    /// Only tasks stamped from a template or spawned by a repetition, which
+    /// are the only ones an average can be computed for.
+    pub repeating_only: bool,
+    /// Bounds on when the task was finished, or created if it never was.
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
+impl Default for AnalyticsFilter {
+    fn default() -> Self {
+        Self {
+            show_unfinished: false,
+            show_archived: true,
+            show_deleted: true,
+            assigned_to_me: false,
+            created_by_me: false,
+            repeating_only: false,
+            since: None,
+            until: None,
+        }
+    }
+}
+
+/// Where a task stands, for the analytics table's own filtering and for the
+/// note it puts next to a row.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Unfinished,
+    Finished,
+    Archived,
+    Deleted,
+}
+
+impl TaskState {
+    pub fn label(self) -> &'static str {
+        match self {
+            TaskState::Unfinished => "open",
+            TaskState::Finished => "done",
+            TaskState::Archived => "archived",
+            TaskState::Deleted => "deleted",
+        }
+    }
+}
+
+/// One row of the analytics table. Durations are whole seconds rather than a
+/// chrono type, so the wire format stays something anything can read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyticsRow {
+    pub task_id: TaskId,
+    pub board_id: BoardId,
+    pub board_name: String,
+    pub short_id: ShortId,
+    pub title: String,
+    pub state: TaskState,
+    pub planned_start: Option<DateTime<Utc>>,
+    pub planned_due: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    /// Time in the started column, pauses excluded. None means it was never
+    /// started, which is not the same as zero.
+    pub time_taken_secs: Option<i64>,
+    /// First start to finish, everything included. The detail view shows it.
+    pub wall_clock_secs: Option<i64>,
+    /// The mean over this task's siblings: the other instances of its
+    /// repetition, or the other tasks from its template.
+    pub average_secs: Option<i64>,
+    /// How many finished siblings that average is over.
+    pub samples: u32,
+    /// Left out of the average above, by hand.
+    pub excluded: bool,
+}
+
+/// One line of a task's recorded history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub at: DateTime<Utc>,
+    /// None when the scheduler did it rather than a person.
+    pub actor: Option<String>,
+    pub kind: EventKind,
 }
 
 /// One row of the repeating tasks list.
@@ -617,7 +746,7 @@ mod tests {
                 column_id: Some(ColumnId(3)),
                 draft: TaskDraft {
                     title: "Water plants".into(),
-                    reminder_minutes: Some(90),
+                    reminder_due_minutes: Some(90),
                     ..Default::default()
                 },
             },

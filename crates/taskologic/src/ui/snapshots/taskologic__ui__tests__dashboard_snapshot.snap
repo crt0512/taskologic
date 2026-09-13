@@ -4,7 +4,7 @@ expression: "render(&mut app, 100, 24)"
 ---
 " Taskologic | Dashboard                                                               alice (admin) "
 "                                                                                                    "
-"  New board   / Search   ? Help                                                               More  "
+"  New board   Analytics   / Search   ? Help                                                   More  "
 "                                                                                                    "
 " ┌Search tasks──────────────────────────────────────────────────────────┐                           "
 " │                                                                      │ [ ] include archived (i)  "

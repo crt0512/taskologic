@@ -4,7 +4,7 @@ expression: "render(&mut app, 100, 24)"
 ---
 " Taskologic | Kitchen | Secret plans                                                  alice (admin) "
 "                                                                                                    "
-"  < Boards   New task   Templates   Edit   Delete   ? Help                                    More  "
+"  < Boards   New task   Templates   Analytics   Edit   Delete   ? Help                        More  "
 "                                                                                                    "
 "┌ Todo (2) ────────── + ┐┌ > Doing (1) ─────── + ┐┌ || Waiting (0) ──── + ┐┌ * Done (1) ──────── + ┐"
 "│┌─────────────────────┐││┌─────────────────────┐││                       ││┌─────────────────────┐│"

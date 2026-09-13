@@ -85,6 +85,9 @@ impl Default for CustomColors {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CardFields {
+    /// Off by default. Most tasks are read by when they are due, and every
+    /// field switched on here makes every card on the board a line taller.
+    pub start_date: bool,
     pub due_date: bool,
     pub assignees: bool,
     pub dependencies: bool,
@@ -96,6 +99,7 @@ pub struct CardFields {
 impl Default for CardFields {
     fn default() -> Self {
         Self {
+            start_date: false,
             due_date: true,
             assignees: true,
             dependencies: true,
@@ -108,7 +112,8 @@ impl Default for CardFields {
 impl CardFields {
     /// How many lines a card needs below its title.
     pub fn extra_lines(self) -> u16 {
-        u16::from(self.due_date)
+        u16::from(self.start_date)
+            + u16::from(self.due_date)
             + u16::from(self.assignees)
             + u16::from(self.dependencies)
             + u16::from(self.description)
@@ -183,9 +188,12 @@ pub struct AutoprintFilter {
 #[serde(default, from = "PrintPrefsRepr")]
 pub struct PrintPrefs {
     pub show_print_button: bool,
-    /// Lead time before a task is due. Minutes rather than hours so that
-    /// "half an hour before" is exact. None is off.
-    pub reminder_minutes: Option<u32>,
+    /// Lead time before a task's start date. Minutes rather than hours so
+    /// that "half an hour before" is exact. None is off.
+    pub reminder_start_minutes: Option<u32>,
+    /// The same, counted back from the due date. The two are independent:
+    /// a task with both dates gets a slip before each.
+    pub reminder_due_minutes: Option<u32>,
     pub mode: PrintMode,
     pub autoprint_filter: Option<AutoprintFilter>,
 }
@@ -194,21 +202,26 @@ impl Default for PrintPrefs {
     fn default() -> Self {
         Self {
             show_print_button: true,
-            reminder_minutes: None,
+            reminder_start_minutes: None,
+            reminder_due_minutes: None,
             mode: PrintMode::Manual,
             autoprint_filter: None,
         }
     }
 }
 
-/// Prefs written before 0.1.10 stored whole hours under `reminder_hours`.
-/// Reading goes through here so an upgrade keeps the user's setting instead
-/// of silently switching reminders off. Writing never uses it, so nothing
-/// emits the old field again.
+/// The reminder setting has been spelled three ways. Before 0.1.10 it was
+/// whole hours under `reminder_hours`; 0.1.10 made it minutes under
+/// `reminder_minutes`; 0.1.11 split it in two, and the one that existed was
+/// always counted back from the due date. Reading goes through here so an
+/// upgrade keeps the user's setting instead of silently switching reminders
+/// off. Writing never uses it, so nothing emits the old spellings again.
 #[derive(Deserialize)]
 #[serde(default)]
 struct PrintPrefsRepr {
     show_print_button: bool,
+    reminder_start_minutes: Option<u32>,
+    reminder_due_minutes: Option<u32>,
     reminder_minutes: Option<u32>,
     reminder_hours: Option<u32>,
     mode: PrintMode,
@@ -220,7 +233,9 @@ impl Default for PrintPrefsRepr {
         let p = PrintPrefs::default();
         Self {
             show_print_button: p.show_print_button,
-            reminder_minutes: p.reminder_minutes,
+            reminder_start_minutes: p.reminder_start_minutes,
+            reminder_due_minutes: p.reminder_due_minutes,
+            reminder_minutes: None,
             reminder_hours: None,
             mode: p.mode,
             autoprint_filter: p.autoprint_filter,
@@ -232,8 +247,12 @@ impl From<PrintPrefsRepr> for PrintPrefs {
     fn from(r: PrintPrefsRepr) -> Self {
         Self {
             show_print_button: r.show_print_button,
-            reminder_minutes: r
-                .reminder_minutes
+            // Nothing inherits a start reminder: the old setting never meant
+            // one, so it starts empty and the user opts in.
+            reminder_start_minutes: r.reminder_start_minutes,
+            reminder_due_minutes: r
+                .reminder_due_minutes
+                .or(r.reminder_minutes)
                 .or(r.reminder_hours.map(|h| h.saturating_mul(60))),
             mode: r.mode,
             autoprint_filter: r.autoprint_filter,
@@ -263,7 +282,7 @@ pub fn parse_reminder_hours(text: &str) -> Result<Option<u32>, String> {
     }
     let minutes = (hours * 60.0).round();
     if minutes > f64::from(MAX_REMINDER_MINUTES) {
-        return Err("a reminder cannot be more than a year before the due date".into());
+        return Err("a reminder cannot be more than a year early".into());
     }
     Ok(Some(minutes as u32))
 }
@@ -314,7 +333,8 @@ mod tests {
         assert!(p.ui.show_board_tabs);
         assert!(p.ui.scanner_enabled, "on unless the user turns it off");
         assert!(!p.ui.show_date && !p.ui.show_time);
-        assert_eq!(p.print.reminder_minutes, None);
+        assert_eq!(p.print.reminder_start_minutes, None);
+        assert_eq!(p.print.reminder_due_minutes, None);
         assert_eq!(p.print.mode, PrintMode::Manual);
         assert_eq!(p.scanner.format, Symbology::Code39);
         assert_eq!(p.scanner.magic, Magic::Dots);
@@ -322,6 +342,7 @@ mod tests {
         assert_eq!(p.ui.theme, ThemePreset::Default);
         let c = CardFields::default();
         assert!(c.due_date && c.assignees && c.dependencies && !c.short_id);
+        assert!(!c.start_date, "cards do not grow a line for everyone");
         assert_eq!(c.extra_lines(), 3);
     }
 
@@ -352,7 +373,7 @@ mod tests {
         );
         assert_eq!(
             parse_reminder_hours("9000"),
-            Err("a reminder cannot be more than a year before the due date".into())
+            Err("a reminder cannot be more than a year early".into())
         );
     }
 
@@ -360,22 +381,43 @@ mod tests {
     fn prefs_written_before_the_switch_to_minutes_keep_their_reminder() {
         let old = r#"{"print":{"show_print_button":true,"reminder_hours":3,"mode":"manual"}}"#;
         let p: UserPrefs = serde_json::from_str(old).unwrap();
-        assert_eq!(p.print.reminder_minutes, Some(180));
+        assert_eq!(p.print.reminder_due_minutes, Some(180));
 
         let written = serde_json::to_string(&p.print).unwrap();
-        assert!(written.contains(r#""reminder_minutes":180"#), "{written}");
         assert!(
-            !written.contains("reminder_hours"),
-            "the old field is read, never written again: {written}"
+            written.contains(r#""reminder_due_minutes":180"#),
+            "{written}"
         );
+        for gone in ["reminder_hours", r#""reminder_minutes""#] {
+            assert!(
+                !written.contains(gone),
+                "{gone} is read, never written again: {written}"
+            );
+        }
 
-        // Minutes are the truth if a row somehow carries both.
-        let both: PrintPrefs =
-            serde_json::from_str(r#"{"reminder_minutes":90,"reminder_hours":3}"#).unwrap();
-        assert_eq!(both.reminder_minutes, Some(90));
+        // The newest spelling wins if a row somehow carries several.
+        let all: PrintPrefs = serde_json::from_str(
+            r#"{"reminder_due_minutes":45,"reminder_minutes":90,"reminder_hours":3}"#,
+        )
+        .unwrap();
+        assert_eq!(all.reminder_due_minutes, Some(45));
         assert_eq!(
             serde_json::from_str::<PrintPrefs>("{}").unwrap(),
             PrintPrefs::default()
         );
+    }
+
+    #[test]
+    fn the_reminder_that_predates_the_split_becomes_the_due_one() {
+        // 0.1.10 wrote minutes and meant "before due". Nobody gains a start
+        // reminder they never asked for.
+        let p: PrintPrefs = serde_json::from_str(r#"{"reminder_minutes":90}"#).unwrap();
+        assert_eq!(p.reminder_due_minutes, Some(90));
+        assert_eq!(p.reminder_start_minutes, None);
+
+        // Same for the whole hours that predate even that.
+        let older: PrintPrefs = serde_json::from_str(r#"{"reminder_hours":2}"#).unwrap();
+        assert_eq!(older.reminder_due_minutes, Some(120));
+        assert_eq!(older.reminder_start_minutes, None);
     }
 }

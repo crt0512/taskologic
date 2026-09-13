@@ -62,6 +62,7 @@ pub struct BoardForm {
     finished: ChoiceState<i64>,
     archive_days: TextInputState,
     retention_days: TextInputState,
+    card_start: CheckboxState,
     card_due: CheckboxState,
     card_assignees: CheckboxState,
     card_deps: CheckboxState,
@@ -92,6 +93,7 @@ impl BoardForm {
             finished: ChoiceState::named("finished"),
             archive_days: TextInputState::named("archive_days"),
             retention_days: TextInputState::named("retention_days"),
+            card_start: check("card_start", cards.start_date),
             card_due: check("card_due", cards.due_date),
             card_assignees: check("card_assignees", cards.assignees),
             card_deps: check("card_deps", cards.dependencies),
@@ -198,6 +200,7 @@ impl BoardForm {
             .widget(&self.finished)
             .widget(&self.archive_days)
             .widget(&self.retention_days)
+            .widget(&self.card_start)
             .widget(&self.card_due)
             .widget(&self.card_assignees)
             .widget(&self.card_deps)
@@ -258,6 +261,7 @@ impl BoardForm {
         self.archive_days.handle(ev, Regular);
         self.retention_days.handle(ev, Regular);
         for c in [
+            &mut self.card_start,
             &mut self.card_due,
             &mut self.card_assignees,
             &mut self.card_deps,
@@ -304,6 +308,7 @@ impl BoardForm {
 
     fn card_fields(&self) -> CardFields {
         CardFields {
+            start_date: self.card_start.checked(),
             due_date: self.card_due.checked(),
             assignees: self.card_assignees.checked(),
             dependencies: self.card_deps.checked(),
@@ -526,6 +531,12 @@ impl BoardForm {
         i += 1;
         label(f, l, "Cards show", t);
         let mut r = Row::new(w);
+        let cb = r.take(check_w("start"));
+        f.render_stateful_widget(
+            checkbox_at("start".into(), cb, t),
+            cb,
+            &mut self.card_start,
+        );
         let cb = r.take(check_w("due date"));
         f.render_stateful_widget(
             checkbox_at("due date".into(), cb, t),

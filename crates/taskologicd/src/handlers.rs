@@ -1,6 +1,7 @@
 //! One function per request. Permission checks all go through
 //! `taskologic_core::permission`, nothing in here decides on its own.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -17,8 +18,8 @@ use taskologic_core::template::{self, Template, TemplateError, TemplateOptions};
 use taskologic_core::transition::{self, plan_move};
 use taskologic_core::user::UserSummary;
 use taskologic_proto::{
-    BoardChange, BoardDetail, Event, RepeatEntry, Request, Response, ScanOutcome, Severity,
-    TaskChange,
+    AnalyticsFilter, AnalyticsRow, BoardChange, BoardDetail, Event, HistoryEntry, RepeatEntry,
+    Request, Response, ScanOutcome, Severity, TaskChange, TaskState,
 };
 
 use crate::auth;
@@ -409,7 +410,7 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             };
             let task = state.db.tx(|c| {
                 check_deps(c, s, TaskId(0), &draft)?;
-                repo::create_task(c, &board, column, &draft, s.uid, Utc::now())
+                repo::create_task(c, &board, column, &draft, s.uid, None, Utc::now())
             })?;
             state.publish_board(
                 &board,
@@ -437,13 +438,14 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             let task = state.db.tx(|c| {
                 taskologic_core::task::validate_draft(&draft, &board)?;
                 check_deps(c, s, task.id, &draft)?;
+                let changed = taskologic_core::event::diff(&task, &draft);
                 let t = repo::update_task(c, &task, &draft, Utc::now())?;
                 repo::record_event(
                     c,
                     board.id,
                     Some(t.id),
                     Some(s.uid),
-                    &EventKind::TaskEdited,
+                    &EventKind::TaskEdited { changed },
                     Utc::now(),
                 )?;
                 Ok(t)
@@ -479,12 +481,17 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             check_task(TaskAction::Move, &s.actor(), &board, &task)?;
             let task = state.db.tx(|c| {
                 let t = repo::set_checklist_item(c, &task, index, done)?;
+                let text = t
+                    .checklist
+                    .get(index)
+                    .map(|i| i.text.clone())
+                    .unwrap_or_default();
                 repo::record_event(
                     c,
                     board.id,
                     Some(t.id),
                     Some(s.uid),
-                    &EventKind::TaskEdited,
+                    &EventKind::ChecklistToggled { index, text, done },
                     Utc::now(),
                 )?;
                 Ok(t)
@@ -591,6 +598,57 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             let tasks = state.db.with(|c| repo::list_tasks(c, board.id, true))?;
             Ok(Response::Tasks { tasks })
         }
+        Request::Analytics { board_id, filter } => {
+            // One board narrows it, and asking for one you cannot see is
+            // answered the way every other request answers that.
+            if let Some(id) = board_id {
+                load_board(state, s, id)?;
+            }
+            let rows = state
+                .db
+                .with(|c| analytics_rows(c, s.uid, board_id, &filter, Utc::now()))?;
+            Ok(Response::Analytics { rows })
+        }
+        Request::TaskHistory { task_id } => {
+            // Seeing the board is enough to read what happened on it.
+            let (board, task) = load_task(state, s, task_id)?;
+            let entries = state
+                .db
+                .with(|c| repo::task_history(c, task.id))?
+                .into_iter()
+                .map(|(e, actor)| HistoryEntry {
+                    at: e.at,
+                    actor,
+                    kind: e.kind,
+                })
+                .collect();
+            // Only the columns that still exist. A move into one that has
+            // since been removed is left for the client to word.
+            let columns = board
+                .columns
+                .iter()
+                .map(|c| (c.id, c.name.clone()))
+                .collect();
+            Ok(Response::History { entries, columns })
+        }
+        Request::SetExcludeFromStats { task_id, excluded } => {
+            let (board, task) = load_task(state, s, task_id)?;
+            // Changing what a task means for everyone else's estimates is an
+            // edit, and answers to the same rule as any other edit.
+            check_task(TaskAction::Edit, &s.actor(), &board, &task)?;
+            let task = state
+                .db
+                .with(|c| repo::set_exclude_from_stats(c, task.id, excluded))?;
+            state.publish_board(
+                &board,
+                Event::TaskChanged {
+                    task: task.clone(),
+                    change: TaskChange::Edited,
+                    actor: Some(s.uid),
+                },
+            );
+            Ok(Response::Task { task })
+        }
         Request::ListTemplates { board_id } => {
             let board = load_board(state, s, board_id)?;
             let templates = state.db.with(|c| repo::list_templates(c, board.id))?;
@@ -671,9 +729,26 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                         continue;
                     };
                     let mut dep_draft = dep_tpl.draft;
-                    dep_draft.due_at = dep_tpl.options.due_prefill.and_then(|p| p.due_from(now));
+                    dep_draft.start_at = dep_tpl.options.start_for(now);
+                    let history = dep_tpl
+                        .options
+                        .due_from_average
+                        .is_some()
+                        .then(|| repo::template_average(c, dep_tpl.id, now))
+                        .transpose()?
+                        .flatten();
+                    dep_draft.due_at =
+                        dep_tpl
+                            .options
+                            .due_for(now, dep_draft.start_at, history);
                     deps.push(repo::create_task(
-                        c, &board, column, &dep_draft, s.uid, now,
+                        c,
+                        &board,
+                        column,
+                        &dep_draft,
+                        s.uid,
+                        Some(dep_tpl.id),
+                        now,
                     )?);
                 }
                 // The root template's own prefill is already in the draft:
@@ -685,7 +760,7 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                     }
                 }
                 check_deps(c, s, TaskId(0), &main)?;
-                let task = repo::create_task(c, &board, column, &main, s.uid, now)?;
+                let task = repo::create_task(c, &board, column, &main, s.uid, Some(tpl.id), now)?;
                 Ok((deps, task))
             })?;
             for made in deps.iter().chain(std::iter::once(&task)) {
@@ -771,6 +846,10 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                 let user = repo::require_user(c, s.uid)?;
                 let names = repo::username_map(c)?;
                 let deps = repo::dep_lines(c, &task)?;
+                // Asking for the slip counts as having it. A reminder that
+                // would hand over the same paper an hour later then knows
+                // better, and autoprint already worked this way.
+                repo::mark_autoprinted(c, task.id, s.uid, Utc::now())?;
                 Ok(build_task_job(
                     &task,
                     &board,
@@ -891,13 +970,14 @@ fn template_input(
     if name.is_empty() {
         return Err(AppError::bad("template name cannot be empty"));
     }
+    draft.start_at = None;
     draft.due_at = None;
     draft.depends_on.clear();
     let refuse = |e: TemplateError| AppError::bad(e.to_string());
-    if options
-        .due_prefill
-        .is_some_and(|p| p.amount > template::MAX_PREFILL_AMOUNT)
-    {
+    let too_large = |o: &Option<taskologic_core::offset::Offset>| {
+        o.is_some_and(|p| p.amount > taskologic_core::offset::MAX_OFFSET_AMOUNT)
+    };
+    if too_large(&options.due_prefill) || too_large(&options.start_prefill) {
         return Err(refuse(TemplateError::PrefillTooLarge));
     }
     let graph = repo::template_deps_graph(c, board.id)?;
@@ -1124,7 +1204,7 @@ mod tests {
     use crate::config::Config;
     use crate::db::Db;
     use taskologic_core::board::{DEFAULT_ARCHIVE_AFTER_SECS, DEFAULT_PURGE_DELETED_AFTER_SECS};
-    use taskologic_core::template::{DuePrefill, OffsetUnit};
+    use taskologic_core::offset::{Offset, OffsetUnit};
     use taskologic_proto::{CreateBoard, ErrorBody, ErrorCode};
 
     fn state() -> Arc<AppState> {
@@ -1198,6 +1278,372 @@ mod tests {
             Response::Task { task } => task,
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Move a task and backdate the event that records it, so a test can lay
+    /// out a believable history in one go. Offsets are seconds ago.
+    fn move_at(st: &Arc<AppState>, uid: Uid, task: TaskId, to: ColumnId, secs_ago: i64) {
+        handle(
+            st,
+            &session(uid),
+            Request::MoveTask {
+                task_id: task,
+                to_column: to,
+                position: None,
+                override_deps: false,
+            },
+        )
+        .unwrap();
+        st.db
+            .with(|c| {
+                Ok(c.execute(
+                    "UPDATE events SET at = ?2 WHERE id = (SELECT max(id) FROM events WHERE task_id = ?1)",
+                    rusqlite::params![task.0, Utc::now().timestamp() - secs_ago],
+                )?)
+            })
+            .unwrap();
+    }
+
+    /// Backdate the creation event so a laid-out history reads in order. Real
+    /// tasks are created before they are moved; a test that fakes the moves
+    /// has to fake this too.
+    fn created_secs_ago(st: &Arc<AppState>, task: TaskId, secs: i64) {
+        st.db
+            .with(|c| {
+                Ok(c.execute(
+                    "UPDATE events SET at = ?2 WHERE task_id = ?1 AND kind = 'task_created'",
+                    rusqlite::params![task.0, Utc::now().timestamp() - secs],
+                )?)
+            })
+            .unwrap();
+    }
+
+    fn analytics(st: &Arc<AppState>, uid: Uid, filter: AnalyticsFilter) -> Vec<AnalyticsRow> {
+        match handle(
+            st,
+            &session(uid),
+            Request::Analytics {
+                board_id: None,
+                filter,
+            },
+        )
+        .unwrap()
+        {
+            Response::Analytics { rows } => rows,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn analytics_measures_time_in_the_started_column_and_leaves_pauses_out() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let task = make_task(&st, 1, &board, "Water plants");
+        // Started an hour ago, paused after ten minutes, restarted twenty
+        // minutes later, finished ten minutes after that.
+        created_secs_ago(&st, task.id, 7_200);
+        move_at(&st, 1, task.id, board.started_col, 3_600);
+        move_at(&st, 1, task.id, board.paused_col, 3_000);
+        move_at(&st, 1, task.id, board.started_col, 1_800);
+        move_at(&st, 1, task.id, board.finished_col, 1_200);
+
+        let rows = analytics(&st, 1, AnalyticsFilter::default());
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.state, TaskState::Finished);
+        assert_eq!(
+            r.time_taken_secs,
+            Some(1_200),
+            "ten minutes before the pause and ten after"
+        );
+        assert_eq!(
+            r.wall_clock_secs,
+            Some(2_400),
+            "start to finish, the pause included"
+        );
+        assert!(r.started_at.is_some());
+    }
+
+    #[test]
+    fn a_task_that_was_never_started_reports_no_duration_at_all() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let task = make_task(&st, 1, &board, "Two second job");
+        created_secs_ago(&st, task.id, 600);
+        move_at(&st, 1, task.id, board.finished_col, 60);
+        let rows = analytics(&st, 1, AnalyticsFilter::default());
+        assert_eq!(rows[0].time_taken_secs, None, "zero would be a lie");
+        assert_eq!(rows[0].started_at, None);
+    }
+
+    #[test]
+    fn a_task_created_straight_into_the_started_column_still_has_a_start_time() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let draft = TaskDraft {
+            title: "Straight to work".into(),
+            ..Default::default()
+        };
+        let task = match handle(
+            &st,
+            &session(1),
+            Request::CreateTask {
+                board_id: board.id,
+                column_id: Some(board.started_col),
+                draft,
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        };
+        created_secs_ago(&st, task.id, 600);
+        move_at(&st, 1, task.id, board.finished_col, 0);
+        let rows = analytics(&st, 1, AnalyticsFilter::default());
+        assert!(
+            rows[0].started_at.is_some(),
+            "the creation event records the column it landed in"
+        );
+        assert!(rows[0].time_taken_secs.is_some());
+    }
+
+    #[test]
+    fn the_table_lists_finished_work_by_default_and_the_filter_widens_it() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let done = make_task(&st, 1, &board, "Done");
+        created_secs_ago(&st, done.id, 1_200);
+        move_at(&st, 1, done.id, board.finished_col, 600);
+        let open = make_task(&st, 1, &board, "Still going");
+        let gone = make_task(&st, 1, &board, "Deleted");
+        handle(&st, &session(1), Request::DeleteTask { task_id: gone.id }).unwrap();
+
+        let titles = |f: AnalyticsFilter| {
+            let mut t: Vec<String> = analytics(&st, 1, f).into_iter().map(|r| r.title).collect();
+            t.sort();
+            t
+        };
+        assert_eq!(
+            titles(AnalyticsFilter::default()),
+            vec!["Deleted".to_string(), "Done".to_string()],
+            "finished and deleted, but not work still in flight"
+        );
+        assert_eq!(
+            titles(AnalyticsFilter {
+                show_deleted: false,
+                ..Default::default()
+            }),
+            vec!["Done".to_string()]
+        );
+        assert_eq!(
+            titles(AnalyticsFilter {
+                show_unfinished: true,
+                ..Default::default()
+            }),
+            vec![
+                "Deleted".to_string(),
+                "Done".to_string(),
+                "Still going".to_string()
+            ]
+        );
+        assert!(open.id.0 > 0);
+    }
+
+    #[test]
+    fn tasks_from_one_template_average_against_each_other() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let tpl = match handle(
+            &st,
+            &session(1),
+            Request::CreateTemplate {
+                board_id: board.id,
+                name: "Water plants".into(),
+                draft: TaskDraft {
+                    title: "Water plants".into(),
+                    ..Default::default()
+                },
+                options: TemplateOptions::default(),
+            },
+        )
+        .unwrap()
+        {
+            Response::Template { template } => template,
+            other => panic!("{other:?}"),
+        };
+
+        // Two instances: one took ten minutes, the other twenty.
+        let mut made = Vec::new();
+        for secs in [600i64, 1_200] {
+            let task = match handle(
+                &st,
+                &session(1),
+                Request::CreateFromTemplate {
+                    template_id: tpl.id,
+                    column_id: None,
+                    draft: TaskDraft {
+                        title: "Water plants".into(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap()
+            {
+                Response::Task { task } => task,
+                other => panic!("{other:?}"),
+            };
+            created_secs_ago(&st, task.id, 20_000);
+            move_at(&st, 1, task.id, board.started_col, 10_000);
+            move_at(&st, 1, task.id, board.finished_col, 10_000 - secs);
+            made.push(task);
+        }
+
+        let rows = analytics(&st, 1, AnalyticsFilter::default());
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert_eq!(r.average_secs, Some(900), "the mean of ten and twenty");
+            assert_eq!(r.samples, 2);
+        }
+
+        // Excluding the long one leaves the average to the other.
+        handle(
+            &st,
+            &session(1),
+            Request::SetExcludeFromStats {
+                task_id: made[1].id,
+                excluded: true,
+            },
+        )
+        .unwrap();
+        let rows = analytics(&st, 1, AnalyticsFilter::default());
+        for r in &rows {
+            assert_eq!(r.average_secs, Some(600));
+            assert_eq!(r.samples, 1);
+        }
+        assert!(rows.iter().any(|r| r.excluded), "the row still shows");
+    }
+
+    #[test]
+    fn a_one_off_task_has_nothing_to_average_against() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let task = make_task(&st, 1, &board, "One off");
+        created_secs_ago(&st, task.id, 1_200);
+        move_at(&st, 1, task.id, board.started_col, 600);
+        move_at(&st, 1, task.id, board.finished_col, 0);
+        let rows = analytics(&st, 1, AnalyticsFilter::default());
+        assert_eq!(rows[0].average_secs, None, "not a sibling of anything");
+        assert_eq!(rows[0].samples, 0);
+
+        // And it is filtered out when only repeated work is wanted.
+        let only = analytics(
+            &st,
+            1,
+            AnalyticsFilter {
+                repeating_only: true,
+                ..Default::default()
+            },
+        );
+        assert!(only.is_empty());
+    }
+
+    #[test]
+    fn analytics_never_reaches_across_a_private_board() {
+        let st = state();
+        let mine = make_board(&st, 1, false, &[]);
+        let theirs = make_board(&st, 2, true, &[]);
+        let a = make_task(&st, 1, &mine, "Mine");
+        let b = make_task(&st, 2, &theirs, "Theirs");
+        created_secs_ago(&st, a.id, 600);
+        created_secs_ago(&st, b.id, 600);
+        move_at(&st, 1, a.id, mine.finished_col, 60);
+        move_at(&st, 2, b.id, theirs.finished_col, 60);
+
+        let rows = analytics(&st, 1, AnalyticsFilter::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Mine");
+
+        // And asking for that board by name is a not-found, as everywhere.
+        let err = handle(
+            &st,
+            &session(1),
+            Request::Analytics {
+                board_id: Some(theirs.id),
+                filter: AnalyticsFilter::default(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(code(err), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn a_tasks_history_says_which_fields_an_edit_touched() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let task = make_task(&st, 1, &board, "Water plants");
+        let draft = TaskDraft {
+            title: "Water the plants".into(),
+            due_at: Some(Utc::now()),
+            checklist: vec![taskologic_core::task::ChecklistItem {
+                text: "fill can".into(),
+                done: false,
+            }],
+            ..Default::default()
+        };
+        handle(
+            &st,
+            &session(1),
+            Request::UpdateTask {
+                task_id: task.id,
+                version: task.version,
+                draft,
+            },
+        )
+        .unwrap();
+        handle(
+            &st,
+            &session(1),
+            Request::SetChecklistItem {
+                task_id: task.id,
+                index: 0,
+                done: true,
+            },
+        )
+        .unwrap();
+
+        let entries = match handle(&st, &session(1), Request::TaskHistory { task_id: task.id })
+            .unwrap()
+        {
+            Response::History { entries, .. } => entries,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            entries.first().map(|e| &e.kind),
+            Some(EventKind::TaskCreated { .. })
+        ));
+        let edit = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::TaskEdited { changed } => Some(changed),
+                _ => None,
+            })
+            .expect("the edit is in the log");
+        let fields: Vec<&str> = edit.iter().map(|c| c.label()).collect();
+        assert_eq!(fields, vec!["title", "due date", "checklist"]);
+
+        let tick = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ChecklistToggled { text, done, .. } => Some((text.clone(), *done)),
+                _ => None,
+            })
+            .expect("the tick is its own line");
+        assert_eq!(tick, ("fill can".to_string(), true));
+        assert!(
+            entries.iter().all(|e| e.actor.as_deref() == Some("alice")),
+            "the log says who, by name"
+        );
     }
 
     fn code(e: AppError) -> ErrorCode {
@@ -1475,11 +1921,12 @@ mod tests {
             &board,
             "Buy soap",
             TemplateOptions {
-                due_prefill: Some(DuePrefill {
+                due_prefill: Some(Offset {
                     amount: 2,
                     unit: OffsetUnit::Hours,
                 }),
                 dep_templates: Vec::new(),
+                ..Default::default()
             },
         );
         let sink = make_template(&st, 1, &board, "Fill sink", TemplateOptions::default());
@@ -1491,6 +1938,7 @@ mod tests {
             TemplateOptions {
                 due_prefill: None,
                 dep_templates: vec![soap.id, sink.id],
+                ..Default::default()
             },
         );
 
@@ -1558,6 +2006,7 @@ mod tests {
             TemplateOptions {
                 due_prefill: None,
                 dep_templates: vec![sink.id],
+                ..Default::default()
             },
         );
 
@@ -1571,6 +2020,7 @@ mod tests {
                 options: TemplateOptions {
                     due_prefill: None,
                     dep_templates: vec![wash.id],
+                    ..Default::default()
                 },
             },
         )
@@ -1591,6 +2041,7 @@ mod tests {
                 options: TemplateOptions {
                     due_prefill: None,
                     dep_templates: vec![wash.id],
+                    ..Default::default()
                 },
             },
         )
@@ -1618,6 +2069,8 @@ mod tests {
                 },
                 at: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
                 tz: chrono_tz::UTC,
+                start_rule: None,
+                due_rule: None,
             }),
             ..Default::default()
         };
@@ -1891,6 +2344,8 @@ mod tests {
             },
             at: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
             tz: chrono_tz::UTC,
+            start_rule: None,
+            due_rule: None,
         };
         let draft = TaskDraft {
             title: "Water".into(),
@@ -2334,4 +2789,162 @@ mod tests {
         };
         assert!(hits.is_empty(), "wildcards are literal");
     }
+}
+
+/// Which sibling group a task's average is taken over. A task from a template
+/// is compared against the others from that template; a repeated one against
+/// the other instances in its chain. Anything else is a one off with nothing
+/// to compare it to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SiblingGroup {
+    Template(TemplateId),
+    Chain(TaskId),
+}
+
+/// The oldest instance in a repetition chain, which stands for the chain.
+fn chain_root(parents: &HashMap<TaskId, TaskId>, mut task: TaskId) -> TaskId {
+    // A chain is built one spawn at a time so it cannot really loop, but a
+    // corrupted log must not hang the daemon either.
+    for _ in 0..10_000 {
+        match parents.get(&task) {
+            Some(next) => task = *next,
+            None => break,
+        }
+    }
+    task
+}
+
+fn state_of(task: &Task, board: &Board) -> TaskState {
+    if task.deleted_at.is_some() {
+        TaskState::Deleted
+    } else if task.archived_at.is_some() {
+        TaskState::Archived
+    } else if task.column_id == board.finished_col {
+        TaskState::Finished
+    } else {
+        TaskState::Unfinished
+    }
+}
+
+/// Build the analytics table.
+///
+/// Timings are worked out for every task the caller can see and only then
+/// filtered, so narrowing the table to one week does not quietly change the
+/// averages it reports.
+fn analytics_rows(
+    c: &rusqlite::Connection,
+    uid: Uid,
+    board_id: Option<taskologic_core::ids::BoardId>,
+    filter: &AnalyticsFilter,
+    now: chrono::DateTime<Utc>,
+) -> Result<Vec<AnalyticsRow>, AppError> {
+    use taskologic_core::stats;
+
+    let candidates = repo::analytics_candidates(c, uid, board_id)?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut boards: HashMap<taskologic_core::ids::BoardId, Board> = HashMap::new();
+    for (task, _) in &candidates {
+        if let std::collections::hash_map::Entry::Vacant(e) = boards.entry(task.board_id) {
+            e.insert(repo::require_board(c, task.board_id)?);
+        }
+    }
+
+    let ids: Vec<TaskId> = candidates.iter().map(|(t, _)| t.id).collect();
+    let trails = repo::transitions_for(c, &ids)?;
+    let parents = repo::repeat_parents(c, uid)?;
+    // Only tasks that actually belong to a chain get a chain group. Every
+    // other one off would otherwise be "averaged" against itself.
+    let mut in_chain: HashSet<TaskId> = HashSet::new();
+    for (child, parent) in &parents {
+        in_chain.insert(*child);
+        in_chain.insert(*parent);
+    }
+
+    let group_of = |task: &Task| -> Option<SiblingGroup> {
+        if let Some(tpl) = task.template_id {
+            return Some(SiblingGroup::Template(tpl));
+        }
+        in_chain
+            .contains(&task.id)
+            .then(|| SiblingGroup::Chain(chain_root(&parents, task.id)))
+    };
+
+    let empty: Vec<stats::Transition> = Vec::new();
+    let mut timings: HashMap<TaskId, stats::Timings> = HashMap::new();
+    let mut samples: HashMap<SiblingGroup, Vec<chrono::TimeDelta>> = HashMap::new();
+    for (task, _) in &candidates {
+        let Some(board) = boards.get(&task.board_id) else {
+            continue;
+        };
+        let trail = trails.get(&task.id).unwrap_or(&empty);
+        let t = stats::timings(trail, board.started_col, board.finished_col, now);
+        // Only finished work says how long this kind of work takes. One still
+        // running would contribute the time since it started, a different
+        // number that happens to have the same units.
+        if !task.exclude_from_stats
+            && t.finished_at.is_some()
+            && let (Some(group), Some(taken)) = (group_of(task), t.time_taken)
+        {
+            samples.entry(group).or_default().push(taken);
+        }
+        timings.insert(task.id, t);
+    }
+
+    let mut out = Vec::new();
+    for (task, board_name) in candidates {
+        let Some(board) = boards.get(&task.board_id) else {
+            continue;
+        };
+        let state = state_of(&task, board);
+        let keep_state = match state {
+            // A finished task is the whole point of the table.
+            TaskState::Finished => true,
+            TaskState::Unfinished => filter.show_unfinished,
+            TaskState::Archived => filter.show_archived,
+            TaskState::Deleted => filter.show_deleted,
+        };
+        if !keep_state {
+            continue;
+        }
+        // Two ways of saying "mine", so having either tick match is what the
+        // reader means by ticking both.
+        if (filter.assigned_to_me || filter.created_by_me)
+            && !((filter.assigned_to_me && task.is_assignee(uid))
+                || (filter.created_by_me && task.is_creator(uid)))
+        {
+            continue;
+        }
+        let group = group_of(&task);
+        if filter.repeating_only && group.is_none() {
+            continue;
+        }
+        let t = timings.get(&task.id).copied().unwrap_or_default();
+        let when = t.finished_at.unwrap_or(task.created_at);
+        if filter.since.is_some_and(|s| when < s) || filter.until.is_some_and(|u| when > u) {
+            continue;
+        }
+        let average = group
+            .and_then(|g| samples.get(&g))
+            .and_then(|s| stats::average(s));
+        out.push(AnalyticsRow {
+            task_id: task.id,
+            board_id: task.board_id,
+            board_name,
+            short_id: task.short_id,
+            title: task.title.clone(),
+            state,
+            planned_start: task.start_at,
+            planned_due: task.due_at,
+            started_at: t.started_at,
+            time_taken_secs: t.time_taken.map(|d| d.num_seconds()),
+            wall_clock_secs: t.wall_clock.map(|d| d.num_seconds()),
+            average_secs: average.map(|(d, _)| d.num_seconds()),
+            samples: average.map(|(_, n)| n).unwrap_or(0),
+            excluded: task.exclude_from_stats,
+        });
+    }
+    Ok(out)
 }
