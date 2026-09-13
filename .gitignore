@@ -1,9 +1,5 @@
 /target
-/dumping-ground
-/scratchpad
 /dev
-/pisspond
-/olesatovh
 Cargo.lock
 *.db
 *.db-wal
@@ -12,4 +8,3 @@ Cargo.lock
 *.DS_Store
 .vscode
 /TODO.md
-/external
