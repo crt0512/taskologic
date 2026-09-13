@@ -102,8 +102,8 @@ I believe in that if LLM's were used for a project it should be clearly stated w
 - TTY Based Browser/Native client via normalish Web Ports
 - non TTY PAM user backed authentication
 - kiosk mode 
-- time tracking reports with estimates on how long certain tasks (added as templates) should take
 - calendar view
+- task interaction/modification barcodes (shortcut style)
 - Import / Export features
 
 ## Status
