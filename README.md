@@ -1,4 +1,4 @@
-# <img src="assets/logo.png" alt="Logo" height="30"> Taskologic
+# <img src="assets/logo.png" alt="Logo" height="30" align="absmiddle"> Taskologic
 
 A terminal Kanban board for people who like moving post-it's around, with bonus support for a receipt printer and a barcode scanner because i have severe autism.
 
