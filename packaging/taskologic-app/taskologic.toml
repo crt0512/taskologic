@@ -1,0 +1,43 @@
+# Taskologic as a desktop app: tacoshell logs into the server over SSH and runs
+# taskologic there, in its own window. How to build it: README.md next to this file.
+#
+# Everything tacoshell can be told is in its README and examples/ssh.toml.
+# `taskologic-app --print-config` shows the finished config with all defaults.
+
+[app]
+name = "Taskologic"
+id = "net.512mb.taskologic"
+binary = "taskologic-app"
+version = "1.0.0"         # the app's own version for the package, default: tacoshell's
+description = "Taskologic, the terminal kanban board"
+icon = "logo.png"         # png, relative to this file. baked in, used for the
+
+[ssh]
+# Bake a server in and the setup screen only asks for the login:
+# server = "tasks.example.com"
+
+# Command of the remote TUI Application
+command = "taskologic"
+
+# Checked: taskologic is the users login shell, so a plain login lands in it no need to run taskologic manually
+# Unchecked: the login shell is something else, run taskologic right after connecting.
+shell_toggle = { label = "Taskologic Shell", default = true }
+
+# Quitting taskologic closes the window. A kiosk wants "reinitialize" here.
+on_exit = "close"
+
+# Defines the credential store
+# As of tacoshell 0.1.7 only memory (Store in RAM, doesnt persist app restart) and unsafe (Stored not quiet in plaintext but close to that on disk) are supported.
+# credentials = "unsafe"
+# unsafe_warning = true
+
+[login]
+logo_file = "logo.txt"
+
+# What the .deb (make deb) says about itself. The maintainer defaults to the
+# git identity of whoever builds it.
+[packaging]
+homepage = "https://github.com/crt0512/taskologic"
+long_description = "Opens Taskologic in its own window: logs into your Taskologic server over SSH, runs the board there and reconnects by itself when the connection drops. Includes a kiosk mode with an on screen keyboard for touchscreens."
+# maintainer = "Name <mail@example.com>"
+# license = ""
