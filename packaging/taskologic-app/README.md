@@ -43,7 +43,10 @@ Good to know:
 Now based on what you want to cook for / your os youll want to do either of these :
 
 ### Building for Debian / Ubuntu
-The .deb needs `dpkg-deb` on top, which comes with `dpkg-dev` on Debian (`sudo apt install dpkg-dev`). `make install` doesnt and just shoves the files rawdog style inplace where they should go.
+
+- The .deb needs `dpkg-deb`
+  -  comes with `dpkg-dev` on Debian (`sudo apt install dpkg-dev`).
+- `make install` doesnt and just shoves the files rawdog style inplace where they should go.
 
 - Build a .deb for your local system only :
   - `make deb CONFIG=taskologic-app/taskologic.toml`
