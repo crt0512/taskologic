@@ -4,7 +4,7 @@
 name = "Taskologic"
 id = "net.512mb.taskologic_app"
 binary = "taskologic-app"
-version = "1.0.2"
+version = "1.0.4"
 description = "Taskologic, the terminal kanban board"
 icon = "logo.png"
 
@@ -19,12 +19,12 @@ unsafe_warning = false
 
 [login]
 logo_file = "logo.txt"
-logo_color = "#ff0000"
-title = """ TaskoLogic "Client" """
+logo_color = "#ff1900"
+title = """Tasko-Logic"""
 
 [packaging]
 homepage = "https://github.com/crt0512/taskologic"
-long_description = "Opens Taskologic in its own window: log into your Taskologic server over SSH, reconnects by itself when the connection drops. Includes a kiosk mode with an on screen keyboard for touchscreens."
+long_description = "Opens Taskologic in its own window: logs you into your Taskologic server over SSH, reconnects by itself when the connection drops. Includes a kiosk mode with an on screen keyboard for touchscreens."
 maintainer = "crt <crt@512mb.net>"
 # license = ""
 

@@ -2,7 +2,7 @@
 
 A terminal Kanban board for people who like moving post-it's around, with bonus support for a receipt printer and a barcode scanner because i have severe autism.
 
-Idea in the end is that you SSH or Telnet into your Taskologic Server where Taskologic is your actual shell giving you a TUI instead of a bin bash head wall.
+Idea in the end is that you SSH or Telnet into your Taskologic Server (perhaps using the [Desktop Wrapper](packaging/taskologic-app/README.md)) where Taskologic is your actual shell giving you a TUI instead of a bin bash head wall.
 
 ![Screenshot](assets/README-1.png)
 
