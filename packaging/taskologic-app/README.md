@@ -105,7 +105,27 @@ Tested on Intel and M-Series Mac and worked no problemo, uses logo.icns though s
     - Then `make pkg CONFIG=taskologic-app/taskologic.toml TARGET=x86_64-apple-darwin`.
 
 ### Building for Windows
-Not possible yet, tacoshell has no Windows build or installer so far because I am allergic to windows 
+Possible now, on Linux atleast. No installer yet though, what you get is a portable build: a zip with the exe in it, unzip anywhere and run.
+
+Make sure you have these here:
+
+- `rustup target add x86_64-pc-windows-gnu`
+- zig and cargo-zigbuild from above, they do the linking. zig also puts the icon and the version info on the exe
+- `nasm`, the SSH crypto assembles its x86_64 code with it
+  - `sudo apt install nasm`
+  - Or add `AWS_LC_SYS_PREBUILT_NASM=1` to the make line to use the objects the crate ships instead
+- `zip` (`sudo apt install zip`)
+
+Then:
+
+- `make win CONFIG=taskologic-app/taskologic.toml`
+  - Gives you `target/taskologic-app-1.0.4-windows-x86_64.zip` (exact name might differ)
+  - Inside: `taskologic-app.exe` plus `taskologic-app-kiosk.cmd`, which starts it in kiosk mode
+  - Targets Windows 10 and up
+    - Might run on older things too not tested yet.
+    - `--help` and stuff will still work when run from a cmd
+  - It remembers server, username and passwords unsafely in `%APPDATA%\net.512mb.taskologic_app` so the app might be portable but your logins arent.
+  - Tested under wine only so far (seems fully functional apart from fractional scaling under X11)
 
 ### Building for iOS / iPadOS
 Not possible yet either coming one day
