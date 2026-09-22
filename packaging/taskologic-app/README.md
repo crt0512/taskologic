@@ -91,7 +91,9 @@ Then:
     - Tested Working on a Kindle Fire HD 8.9"
 
 ### Building for MacOS
-Not tested yet, cant decide which of my 7 Macs to try this on, (Pkg building cant be done on Debian), Needs Xcode's command line tools (`xcode-select --install`) and the rustup stuff from above:
+You're going to need a Mac for making pkgs as they needs Xcodes command line tools (`xcode-select --install`) and you obviously need the rustup stuff from above
+
+Tested on Intel and M-Series Mac and worked no problemo, uses logo.icns though so my OCD isnt upset :
 
 - Build for the Mac you're on
   - `make pkg CONFIG=taskologic-app/taskologic.toml`
