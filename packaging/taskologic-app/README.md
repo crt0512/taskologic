@@ -69,7 +69,7 @@ Make sure you have these here:
   - Android Studio's SDK manager can get you all of that. 
 - `rustup target add aarch64-linux-android`
   - `rustup target add armv7-linux-androideabi`  if you plan on building for older devices too
-- `zip` and Java's `keytool` are neede for the signing key
+- `zip` and Java's `keytool` are needed for the signing key
   - `sudo apt install zip default-jdk-headless`
 
 Then:
@@ -77,7 +77,6 @@ Then:
 - For somewhat recent Android devices
   - `make apk CONFIG=taskologic-app/taskologic.toml`
   - Runs on Android 7 and up, 64 bit arm devices only by default. To run on 32 bit devices too: 
-  - 
   - Then add `ANDROID_TARGETS="aarch64-linux-android armv7-linux-androideabi"` to the make line, this way both binaries end up in the same apk <3
   - Its signed with Android Studio's debug key (will be made for you if there is none yet). 
   - For a key of your own: `ANDROID_KEYSTORE=path/to/key.jks ANDROID_KEY_ALIAS=name ANDROID_KEYSTORE_PASS=secret`
