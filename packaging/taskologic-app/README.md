@@ -76,8 +76,8 @@ Then:
 
 - For somewhat recent Android devices
   - `make apk CONFIG=taskologic-app/taskologic.toml`
-  - Runs on Android 7 and up, 64 bit arm devices only by default. To run on 32 bit devices too: 
-  - Then add `ANDROID_TARGETS="aarch64-linux-android armv7-linux-androideabi"` to the make line, this way both binaries end up in the same apk <3
+  - Runs on Android 7 and up, 64 bit arm devices only by default.
+  - Add `ANDROID_TARGETS="aarch64-linux-android armv7-linux-androideabi"` to the make line, this way both binaries end up in the same apk <3
   - Its signed with Android Studio's debug key (will be made for you if there is none yet). 
   - For a key of your own: `ANDROID_KEYSTORE=path/to/key.jks ANDROID_KEY_ALIAS=name ANDROID_KEYSTORE_PASS=secret`
   - Android only installs an update if the version code went up. It comes from the version in taskologic.toml (1.0.2 becomes 1000002), so bump the version for every apk you hand out
