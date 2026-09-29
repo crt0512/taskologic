@@ -7,7 +7,9 @@
 //!
 //! ..      magic, two identical characters, so random product barcodes are ignored
 //! 1       format version, which fixes the total length
-//! action  S = start/pause toggle, F = finish
+//! action  S = start/pause toggle, F = finish, Y/N = answer a yes/no question
+//!         and finish, 1-8 = pick that answer of a choice question and finish,
+//!         C = on a program's root: finish everything of its run that is started
 //! taskid  six character base36 short id
 //! check   one base36 check character
 //! ```
@@ -73,13 +75,30 @@ pub enum ScanAction {
     StartPause,
     /// Move to the finished column, running the normal dependency check.
     Finish,
+    /// Answer the task's yes/no question "yes", finishing it if it is not
+    /// finished yet. Only a task a program gave a question to has one.
+    Yes,
+    No,
+    /// Pick the n-th answer, 1 to 8, of the task's choice question, finishing
+    /// it if it is not finished yet.
+    Choice(u8),
+    /// On a program run's root: finish every task of the run that is in the
+    /// started column right now. The universal stop code on a group sheet.
+    FinishChildren,
 }
 
 impl ScanAction {
+    /// The most answers a choice question can offer, one digit each.
+    pub const MAX_CHOICES: u8 = 8;
+
     pub fn code(self) -> char {
         match self {
             ScanAction::StartPause => 'S',
             ScanAction::Finish => 'F',
+            ScanAction::Yes => 'Y',
+            ScanAction::No => 'N',
+            ScanAction::Choice(n) => char::from(b'0' + n.clamp(1, Self::MAX_CHOICES)),
+            ScanAction::FinishChildren => 'C',
         }
     }
 
@@ -87,8 +106,18 @@ impl ScanAction {
         match c.to_ascii_uppercase() {
             'S' => Some(ScanAction::StartPause),
             'F' => Some(ScanAction::Finish),
+            'Y' => Some(ScanAction::Yes),
+            'N' => Some(ScanAction::No),
+            '1'..='8' => Some(ScanAction::Choice(c as u8 - b'0')),
+            'C' => Some(ScanAction::FinishChildren),
             _ => None,
         }
+    }
+
+    /// Whether this code belongs with the finishing codes on a slip: every
+    /// one but the start code.
+    pub fn finishes(self) -> bool {
+        !matches!(self, ScanAction::StartPause)
     }
 }
 

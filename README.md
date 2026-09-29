@@ -70,6 +70,7 @@ The printer and scanner config live with the user on purpose for that reason as 
 - Boards have columns, and three of them are special (like me): started, paused, and finished.
 - Tasks have a title, an optional description, a checklist, a due date, dependencies on other tasks, and assigned members
 - Tasks can repeat on a schedule, and they only regenerate once the previous one is actually finished (might make that an option in the future idk yet)
+- Programs are chains of tasks (or perhaps workflows i guess) written once and started as often as you like. Every step says what makes it appear, when it starts, its time limit, whether the root task waits for it, what question it asks when it is done and what that does aswell as what it prints.
 - Everything should be somewhat mouse and keyboard friendly, with a help overlay bound to `?`
 
 ## Built using
@@ -105,7 +106,6 @@ Yes i do infact use this system myself ... as the only one using it most likely 
 - kiosk mode 
 - calendar view
 - task interaction/modification barcodes (shortcut style)
-- Import / Export features
 
 ## Status
 

@@ -21,23 +21,34 @@ pub struct CardCtx<'a> {
     pub names: &'a dyn Fn(Uid) -> String,
     /// Open dependencies of a task, and how many it has in total.
     pub deps: &'a dyn Fn(&Task) -> (usize, usize),
+    /// How long tasks like this one usually take, in seconds, when the
+    /// daemon had enough history to say.
+    pub estimate: &'a dyn Fn(&Task) -> Option<i64>,
     pub finished_col: taskologic_core::ids::ColumnId,
 }
 
 /// The lines a card shows under its title. A field that has nothing to say
 /// is left out rather than printed as "none", so cards stay as small as
 /// their content.
-fn detail_count(task: &Task, fields: CardFields, deps_total: usize) -> u16 {
+fn detail_count(task: &Task, fields: CardFields, deps_total: usize, estimate: bool) -> u16 {
     u16::from(fields.start_date && task.start_at.is_some())
         + u16::from(fields.due_date && task.due_at.is_some())
         + u16::from(fields.assignees && !task.assignees.is_empty())
         + u16::from(fields.dependencies && deps_total > 0)
         + u16::from(fields.description && !task.description.trim().is_empty())
+        + u16::from(fields.estimate && estimate)
 }
 
-/// Rows this task's card takes, borders included.
-pub fn task_card_height(task: &Task, fields: CardFields, deps_total: usize, touch: bool) -> u16 {
-    2 + 1 + detail_count(task, fields, deps_total) + u16::from(touch)
+/// Rows this task's card takes, borders included. `estimate` is whether
+/// there is one to show.
+pub fn task_card_height(
+    task: &Task,
+    fields: CardFields,
+    deps_total: usize,
+    estimate: bool,
+    touch: bool,
+) -> u16 {
+    2 + 1 + detail_count(task, fields, deps_total, estimate) + u16::from(touch)
 }
 
 fn clip(s: &str, width: usize) -> String {
@@ -89,6 +100,12 @@ pub fn render_task(
     let mut title = task.title.clone();
     if ctx.fields.short_id {
         title = format!("{} {}", task.short_id, title);
+    }
+    // A step of a program says which, so a board full of a run's tasks
+    // reads in order. The root is marked as the root.
+    if let Some(p) = &task.program {
+        let mark = if p.pending_question { " ?" } else { "" };
+        title = format!("[{}{mark}] {title}", p.label());
     }
     lines.push(Line::from(Span::styled(clip(&title, w), title_style)));
 
@@ -166,6 +183,15 @@ pub fn render_task(
         && let Some(first) = task.description.lines().find(|l| !l.trim().is_empty())
     {
         lines.push(Line::from(Span::styled(clip(first, w), t.card_dim())));
+    }
+    if ctx.fields.estimate
+        && let Some(secs) = (ctx.estimate)(task)
+    {
+        let text = format!(
+            "usually {}",
+            taskologic_core::stats::format_duration(chrono::TimeDelta::seconds(secs))
+        );
+        lines.push(Line::from(Span::styled(clip(&text, w), t.card_dim())));
     }
 
     lines.truncate(inner.height as usize);
@@ -295,21 +321,25 @@ mod tests {
         let mut task = task_on(&board, 1);
         let f = CardFields::default();
         // Title only: two borders and one line.
-        assert_eq!(task_card_height(&task, f, 0, false), 3);
+        assert_eq!(task_card_height(&task, f, 0, false, false), 3);
         task.due_at = Some(chrono::Utc::now());
-        assert_eq!(task_card_height(&task, f, 0, false), 4);
+        assert_eq!(task_card_height(&task, f, 0, false, false), 4);
         task.assignees = vec![1];
-        assert_eq!(task_card_height(&task, f, 2, false), 6);
-        assert_eq!(task_card_height(&task, f, 2, true), 7);
+        assert_eq!(task_card_height(&task, f, 2, false, false), 6);
+        assert_eq!(task_card_height(&task, f, 2, false, true), 7);
 
         // A start date costs a line only where the board asked for one.
         task.start_at = Some(chrono::Utc::now());
-        assert_eq!(task_card_height(&task, f, 2, false), 6);
+        assert_eq!(task_card_height(&task, f, 2, false, false), 6);
         let with_start = CardFields {
             start_date: true,
             ..f
         };
-        assert_eq!(task_card_height(&task, with_start, 2, false), 7);
+        assert_eq!(task_card_height(&task, with_start, 2, false, false), 7);
+        // An estimate costs a line only when asked for and only when there is one.
+        let with_estimate = CardFields { estimate: true, ..f };
+        assert_eq!(task_card_height(&task, with_estimate, 2, false, false), 6);
+        assert_eq!(task_card_height(&task, with_estimate, 2, true, false), 7);
     }
 
     #[test]

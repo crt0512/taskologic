@@ -105,7 +105,13 @@ pub fn scan_target(
     Ok(match action {
         ScanAction::StartPause if task.column_id == board.started_col => board.paused_col,
         ScanAction::StartPause => board.started_col,
-        ScanAction::Finish => board.finished_col,
+        // An answer code finishes the task too; what it answers is the run's
+        // business, decided where the scan is applied.
+        ScanAction::Finish
+        | ScanAction::Yes
+        | ScanAction::No
+        | ScanAction::Choice(_)
+        | ScanAction::FinishChildren => board.finished_col,
     })
 }
 

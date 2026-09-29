@@ -10,10 +10,12 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use taskologic_core::board::{Board, Column, ColumnRemoval, ColumnRole};
 use taskologic_core::event::{Event, EventKind};
 use taskologic_core::ids::{
-    BoardId, ColumnId, EventId, PrintJobId, ShortId, TaskId, TemplateId, Uid,
+    BoardId, ColumnId, EventId, PrintJobId, ProgramId, RunId, ShortId, TaskId, TemplateId, Uid,
 };
+use taskologic_core::offset::Offset;
 use taskologic_core::prefs::UserPrefs;
 use taskologic_core::print::{DepLine, PrintJob, ReminderKind};
+use taskologic_core::program::{Program, ProgramDraft, Question, Run, StepRef};
 use taskologic_core::repeat::RepeatSpec;
 use taskologic_core::stats;
 use taskologic_core::task::{Task, TaskDraft};
@@ -213,6 +215,14 @@ pub fn get_board(c: &Connection, id: BoardId) -> R<Option<Board>> {
         columns: columns_of(c, id)?,
         members: members_of(c, id)?,
     }))
+}
+
+/// Every board called `name`, whatever the case. Names are not unique, so
+/// a caller that needs one board has to decide what two of them mean.
+pub fn boards_named(c: &Connection, name: &str) -> R<Vec<BoardId>> {
+    let mut st = c.prepare("SELECT id FROM boards WHERE lower(name) = lower(?1) ORDER BY id")?;
+    let rows = st.query_map(params![name.trim()], |r| Ok(BoardId(r.get(0)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 pub fn require_board(c: &Connection, id: BoardId) -> R<Board> {
@@ -532,6 +542,7 @@ pub fn task_count_in_column(c: &Connection, column_id: ColumnId) -> R<i64> {
 fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
     let short: String = r.get("short_id")?;
     let checklist: String = r.get("checklist")?;
+    let print_rules: String = r.get("print_rules")?;
     Ok(Task {
         id: TaskId(r.get("id")?),
         short_id: ShortId::parse(&short).unwrap_or(ShortId::from_index(0)),
@@ -561,7 +572,32 @@ fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
         repeat: None,
         template_id: r.get::<_, Option<i64>>("template_id")?.map(TemplateId),
         exclude_from_stats: r.get::<_, i64>("exclude_from_stats")? != 0,
+        print_rules: serde_json::from_str(&print_rules).unwrap_or_default(),
+        // Filled in by `hydrate`, which knows the run tables.
+        program: None,
+        auto_start: r.get::<_, i64>("auto_start")? != 0,
     })
+}
+
+/// How a task belongs to a program run, if it does.
+fn program_link(c: &Connection, task: TaskId) -> R<Option<StepRef>> {
+    Ok(c.query_row(
+        "SELECT run_id, step_key, iteration, question_json, asked, answer FROM program_tasks WHERE task_id = ?1",
+        params![task.0],
+        |r| {
+            let question: Option<String> = r.get(3)?;
+            let asked: i64 = r.get(4)?;
+            let answer: Option<String> = r.get(5)?;
+            Ok(StepRef {
+                run: RunId(r.get(0)?),
+                step: r.get(1)?,
+                iteration: r.get::<_, i64>(2)?.max(1) as u32,
+                question: question.and_then(|j| serde_json::from_str(&j).ok()),
+                pending_question: asked != 0 && answer.is_none(),
+            })
+        },
+    )
+    .optional()?)
 }
 
 fn hydrate(c: &Connection, mut task: Task) -> R<Task> {
@@ -583,6 +619,7 @@ fn hydrate(c: &Connection, mut task: Task) -> R<Task> {
         )
         .optional()?;
     task.repeat = rule.and_then(|j| serde_json::from_str(&j).ok());
+    task.program = program_link(c, task.id)?;
     Ok(task)
 }
 
@@ -633,7 +670,7 @@ fn next_position(c: &Connection, column_id: ColumnId) -> R<i64> {
     )?)
 }
 
-fn fresh_short_id(c: &Connection) -> R<ShortId> {
+pub fn fresh_short_id(c: &Connection) -> R<ShortId> {
     for _ in 0..32 {
         let n: i64 = c.query_row("SELECT abs(random())", [], |r| r.get(0))?;
         let id = ShortId::from_index(n as u64);
@@ -692,8 +729,8 @@ pub fn create_task(
     let pos = next_position(c, column)?;
     c.execute(
         "INSERT INTO tasks (short_id, board_id, column_id, position, title, description, start_at, due_at, created_by, created_at, \
-         finished_at, version, checklist, reminder_start_minutes, reminder_due_minutes, template_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15)",
+         finished_at, version, checklist, reminder_start_minutes, reminder_due_minutes, template_id, print_rules, auto_start) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             short.as_str(),
             board.id.0,
@@ -710,6 +747,8 @@ pub fn create_task(
             draft.reminder_start_minutes.map(i64::from),
             draft.reminder_due_minutes.map(i64::from),
             from_template.map(|t| t.0),
+            serde_json::to_string(&draft.print_rules).unwrap_or_else(|_| "[]".into()),
+            draft.auto_start as i64,
         ],
     )?;
     let id = TaskId(c.last_insert_rowid());
@@ -731,7 +770,7 @@ pub fn create_task(
 pub fn update_task(c: &Connection, task: &Task, draft: &TaskDraft, now: DateTime<Utc>) -> R<Task> {
     c.execute(
         "UPDATE tasks SET title = ?2, description = ?3, start_at = ?4, due_at = ?5, checklist = ?6, \
-         reminder_start_minutes = ?7, reminder_due_minutes = ?8, version = version + 1 WHERE id = ?1",
+         reminder_start_minutes = ?7, reminder_due_minutes = ?8, print_rules = ?9, auto_start = ?10, version = version + 1 WHERE id = ?1",
         params![
             task.id.0,
             draft.title.trim(),
@@ -741,6 +780,8 @@ pub fn update_task(c: &Connection, task: &Task, draft: &TaskDraft, now: DateTime
             serde_json::to_string(&draft.checklist).unwrap_or_else(|_| "[]".into()),
             draft.reminder_start_minutes.map(i64::from),
             draft.reminder_due_minutes.map(i64::from),
+            serde_json::to_string(&draft.print_rules).unwrap_or_else(|_| "[]".into()),
+            draft.auto_start as i64,
         ],
     )?;
     write_relations(c, task.id, draft, now)?;
@@ -1188,6 +1229,355 @@ pub fn delete_template(c: &Connection, id: TemplateId) -> R<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Programs and runs
+// ---------------------------------------------------------------------------
+
+fn program_from_row(r: &Row) -> rusqlite::Result<Program> {
+    let steps: String = r.get("steps_json")?;
+    Ok(Program {
+        id: ProgramId(r.get("id")?),
+        board_id: BoardId(r.get("board_id")?),
+        owner_uid: r.get::<_, i64>("owner_uid")? as Uid,
+        name: r.get("name")?,
+        description: r.get("description")?,
+        steps: serde_json::from_str(&steps).unwrap_or_default(),
+    })
+}
+
+pub fn list_programs(c: &Connection, board_id: BoardId) -> R<Vec<Program>> {
+    let mut st =
+        c.prepare("SELECT * FROM programs WHERE board_id = ?1 ORDER BY name COLLATE NOCASE, id")?;
+    let rows: Vec<Program> = st
+        .query_map(params![board_id.0], program_from_row)?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+pub fn get_program(c: &Connection, id: ProgramId) -> R<Option<Program>> {
+    Ok(c.query_row(
+        "SELECT * FROM programs WHERE id = ?1",
+        params![id.0],
+        program_from_row,
+    )
+    .optional()?)
+}
+
+pub fn require_program(c: &Connection, id: ProgramId) -> R<Program> {
+    get_program(c, id)?.ok_or_else(|| AppError::NotFound("program not found".into()))
+}
+
+pub fn create_program(
+    c: &Connection,
+    board_id: BoardId,
+    owner: Uid,
+    draft: &ProgramDraft,
+) -> R<Program> {
+    c.execute(
+        "INSERT INTO programs (board_id, owner_uid, name, description, steps_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            board_id.0,
+            i64::from(owner),
+            draft.name.trim(),
+            draft.description.trim(),
+            serde_json::to_string(&draft.steps)?
+        ],
+    )?;
+    require_program(c, ProgramId(c.last_insert_rowid()))
+}
+
+pub fn update_program(c: &Connection, id: ProgramId, draft: &ProgramDraft) -> R<Program> {
+    c.execute(
+        "UPDATE programs SET name = ?2, description = ?3, steps_json = ?4 WHERE id = ?1",
+        params![
+            id.0,
+            draft.name.trim(),
+            draft.description.trim(),
+            serde_json::to_string(&draft.steps)?
+        ],
+    )?;
+    require_program(c, id)
+}
+
+/// Runs already going keep their own copy of the steps, so this only takes
+/// the definition away.
+pub fn delete_program(c: &Connection, id: ProgramId) -> R<()> {
+    c.execute("DELETE FROM programs WHERE id = ?1", params![id.0])?;
+    Ok(())
+}
+
+fn run_from_row(r: &Row) -> rusqlite::Result<Run> {
+    let steps: String = r.get("steps_json")?;
+    Ok(Run {
+        id: RunId(r.get("id")?),
+        program_id: r.get::<_, Option<i64>>("program_id")?.map(ProgramId),
+        board_id: BoardId(r.get("board_id")?),
+        root_task: TaskId(r.get("root_task_id")?),
+        started_by: r.get::<_, i64>("started_by")? as Uid,
+        column_id: ColumnId(r.get("column_id")?),
+        steps: serde_json::from_str(&steps).unwrap_or_default(),
+        created_at: dt(r.get("created_at")?),
+        started_at: r.get::<_, Option<i64>>("started_at")?.map(dt),
+        finished_at: r.get::<_, Option<i64>>("finished_at")?.map(dt),
+        cancelled_at: r.get::<_, Option<i64>>("cancelled_at")?.map(dt),
+    })
+}
+
+/// A run of `program` whose root task is `root`, with the steps as they
+/// are right now: from here on the run answers to its own copy.
+pub fn create_run(
+    c: &Connection,
+    program: &Program,
+    root: TaskId,
+    started_by: Uid,
+    column: ColumnId,
+    now: DateTime<Utc>,
+) -> R<Run> {
+    c.execute(
+        "INSERT INTO program_runs (program_id, board_id, root_task_id, started_by, column_id, name, steps_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            program.id.0,
+            program.board_id.0,
+            root.0,
+            i64::from(started_by),
+            column.0,
+            program.name,
+            serde_json::to_string(&program.steps)?,
+            ts(now)
+        ],
+    )?;
+    require_run(c, RunId(c.last_insert_rowid()))
+}
+
+pub fn get_run(c: &Connection, id: RunId) -> R<Option<Run>> {
+    Ok(c.query_row(
+        "SELECT * FROM program_runs WHERE id = ?1",
+        params![id.0],
+        run_from_row,
+    )
+    .optional()?)
+}
+
+pub fn require_run(c: &Connection, id: RunId) -> R<Run> {
+    get_run(c, id)?.ok_or_else(|| AppError::NotFound("run not found".into()))
+}
+
+/// The name the run's program had when it started. The program may be gone
+/// or renamed since, the run is not.
+pub fn run_name(c: &Connection, id: RunId) -> R<String> {
+    Ok(c.query_row(
+        "SELECT name FROM program_runs WHERE id = ?1",
+        params![id.0],
+        |r| r.get(0),
+    )?)
+}
+
+/// Every run on a board, the ones still going first, newest first.
+pub fn list_runs(c: &Connection, board_id: BoardId) -> R<Vec<Run>> {
+    let mut st = c.prepare(
+        "SELECT * FROM program_runs WHERE board_id = ?1 \
+         ORDER BY (finished_at IS NULL AND cancelled_at IS NULL) DESC, created_at DESC, id DESC",
+    )?;
+    let rows: Vec<Run> = st
+        .query_map(params![board_id.0], run_from_row)?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+pub fn start_run(c: &Connection, id: RunId, now: DateTime<Utc>) -> R<()> {
+    c.execute(
+        "UPDATE program_runs SET started_at = ?2 WHERE id = ?1 AND started_at IS NULL",
+        params![id.0, ts(now)],
+    )?;
+    Ok(())
+}
+
+pub fn finish_run(c: &Connection, id: RunId, now: DateTime<Utc>) -> R<()> {
+    c.execute(
+        "UPDATE program_runs SET finished_at = ?2 WHERE id = ?1 AND finished_at IS NULL",
+        params![id.0, ts(now)],
+    )?;
+    Ok(())
+}
+
+pub fn cancel_run(c: &Connection, id: RunId, now: DateTime<Utc>) -> R<()> {
+    c.execute(
+        "UPDATE program_runs SET cancelled_at = ?2 WHERE id = ?1 AND cancelled_at IS NULL",
+        params![id.0, ts(now)],
+    )?;
+    Ok(())
+}
+
+/// What a run remembers about one of its tasks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskLink {
+    pub run: RunId,
+    pub step: String,
+    pub iteration: u32,
+    /// The fan-out entry this task is for.
+    pub param: Option<String>,
+    pub counts: bool,
+    pub time_limit: Option<Offset>,
+    pub paused_at: Option<DateTime<Utc>>,
+    pub skipped: bool,
+    pub question: Option<Question>,
+    /// Finished with the question unanswered.
+    pub asked: bool,
+    pub answer: Option<String>,
+}
+
+impl TaskLink {
+    pub fn pending_answer(&self) -> bool {
+        self.asked && self.answer.is_none()
+    }
+}
+
+fn link_from_row(r: &Row) -> rusqlite::Result<TaskLink> {
+    let limit: Option<String> = r.get("time_limit_json")?;
+    let question: Option<String> = r.get("question_json")?;
+    Ok(TaskLink {
+        run: RunId(r.get("run_id")?),
+        step: r.get("step_key")?,
+        iteration: r.get::<_, i64>("iteration")?.max(1) as u32,
+        param: r.get("param")?,
+        counts: r.get::<_, i64>("counts")? != 0,
+        time_limit: limit.and_then(|j| serde_json::from_str(&j).ok()),
+        paused_at: r.get::<_, Option<i64>>("paused_at")?.map(dt),
+        skipped: r.get::<_, i64>("skipped")? != 0,
+        question: question.and_then(|j| serde_json::from_str(&j).ok()),
+        asked: r.get::<_, i64>("asked")? != 0,
+        answer: r.get("answer")?,
+    })
+}
+
+/// Make `task` one of the run's, as step `step` on its `iteration`th go.
+#[allow(clippy::too_many_arguments)]
+pub fn link_task(
+    c: &Connection,
+    run: RunId,
+    task: TaskId,
+    step: &str,
+    iteration: u32,
+    param: Option<&str>,
+    counts: bool,
+    time_limit: Option<Offset>,
+    question: Option<&Question>,
+) -> R<()> {
+    c.execute(
+        "INSERT INTO program_tasks (task_id, run_id, step_key, iteration, param, counts, time_limit_json, question_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            task.0,
+            run.0,
+            step,
+            i64::from(iteration),
+            param,
+            counts as i64,
+            time_limit.map(|l| serde_json::to_string(&l)).transpose()?,
+            question.map(serde_json::to_string).transpose()?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The question was asked and nobody has answered. Bumps the task's version
+/// so every board redraws the mark.
+pub fn set_asked(c: &Connection, task: TaskId) -> R<()> {
+    c.execute(
+        "UPDATE program_tasks SET asked = 1 WHERE task_id = ?1",
+        params![task.0],
+    )?;
+    c.execute(
+        "UPDATE tasks SET version = version + 1 WHERE id = ?1",
+        params![task.0],
+    )?;
+    Ok(())
+}
+
+pub fn set_answer(c: &Connection, task: TaskId, answer: &str) -> R<()> {
+    c.execute(
+        "UPDATE program_tasks SET asked = 1, answer = ?2 WHERE task_id = ?1",
+        params![task.0, answer],
+    )?;
+    c.execute(
+        "UPDATE tasks SET version = version + 1 WHERE id = ?1",
+        params![task.0],
+    )?;
+    Ok(())
+}
+
+pub fn task_link(c: &Connection, task: TaskId) -> R<Option<TaskLink>> {
+    Ok(c.query_row(
+        "SELECT * FROM program_tasks WHERE task_id = ?1",
+        params![task.0],
+        link_from_row,
+    )
+    .optional()?)
+}
+
+/// Every task a run made, with what the run knows about each, oldest first.
+pub fn run_tasks(c: &Connection, run: RunId) -> R<Vec<(TaskLink, Task)>> {
+    let mut st = c.prepare(
+        "SELECT p.*, t.* FROM program_tasks p JOIN tasks t ON t.id = p.task_id \
+         WHERE p.run_id = ?1 ORDER BY t.id",
+    )?;
+    let rows: Vec<(TaskLink, Task)> = st
+        .query_map(params![run.0], |r| Ok((link_from_row(r)?, task_from_row(r)?)))?
+        .collect::<Result<_, _>>()?;
+    rows.into_iter()
+        .map(|(l, t)| Ok((l, hydrate(c, t)?)))
+        .collect()
+}
+
+pub fn set_paused_at(c: &Connection, task: TaskId, at: Option<DateTime<Utc>>) -> R<()> {
+    c.execute(
+        "UPDATE program_tasks SET paused_at = ?2 WHERE task_id = ?1",
+        params![task.0, at.map(ts)],
+    )?;
+    Ok(())
+}
+
+pub fn set_skipped(c: &Connection, task: TaskId, skipped: bool) -> R<()> {
+    c.execute(
+        "UPDATE program_tasks SET skipped = ?2 WHERE task_id = ?1",
+        params![task.0, skipped as i64],
+    )?;
+    Ok(())
+}
+
+/// The engine's own edits to a task's dates. Each bumps the version so an
+/// open editor notices the task changed under it.
+pub fn set_due_at(c: &Connection, task: &Task, due: Option<DateTime<Utc>>) -> R<Task> {
+    c.execute(
+        "UPDATE tasks SET due_at = ?2, version = version + 1 WHERE id = ?1",
+        params![task.id.0, due.map(ts)],
+    )?;
+    require_task(c, task.id)
+}
+
+pub fn set_start_at(c: &Connection, task: &Task, start: DateTime<Utc>) -> R<Task> {
+    c.execute(
+        "UPDATE tasks SET start_at = ?2, version = version + 1 WHERE id = ?1",
+        params![task.id.0, ts(start)],
+    )?;
+    require_task(c, task.id)
+}
+
+/// One more dependency on a task that already exists: the root waiting for
+/// a step the run has just made.
+pub fn add_dep(c: &Connection, task: TaskId, dep: TaskId) -> R<()> {
+    c.execute(
+        "INSERT OR IGNORE INTO deps (task_id, depends_on_task_id) VALUES (?1, ?2)",
+        params![task.0, dep.0],
+    )?;
+    c.execute(
+        "UPDATE tasks SET version = version + 1 WHERE id = ?1",
+        params![task.0],
+    )?;
+    Ok(())
+}
+
 /// Who has already had this task printed for them automatically.
 pub fn autoprinted_uids(c: &Connection, task: TaskId) -> R<Vec<Uid>> {
     let mut q = c.prepare("SELECT uid FROM task_autoprint WHERE task_id = ?1")?;
@@ -1382,12 +1772,7 @@ pub fn reminder_sent(
     kind: ReminderKind,
     anchor_at: DateTime<Utc>,
 ) -> R<bool> {
-    let n: i64 = c.query_row(
-        "SELECT count(*) FROM reminders_sent WHERE task_id = ?1 AND uid = ?2 AND kind = ?3 AND anchor_at = ?4",
-        params![task_id.0, i64::from(uid), kind.name(), ts(anchor_at)],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
+    slip_sent(c, task_id, uid, kind.name(), anchor_at)
 }
 
 pub fn mark_reminder_sent(
@@ -1398,17 +1783,54 @@ pub fn mark_reminder_sent(
     anchor_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> R<()> {
+    mark_slip_sent(c, task_id, uid, kind.name(), anchor_at, now)
+}
+
+/// The same bookkeeping for a task's own print rules, which name their kind
+/// themselves: the moment and the paper, see `PrintRule::sent_kind`.
+pub fn slip_sent(
+    c: &Connection,
+    task_id: TaskId,
+    uid: Uid,
+    kind: &str,
+    anchor_at: DateTime<Utc>,
+) -> R<bool> {
+    let n: i64 = c.query_row(
+        "SELECT count(*) FROM reminders_sent WHERE task_id = ?1 AND uid = ?2 AND kind = ?3 AND anchor_at = ?4",
+        params![task_id.0, i64::from(uid), kind, ts(anchor_at)],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+pub fn mark_slip_sent(
+    c: &Connection,
+    task_id: TaskId,
+    uid: Uid,
+    kind: &str,
+    anchor_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> R<()> {
     c.execute(
         "INSERT OR IGNORE INTO reminders_sent (task_id, uid, kind, anchor_at, sent_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            task_id.0,
-            i64::from(uid),
-            kind.name(),
-            ts(anchor_at),
-            ts(now)
-        ],
+        params![task_id.0, i64::from(uid), kind, ts(anchor_at), ts(now)],
     )?;
     Ok(())
+}
+
+/// Unfinished tasks that carry print rules of their own and at least one
+/// date for them to count from. Who each slip goes to is the rule's business,
+/// so unlike the reminders this is not asked per user.
+pub fn dated_rule_tasks(c: &Connection) -> R<Vec<Task>> {
+    let mut st = c.prepare(
+        "SELECT t.* FROM tasks t JOIN boards b ON b.id = t.board_id \
+         WHERE t.archived_at IS NULL AND t.column_id != b.finished_col \
+           AND t.print_rules != '[]' AND (t.due_at IS NOT NULL OR t.start_at IS NOT NULL)",
+    )?;
+    let rows: Vec<Task> = st
+        .query_map([], task_from_row)?
+        .collect::<Result<_, _>>()?;
+    rows.into_iter().map(|t| hydrate(c, t)).collect()
 }
 
 /// Whether the task was ever in the board's started column, from the event
@@ -1454,8 +1876,9 @@ pub fn analytics_candidates(
             Ok((task_from_row(r)?, r.get::<_, String>("board_name")?))
         })?
         .collect::<Result<_, _>>()?;
-    // Assignees are needed for the "assigned to me" filter; dependencies and
-    // repetitions are not, so the hydrate is deliberately partial.
+    // Assignees are needed for the "assigned to me" filter and the program
+    // link for grouping; dependencies and repetitions are not, so the
+    // hydrate is deliberately partial.
     rows.into_iter()
         .map(|(mut t, name)| {
             let mut st =
@@ -1463,9 +1886,39 @@ pub fn analytics_candidates(
             t.assignees = st
                 .query_map(params![t.id.0], |r| Ok(r.get::<_, i64>(0)? as Uid))?
                 .collect::<Result<_, _>>()?;
+            t.program = program_link(c, t.id)?;
             Ok((t, name))
         })
         .collect()
+}
+
+/// What stands for the program behind each run when grouping its tasks
+/// across runs: the program's id while it exists, its name once it is
+/// gone. Two runs of one program are siblings either way.
+pub fn run_identities(c: &Connection) -> R<HashMap<RunId, String>> {
+    let mut st = c.prepare(
+        "SELECT id, CASE WHEN program_id IS NULL THEN 'name:' || name ELSE 'program:' || program_id END \
+         FROM program_runs",
+    )?;
+    let rows = st.query_map([], |r| Ok((RunId(r.get(0)?), r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Tasks with the auto start flag whose start date has come, that nobody
+/// has started: not in the started or finished column, not archived, and
+/// never in the started column before, so a task somebody started and put
+/// back is left alone.
+pub fn auto_start_due(c: &Connection, now: DateTime<Utc>) -> R<Vec<Task>> {
+    let mut st = c.prepare(
+        "SELECT t.* FROM tasks t JOIN boards b ON b.id = t.board_id \
+         WHERE t.auto_start = 1 AND t.start_at IS NOT NULL AND t.start_at <= ?1 \
+           AND t.archived_at IS NULL AND t.column_id != b.started_col AND t.column_id != b.finished_col \
+           AND NOT EXISTS (SELECT 1 FROM events e WHERE e.task_id = t.id AND e.to_col = b.started_col)",
+    )?;
+    let rows: Vec<Task> = st
+        .query_map(params![ts(now)], task_from_row)?
+        .collect::<Result<_, _>>()?;
+    rows.into_iter().map(|t| hydrate(c, t)).collect()
 }
 
 /// Every column change for these tasks, oldest first, ready for
@@ -1581,7 +2034,42 @@ pub fn template_average(
             ))
         })?
         .collect::<Result<_, _>>()?;
+    average_over(c, &rows, now)
+}
 
+/// The same for the tasks a program step has made across every run of the
+/// program: `identity` as [`run_identities`] spells it, `step` the key. The
+/// root's own average is how long whole runs take.
+pub fn step_average(
+    c: &Connection,
+    identity: &str,
+    step: &str,
+    now: DateTime<Utc>,
+) -> R<Option<(TimeDelta, u32)>> {
+    let mut st = c.prepare(
+        "SELECT t.id, b.started_col, b.finished_col FROM tasks t \
+         JOIN program_tasks p ON p.task_id = t.id JOIN program_runs r ON r.id = p.run_id \
+         JOIN boards b ON b.id = t.board_id \
+         WHERE p.step_key = ?1 AND t.exclude_from_stats = 0 AND t.deleted_at IS NULL \
+           AND (CASE WHEN r.program_id IS NULL THEN 'name:' || r.name ELSE 'program:' || r.program_id END) = ?2",
+    )?;
+    let rows: Vec<(TaskId, ColumnId, ColumnId)> = st
+        .query_map(params![step, identity], |r| {
+            Ok((
+                TaskId(r.get("id")?),
+                ColumnId(r.get("started_col")?),
+                ColumnId(r.get("finished_col")?),
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    average_over(c, &rows, now)
+}
+
+fn average_over(
+    c: &Connection,
+    rows: &[(TaskId, ColumnId, ColumnId)],
+    now: DateTime<Utc>,
+) -> R<Option<(TimeDelta, u32)>> {
     let ids: Vec<TaskId> = rows.iter().map(|(id, _, _)| *id).collect();
     let trails = transitions_for(c, &ids)?;
     let samples: Vec<TimeDelta> = rows

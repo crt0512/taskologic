@@ -599,7 +599,20 @@ impl AnalyticsPanel {
                 taskologic_core::barcode::ScanAction::Finish => {
                     "scanned it as finished".to_string()
                 }
+                taskologic_core::barcode::ScanAction::Yes => {
+                    "scanned it as finished, answering yes".to_string()
+                }
+                taskologic_core::barcode::ScanAction::No => {
+                    "scanned it as finished, answering no".to_string()
+                }
+                taskologic_core::barcode::ScanAction::Choice(n) => {
+                    format!("scanned it as finished with answer {n}")
+                }
+                taskologic_core::barcode::ScanAction::FinishChildren => {
+                    "scanned its sheet to finish what was running".to_string()
+                }
             },
+            EventKind::QuestionAnswered { answer } => format!("answered {answer:?}"),
             EventKind::RepeatSpawned { .. } => "spawned it from a repetition".to_string(),
             EventKind::RepeatStopped => "stopped the repetition".to_string(),
             other => other.name().replace('_', " "),

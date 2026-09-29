@@ -20,4 +20,7 @@ pub use message::*;
 /// date, so a 0.1.10 client saving a task against this daemon would silently
 /// drop the reminder override rather than keep it. Refusing the connection
 /// says so instead; `make update` installs both halves together anyway.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// 3 is 0.1.12. Tasks gained their own print rules, which a 0.1.11 client
+/// does not know about and would strip from every task it saved.
+pub const PROTOCOL_VERSION: u32 = 3;

@@ -162,7 +162,7 @@ fn days_in_month(date: NaiveDate) -> u32 {
         .unwrap_or(28)
 }
 
-fn local_to_utc(tz: Tz, naive: NaiveDateTime) -> DateTime<Utc> {
+pub(crate) fn local_to_utc(tz: Tz, naive: NaiveDateTime) -> DateTime<Utc> {
     use chrono::LocalResult;
     match tz.from_local_datetime(&naive) {
         LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt.with_timezone(&Utc),
@@ -213,6 +213,10 @@ pub fn next_instance(task: &Task, board: &Board, fired_at: DateTime<Utc>) -> Tas
             })
             .collect(),
         repeat: task.repeat.clone(),
+        // The copy prints the way the original did: the rules are about the
+        // kind of task, not about one instance of it.
+        print_rules: task.print_rules.clone(),
+        auto_start: task.auto_start,
     }
 }
 

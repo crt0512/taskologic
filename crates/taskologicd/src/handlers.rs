@@ -5,26 +5,32 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
-use taskologic_core::barcode::{ScanParseError, ScanPayload};
+use taskologic_core::barcode::{ScanAction, ScanParseError, ScanPayload};
 use taskologic_core::board::{Board, plan_column_removal};
 use taskologic_core::event::EventKind;
-use taskologic_core::ids::{ColumnId, TaskId, TemplateId, Uid};
+use taskologic_core::ids::{ColumnId, ProgramId, RunId, TaskId, TemplateId, Uid};
 use taskologic_core::permission::{
-    Actor, BoardAction, TaskAction, check_board, check_task, check_template_manage,
+    Actor, BoardAction, TaskAction, check_board, check_program_manage, check_run_cancel,
+    check_task, check_template_manage,
 };
-use taskologic_core::print::{AutoprintTrigger, build_task_job, wants_autoprint};
+use taskologic_core::print::{AutoprintTrigger, Recipients, build_task_job, wants_autoprint};
+use taskologic_core::program::{self, Assign, Program, ProgramDraft, Run};
 use taskologic_core::task::{Task, TaskDraft};
-use taskologic_core::template::{self, Template, TemplateError, TemplateOptions};
+use taskologic_core::template::{
+    self, DEFAULT_MIN_SAMPLES, Template, TemplateError, TemplateOptions,
+};
 use taskologic_core::transition::{self, plan_move};
 use taskologic_core::user::UserSummary;
 use taskologic_proto::{
     AnalyticsFilter, AnalyticsRow, BoardChange, BoardDetail, Event, HistoryEntry, RepeatEntry,
-    Request, Response, ScanOutcome, Severity, TaskChange, TaskState,
+    Request, Response, RunEntry, ScanOutcome, Severity, TaskChange, TaskState,
 };
 
 use crate::auth;
 use crate::db::repo::{self, PrintAck};
 use crate::error::AppError;
+use crate::programs::{self, Effects};
+use crate::slips;
 use crate::state::AppState;
 
 /// The authenticated connection a request came in on.
@@ -45,6 +51,9 @@ impl Session {
 
 type R = Result<Response, AppError>;
 
+/// How long a kind of task takes on average and over how many, or nothing.
+type Average = Result<Option<(chrono::TimeDelta, u32)>, AppError>;
+
 pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
     match req {
         Request::Hello(_) => Err(AppError::Protocol("hello already sent".into())),
@@ -55,13 +64,12 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             Ok(Response::Boards { boards })
         }
         Request::GetBoard { board_id } => {
-            let (board, tasks) = state.db.with(|c| {
+            let detail = state.db.with(|c| {
                 let board = repo::require_board(c, board_id)?;
                 check_board(BoardAction::View, &s.actor(), &board)?;
-                let tasks = repo::list_tasks(c, board_id, false)?;
-                Ok((board, tasks))
+                board_detail(c, board)
             })?;
-            Ok(Response::Board(BoardDetail { board, tasks }))
+            Ok(Response::Board(detail))
         }
         Request::CreateBoard(req) => {
             let board = state
@@ -74,8 +82,11 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                     change: BoardChange::Created,
                 },
             );
-            let tasks = Vec::new();
-            Ok(Response::Board(BoardDetail { board, tasks }))
+            Ok(Response::Board(BoardDetail {
+                board,
+                tasks: Vec::new(),
+                estimates: Vec::new(),
+            }))
         }
         Request::UpdateBoard(req) => {
             // Not load_board: an admin outside a private board may unlock it,
@@ -143,15 +154,16 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                     },
                 );
             }
-            let tasks = if after.is_member(s.uid) {
-                state.db.with(|c| repo::list_tasks(c, after.id, false))?
+            let detail = if after.is_member(s.uid) {
+                state.db.with(|c| board_detail(c, after))?
             } else {
-                Vec::new()
+                BoardDetail {
+                    board: after,
+                    tasks: Vec::new(),
+                    estimates: Vec::new(),
+                }
             };
-            Ok(Response::Board(BoardDetail {
-                board: after,
-                tasks,
-            }))
+            Ok(Response::Board(detail))
         }
         Request::DeleteBoard { board_id } => {
             let board = state.db.with(|c| repo::require_board(c, board_id))?;
@@ -410,6 +422,7 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             };
             let task = state.db.tx(|c| {
                 check_deps(c, s, TaskId(0), &draft)?;
+                check_print_recipients(c, &draft)?;
                 repo::create_task(c, &board, column, &draft, s.uid, None, Utc::now())
             })?;
             state.publish_board(
@@ -438,6 +451,7 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             let task = state.db.tx(|c| {
                 taskologic_core::task::validate_draft(&draft, &board)?;
                 check_deps(c, s, task.id, &draft)?;
+                check_print_recipients(c, &draft)?;
                 let changed = taskologic_core::event::diff(&task, &draft);
                 let t = repo::update_task(c, &task, &draft, Utc::now())?;
                 repo::record_event(
@@ -465,11 +479,28 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             to_column,
             position,
             override_deps,
+            answer,
         } => {
             let (board, task) = load_task(state, s, task_id)?;
             check_task(TaskAction::Move, &s.actor(), &board, &task)?;
-            let moved = move_task(state, s, &board, &task, to_column, position, override_deps)?;
+            let moved = move_task(
+                state,
+                s,
+                &board,
+                &task,
+                to_column,
+                position,
+                override_deps,
+                answer,
+            )?;
             Ok(Response::Task { task: moved })
+        }
+        Request::AnswerQuestion { task_id, answer } => {
+            let (board, task) = load_task(state, s, task_id)?;
+            // Answering is working the task, the same as moving it.
+            check_task(TaskAction::Move, &s.actor(), &board, &task)?;
+            let task = answer_question(state, s, &board, &task, &answer)?;
+            Ok(Response::Task { task })
         }
         Request::SetChecklistItem {
             task_id,
@@ -512,17 +543,19 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             if task.is_archived() {
                 return Err(AppError::bad("task is already in the archive"));
             }
-            let task = state.db.tx(|c| {
-                let t = repo::soft_delete_task(c, &task, Utc::now())?;
+            let (task, effects) = state.db.tx(|c| {
+                let now = Utc::now();
+                let t = repo::soft_delete_task(c, &task, now)?;
                 repo::record_event(
                     c,
                     board.id,
                     Some(t.id),
                     Some(s.uid),
                     &EventKind::TaskDeleted,
-                    Utc::now(),
+                    now,
                 )?;
-                Ok(t)
+                let effects = programs::after_delete(c, &board, &t, now)?;
+                Ok((t, effects))
             })?;
             state.publish_board(
                 &board,
@@ -532,6 +565,7 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                     actor: Some(s.uid),
                 },
             );
+            publish_effects(state, &board, effects);
             Ok(Response::Task { task })
         }
         Request::PurgeTask { task_id } => {
@@ -581,6 +615,7 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                     &EventKind::TaskRestored { to },
                     Utc::now(),
                 )?;
+                programs::after_restore(c, &t)?;
                 Ok(t)
             })?;
             state.publish_board(
@@ -774,6 +809,7 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                     }
                 }
                 check_deps(c, s, TaskId(0), &main)?;
+                check_print_recipients(c, &main)?;
                 let task = repo::create_task(c, &board, column, &main, s.uid, Some(tpl.id), now)?;
                 Ok((deps, task))
             })?;
@@ -804,6 +840,164 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                 )?;
                 repo::delete_template(c, tpl.id)
             })?;
+            Ok(Response::Done)
+        }
+        Request::ListPrograms { board_id } => {
+            let board = load_board(state, s, board_id)?;
+            let programs = state.db.with(|c| repo::list_programs(c, board.id))?;
+            Ok(Response::Programs { programs })
+        }
+        Request::CreateProgram { board_id, draft } => {
+            let board = load_board(state, s, board_id)?;
+            check_board(BoardAction::AddTask, &s.actor(), &board)?;
+            let program = state.db.tx(|c| {
+                check_program(c, &board, &draft)?;
+                let p = repo::create_program(c, board.id, s.uid, &draft)?;
+                repo::record_event(
+                    c,
+                    board.id,
+                    None,
+                    Some(s.uid),
+                    &EventKind::ProgramCreated { program: p.id },
+                    Utc::now(),
+                )?;
+                Ok(p)
+            })?;
+            Ok(Response::Program { program })
+        }
+        Request::UpdateProgram { program_id, draft } => {
+            let (board, before) = load_program(state, s, program_id)?;
+            check_program_manage(&s.actor(), &board, before.owner_uid)?;
+            let program = state.db.tx(|c| {
+                check_program(c, &board, &draft)?;
+                let p = repo::update_program(c, before.id, &draft)?;
+                repo::record_event(
+                    c,
+                    board.id,
+                    None,
+                    Some(s.uid),
+                    &EventKind::ProgramChanged { program: p.id },
+                    Utc::now(),
+                )?;
+                Ok(p)
+            })?;
+            Ok(Response::Program { program })
+        }
+        Request::DeleteProgram { program_id } => {
+            let (board, program) = load_program(state, s, program_id)?;
+            check_program_manage(&s.actor(), &board, program.owner_uid)?;
+            state.db.tx(|c| {
+                repo::record_event(
+                    c,
+                    board.id,
+                    None,
+                    Some(s.uid),
+                    &EventKind::ProgramDeleted {
+                        program: program.id,
+                    },
+                    Utc::now(),
+                )?;
+                repo::delete_program(c, program.id)
+            })?;
+            Ok(Response::Done)
+        }
+        Request::StartProgram {
+            program_id,
+            column_id,
+            start_at,
+            fan_out,
+        } => {
+            let (board, program) = load_program(state, s, program_id)?;
+            check_board(BoardAction::AddTask, &s.actor(), &board)?;
+            let column = match column_id {
+                Some(c) if board.has_column(c) => c,
+                Some(c) => return Err(AppError::bad(format!("column {c} is not on this board"))),
+                None => board
+                    .first_column()
+                    .map(|c| c.id)
+                    .ok_or_else(|| AppError::bad("board has no columns"))?,
+            };
+            let (root, effects) = state.db.tx(|c| {
+                // The program is checked again on the way in: the board's
+                // members may have changed since it was saved.
+                check_program(c, &board, &program.draft())?;
+                let starter = repo::require_user(c, s.uid)?;
+                programs::start(
+                    c,
+                    &board,
+                    &program,
+                    &starter,
+                    column,
+                    start_at,
+                    &fan_out,
+                    Utc::now(),
+                )
+            })?;
+            state.publish_board(
+                &board,
+                Event::TaskChanged {
+                    task: root.clone(),
+                    change: TaskChange::Created,
+                    actor: Some(s.uid),
+                },
+            );
+            autoprint(state, &board, &root, AutoprintTrigger::AddedToBoard);
+            publish_effects(state, &board, effects);
+            Ok(Response::Task { task: root })
+        }
+        Request::ListRuns { board_id } => {
+            let board = load_board(state, s, board_id)?;
+            let runs = state.db.with(|c| {
+                let mut out = Vec::new();
+                for run in repo::list_runs(c, board.id)? {
+                    let root = repo::require_task(c, run.root_task)?;
+                    let (mut open, mut done) = (0, 0);
+                    for (link, task) in repo::run_tasks(c, run.id)? {
+                        if link.step == program::ROOT_KEY || !link.counts || link.skipped {
+                            continue;
+                        }
+                        if task.is_done(&board) {
+                            done += 1;
+                        } else {
+                            open += 1;
+                        }
+                    }
+                    out.push(RunEntry {
+                        id: run.id,
+                        program_name: repo::run_name(c, run.id)?,
+                        root,
+                        started_by: run.started_by,
+                        created_at: run.created_at,
+                        started_at: run.started_at,
+                        finished_at: run.finished_at,
+                        cancelled_at: run.cancelled_at,
+                        open_steps: open,
+                        done_steps: done,
+                    });
+                }
+                Ok(out)
+            })?;
+            Ok(Response::Runs { runs })
+        }
+        Request::CancelRun { run_id, delete_open } => {
+            let (board, run) = load_run(state, s, run_id)?;
+            check_run_cancel(&s.actor(), &board, run.started_by)?;
+            if !run.is_active() {
+                return Err(AppError::bad("this run is already over"));
+            }
+            let deleted = state
+                .db
+                .tx(|c| programs::cancel(c, &board, &run, delete_open, s.uid, Utc::now()))?;
+            for task in deleted {
+                state.publish_board(
+                    &board,
+                    Event::TaskChanged {
+                        task,
+                        change: TaskChange::Deleted,
+                        actor: Some(s.uid),
+                    },
+                );
+            }
             Ok(Response::Done)
         }
         Request::ListRepeats { board_id } => {
@@ -967,6 +1161,101 @@ fn load_template(
     Ok((board, tpl))
 }
 
+/// Program on an invisible board reads as "program not found".
+fn load_program(
+    state: &AppState,
+    s: &Session,
+    id: ProgramId,
+) -> Result<(Board, Program), AppError> {
+    let program = state.db.with(|c| repo::require_program(c, id))?;
+    let board = state.db.with(|c| repo::require_board(c, program.board_id))?;
+    check_board(BoardAction::View, &s.actor(), &board)
+        .map_err(|_| AppError::NotFound("program not found".into()))?;
+    Ok((board, program))
+}
+
+fn load_run(state: &AppState, s: &Session, id: RunId) -> Result<(Board, Run), AppError> {
+    let run = state.db.with(|c| repo::require_run(c, id))?;
+    let board = state.db.with(|c| repo::require_board(c, run.board_id))?;
+    check_board(BoardAction::View, &s.actor(), &board)
+        .map_err(|_| AppError::NotFound("run not found".into()))?;
+    Ok((board, run))
+}
+
+/// The core's checks, plus the one only the daemon can make: named people,
+/// assigned or printed for, have to be Taskologic users.
+fn check_program(
+    c: &rusqlite::Connection,
+    board: &Board,
+    draft: &ProgramDraft,
+) -> Result<(), AppError> {
+    program::validate(draft, board).map_err(|e| AppError::bad(e.to_string()))?;
+    for step in &draft.steps {
+        if let Assign::Users(uids) = &step.assign {
+            for uid in uids {
+                repo::require_user(c, *uid).map_err(|_| {
+                    AppError::bad(format!(
+                        "step {}: uid {uid} has never logged in to Taskologic",
+                        step.key
+                    ))
+                })?;
+            }
+        }
+        let draft = TaskDraft {
+            print_rules: step.print.clone(),
+            ..Default::default()
+        };
+        check_print_recipients(c, &draft)
+            .map_err(|e| AppError::bad(format!("step {}: {e}", step.key)))?;
+    }
+    Ok(())
+}
+
+/// Tell the clients what a run did on the back of somebody's move, and
+/// give the tasks it made their autoprint pass. The run acts as nobody.
+fn publish_effects(state: &Arc<AppState>, board: &Board, effects: Effects) {
+    for task in effects.created {
+        state.publish_board(
+            board,
+            Event::TaskChanged {
+                task: task.clone(),
+                change: TaskChange::Created,
+                actor: None,
+            },
+        );
+        autoprint(state, board, &task, AutoprintTrigger::AddedToBoard);
+    }
+    for task in effects.changed {
+        state.publish_board(
+            board,
+            Event::TaskChanged {
+                task,
+                change: TaskChange::Edited,
+                actor: None,
+            },
+        );
+    }
+    if let Some(root) = effects.finished_root {
+        let from = board.first_column().map(|c| c.id).unwrap_or(root.column_id);
+        state.publish_board(
+            board,
+            Event::TaskChanged {
+                change: TaskChange::Moved {
+                    from,
+                    to: root.column_id,
+                },
+                task: root,
+                actor: None,
+            },
+        );
+    }
+    for (uid, job) in effects.prints {
+        if let Err(e) = state.enqueue_print(uid, &job) {
+            tracing::warn!(uid, error = %e, "could not queue a group sheet");
+        }
+    }
+}
+
 /// Validates a template and strips what templates do not carry: a due date
 /// and dependencies belong to one instance, not to the kind of task. What
 /// replaces them lives in `options`, and checking those needs the board's
@@ -1007,6 +1296,7 @@ fn template_input(
         return Err(refuse(TemplateError::Cycle(dep)));
     }
     taskologic_core::task::validate_draft(&draft, board)?;
+    check_print_recipients(c, &draft)?;
     Ok((name, draft))
 }
 
@@ -1019,8 +1309,59 @@ fn columns_changed(state: &AppState, s: &Session, board_id: taskologic_core::ids
             change: BoardChange::Columns,
         },
     );
-    let tasks = state.db.with(|c| repo::list_tasks(c, board_id, false))?;
-    Ok(Response::Board(BoardDetail { board, tasks }))
+    let detail = state.db.with(|c| board_detail(c, board))?;
+    Ok(Response::Board(detail))
+}
+
+/// A board with its live tasks and, for the tasks that come from a
+/// template or a program step, how long that kind of task usually takes.
+/// Nothing is said until [`DEFAULT_MIN_SAMPLES`] of them have finished: one
+/// long afternoon must not become everybody's estimate.
+fn board_detail(c: &rusqlite::Connection, board: Board) -> Result<BoardDetail, AppError> {
+    let tasks = repo::list_tasks(c, board.id, false)?;
+    let now = Utc::now();
+    let identities = repo::run_identities(c)?;
+    let mut cache: HashMap<String, Option<i64>> = HashMap::new();
+    let mut estimates = Vec::new();
+    for task in &tasks {
+        if task.is_done(&board) {
+            continue;
+        }
+        let (key, lookup): (String, Box<dyn Fn() -> Average>) =
+            match (&task.program, task.template_id) {
+                (Some(p), _) => {
+                    let Some(identity) = identities.get(&p.run).cloned() else {
+                        continue;
+                    };
+                    let step = p.step.clone();
+                    let key = format!("{identity}/{step}");
+                    (key, Box::new(move || repo::step_average(c, &identity, &step, now)))
+                }
+                (None, Some(tpl)) => (
+                    format!("template:{tpl}"),
+                    Box::new(move || repo::template_average(c, tpl, now)),
+                ),
+                (None, None) => continue,
+            };
+        let secs = match cache.get(&key) {
+            Some(s) => *s,
+            None => {
+                let s = lookup()?
+                    .filter(|(_, n)| *n >= DEFAULT_MIN_SAMPLES)
+                    .map(|(d, _)| d.num_seconds());
+                cache.insert(key, s);
+                s
+            }
+        };
+        if let Some(secs) = secs {
+            estimates.push((task.id, secs));
+        }
+    }
+    Ok(BoardDetail {
+        board,
+        tasks,
+        estimates,
+    })
 }
 
 /// Dependencies must exist, be visible to the caller, and not form a cycle.
@@ -1050,6 +1391,62 @@ fn check_deps(
     Ok(())
 }
 
+/// Named print recipients have to be people Taskologic knows. The draft
+/// check only asks whether they are on the board, and on a public board that
+/// is everyone, so this is what stops a typo printing for nobody forever.
+fn check_print_recipients(c: &rusqlite::Connection, draft: &TaskDraft) -> Result<(), AppError> {
+    for rule in &draft.print_rules {
+        if let Recipients::Users(uids) = &rule.to {
+            for uid in uids {
+                repo::require_user(c, *uid).map_err(|_| {
+                    AppError::bad(format!(
+                        "uid {uid} has never logged in to Taskologic and cannot be printed for"
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Answer the question on one of a run's tasks. An unfinished task is
+/// finished with the answer; a finished one pending an answer gets it.
+fn answer_question(
+    state: &Arc<AppState>,
+    s: &Session,
+    board: &Board,
+    task: &Task,
+    answer: &str,
+) -> Result<Task, AppError> {
+    let question = task
+        .program
+        .as_ref()
+        .and_then(|p| p.question.as_ref())
+        .ok_or_else(|| AppError::bad("this task has no question to answer"))?;
+    if question.canonical(answer).is_none() {
+        return Err(AppError::bad(format!("{answer:?} is not one of the answers")));
+    }
+    if !task.is_done(board) {
+        return move_task(
+            state,
+            s,
+            board,
+            task,
+            board.finished_col,
+            None,
+            false,
+            Some(answer.to_string()),
+        );
+    }
+    let (answered, effects) = state.db.tx(|c| {
+        let effects = programs::answer(c, board, task, answer, Utc::now())?;
+        Ok((repo::require_task(c, task.id)?, effects))
+    })?;
+    publish_effects(state, board, effects);
+    Ok(answered)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn move_task(
     state: &Arc<AppState>,
     s: &Session,
@@ -1058,6 +1455,23 @@ fn move_task(
     to: ColumnId,
     position: Option<i64>,
     override_deps: bool,
+    answer: Option<String>,
+) -> Result<Task, AppError> {
+    move_task_by(state, Some(s.uid), board, task, to, position, override_deps, answer)
+}
+
+/// A move made by `actor`, or by the scheduler when there is none: the
+/// auto start flag moves tasks with nobody at the keyboard.
+#[allow(clippy::too_many_arguments)]
+pub fn move_task_by(
+    state: &Arc<AppState>,
+    actor: Option<Uid>,
+    board: &Board,
+    task: &Task,
+    to: ColumnId,
+    position: Option<i64>,
+    override_deps: bool,
+    answer: Option<String>,
 ) -> Result<Task, AppError> {
     let now = Utc::now();
     let moved = state.db.tx(|c| {
@@ -1065,13 +1479,13 @@ fn move_task(
         let plan = plan_move(board, task, to, &open, override_deps, now)?;
         let moved = repo::apply_move(c, task, &plan, position, now)?;
         if plan.from == plan.to {
-            repo::record_event(c, board.id, Some(task.id), Some(s.uid), &EventKind::TaskReordered, now)?;
-        } else {
+            repo::record_event(c, board.id, Some(task.id), actor, &EventKind::TaskReordered, now)?;
+        } else if let Some(uid) = actor {
             // apply_move records the transition without an actor; fix that up
             // by recording who did it alongside.
             c.execute(
                 "UPDATE events SET actor_uid = ?2 WHERE id = (SELECT max(id) FROM events WHERE task_id = ?1 AND kind = 'task_moved')",
-                rusqlite::params![task.id.0, i64::from(s.uid)],
+                rusqlite::params![task.id.0, i64::from(uid)],
             )?;
         }
         if !plan.overrode_deps.is_empty() {
@@ -1079,14 +1493,20 @@ fn move_task(
                 c,
                 board.id,
                 Some(task.id),
-                Some(s.uid),
+                actor,
                 &EventKind::DependencyOverridden { open: plan.overrode_deps.clone() },
                 now,
             )?;
         }
-        Ok((moved, plan))
+        // A task that belongs to a run sets things off: dates, new steps,
+        // the root finishing. All of it lands with the move or not at all.
+        let effects = programs::after_move(c, board, &moved, &plan, answer.clone(), now)?;
+        // The run may have dated the task or marked its question asked, so
+        // the answer and the broadcast carry the task as it is now.
+        let moved = repo::require_task(c, moved.id)?;
+        Ok((moved, plan, effects))
     })?;
-    let (moved, plan) = moved;
+    let (moved, plan, effects) = moved;
     let change = if plan.from == plan.to {
         TaskChange::Reordered
     } else {
@@ -1100,12 +1520,15 @@ fn move_task(
         Event::TaskChanged {
             task: moved.clone(),
             change,
-            actor: Some(s.uid),
+            actor,
         },
     );
     if plan.from != plan.to && to == board.started_col {
         autoprint(state, board, &moved, AutoprintTrigger::MovedToStarted);
     }
+    // The task the run just re-dated is published after the move, so the
+    // later state is the one that sticks on every screen.
+    publish_effects(state, board, effects);
     Ok(moved)
 }
 
@@ -1133,6 +1556,92 @@ fn scan(state: &Arc<AppState>, s: &Session, payload: &str) -> Result<ScanOutcome
     if check_task(TaskAction::Move, &s.actor(), &board, &task).is_err() {
         return Ok(ScanOutcome::NoPermission);
     }
+    // The stop code on a run's root finishes whatever of the run is being
+    // worked on right now, each the way a finish scan would.
+    if parsed.action == ScanAction::FinishChildren {
+        if !task.program.as_ref().is_some_and(|p| p.is_root()) {
+            return Ok(ScanOutcome::Refused {
+                reason: "this code belongs on a program's root task".into(),
+            });
+        }
+        let running = state
+            .db
+            .with(|c| programs::running_children(c, &board, &task))?;
+        if running.is_empty() {
+            return Ok(ScanOutcome::Refused {
+                reason: "nothing of this program is being worked on right now".into(),
+            });
+        }
+        let mut finished = 0;
+        for child in &running {
+            match move_task(state, s, &board, child, board.finished_col, None, false, None) {
+                Ok(_) => finished += 1,
+                // Open dependencies hold one back; the rest still finish.
+                Err(AppError::Blocked { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        state.db.with(|c| {
+            repo::record_event(
+                c,
+                board.id,
+                Some(task.id),
+                Some(s.uid),
+                &EventKind::ScanApplied {
+                    action: parsed.action,
+                },
+                Utc::now(),
+            )
+        })?;
+        let root = state.db.with(|c| repo::require_task(c, task.id))?;
+        return Ok(ScanOutcome::FinishedChildren {
+            root: Box::new(root),
+            finished,
+        });
+    }
+    // An answer code names an answer to the task's question. On a task that
+    // is finished and waiting, that is the whole scan; otherwise it finishes
+    // the task with the answer in hand.
+    let answer = match parsed.action {
+        ScanAction::StartPause | ScanAction::Finish | ScanAction::FinishChildren => None,
+        answering => {
+            let Some(question) = task.program.as_ref().and_then(|p| p.question.as_ref()) else {
+                return Ok(ScanOutcome::Refused {
+                    reason: "this task has no question to answer".into(),
+                });
+            };
+            let Some(answer) = question.answer_for(answering) else {
+                return Ok(ScanOutcome::Refused {
+                    reason: "that code is not one of this question's answers".into(),
+                });
+            };
+            if task.is_done(&board) {
+                if !task.program.as_ref().is_some_and(|p| p.pending_question) {
+                    return Ok(ScanOutcome::Refused {
+                        reason: "this question has been answered already".into(),
+                    });
+                }
+                let answered = answer_question(state, s, &board, &task, &answer)?;
+                state.db.with(|c| {
+                    repo::record_event(
+                        c,
+                        board.id,
+                        Some(task.id),
+                        Some(s.uid),
+                        &EventKind::ScanApplied {
+                            action: parsed.action,
+                        },
+                        Utc::now(),
+                    )
+                })?;
+                return Ok(ScanOutcome::Answered {
+                    task: Box::new(answered),
+                    answer,
+                });
+            }
+            Some(answer)
+        }
+    };
     let target = match transition::scan_target(parsed.action, &board, &task) {
         Ok(t) => t,
         Err(r) => {
@@ -1141,7 +1650,7 @@ fn scan(state: &Arc<AppState>, s: &Session, payload: &str) -> Result<ScanOutcome
             });
         }
     };
-    match move_task(state, s, &board, &task, target, None, false) {
+    match move_task(state, s, &board, &task, target, None, false, answer) {
         Ok(moved) => {
             state.db.with(|c| {
                 repo::record_event(
@@ -1176,7 +1685,14 @@ fn scan(state: &Arc<AppState>, s: &Session, payload: &str) -> Result<ScanOutcome
 
 /// Queue automatic prints for every user whose prefs ask for one. Failures
 /// are logged, never surfaced to the user who triggered them.
+///
+/// A task with print rules of its own has said how it prints, and for it
+/// the prefs stand down entirely: the rules fire instead.
 fn autoprint(state: &Arc<AppState>, board: &Board, task: &Task, trigger: AutoprintTrigger) {
+    if !task.print_rules.is_empty() {
+        slips::fire(state, board, task, trigger);
+        return;
+    }
     let result = state.db.with(|c| {
         let names = repo::username_map(c)?;
         let deps = repo::dep_lines(c, task)?;
@@ -1219,6 +1735,8 @@ mod tests {
     use crate::db::Db;
     use taskologic_core::board::{DEFAULT_ARCHIVE_AFTER_SECS, DEFAULT_PURGE_DELETED_AFTER_SECS};
     use taskologic_core::offset::{Offset, OffsetUnit};
+    use taskologic_core::print::{PrintRule, PrintWhen, SlipKind};
+    use taskologic_core::program::{Question, QuestionKind, StartRule, Step, Trigger};
     use taskologic_proto::{CreateBoard, ErrorBody, ErrorCode};
 
     fn state() -> Arc<AppState> {
@@ -1305,6 +1823,7 @@ mod tests {
                 to_column: to,
                 position: None,
                 override_deps: false,
+                answer: None,
             },
         )
         .unwrap();
@@ -1695,6 +2214,7 @@ mod tests {
                 to_column,
                 position: None,
                 override_deps: false,
+                answer: None,
             },
         )
         .unwrap();
@@ -1738,6 +2258,1020 @@ mod tests {
         move_to(&st, 1, task.id, board.started_col);
         assert_eq!(queued_slips(&st, 1), 1, "alice already had hers");
         assert_eq!(queued_slips(&st, 2), 1, "bob gets his first");
+    }
+
+    fn make_task_with(st: &Arc<AppState>, uid: Uid, board: &Board, draft: TaskDraft) -> Task {
+        match handle(
+            st,
+            &session(uid),
+            Request::CreateTask {
+                board_id: board.id,
+                column_id: None,
+                draft,
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn rule(when: PrintWhen, slip: SlipKind, to: Recipients) -> PrintRule {
+        PrintRule { when, slip, to }
+    }
+
+    #[test]
+    fn a_task_with_its_own_print_rules_prints_by_them_and_the_prefs_stand_down() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[2]);
+        // Alice's prefs would print every task she starts.
+        wants_prints_on_start(&st, 1);
+        let task = make_task_with(
+            &st,
+            1,
+            &board,
+            TaskDraft {
+                title: "Dishes".into(),
+                print_rules: vec![rule(
+                    PrintWhen::OnCreate,
+                    SlipKind::Reminder,
+                    Recipients::Creator,
+                )],
+                ..Default::default()
+            },
+        );
+        assert_eq!(queued_slips(&st, 1), 1, "the rule printed on creation");
+        let kinds: Vec<_> = st
+            .db
+            .with(|c| repo::pending_print_jobs(c, 1, Utc::now()))
+            .unwrap()
+            .into_iter()
+            .map(|(_, j)| j.kind)
+            .collect();
+        assert_eq!(kinds, vec![taskologic_core::print::PrintJobKind::Reminder]);
+
+        move_to(&st, 1, task.id, board.started_col);
+        assert_eq!(
+            queued_slips(&st, 1),
+            1,
+            "her start preference does not apply to a task with rules"
+        );
+        // A task without rules still follows the prefs.
+        let plain = make_task(&st, 1, &board, "Plain");
+        move_to(&st, 1, plain.id, board.started_col);
+        assert_eq!(queued_slips(&st, 1), 2);
+    }
+
+    #[test]
+    fn an_on_start_rule_prints_once_per_recipient_however_often_it_is_started() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[2]);
+        let task = make_task_with(
+            &st,
+            1,
+            &board,
+            TaskDraft {
+                title: "Dishes".into(),
+                assignees: vec![2],
+                print_rules: vec![rule(
+                    PrintWhen::OnStart,
+                    SlipKind::Task,
+                    Recipients::Assignees,
+                )],
+                ..Default::default()
+            },
+        );
+        assert_eq!(queued_slips(&st, 2), 0, "nothing until it starts");
+        move_to(&st, 1, task.id, board.started_col);
+        assert_eq!(queued_slips(&st, 2), 1, "the assignee gets the slip");
+        assert_eq!(queued_slips(&st, 1), 0, "the creator is not who it is for");
+        move_to(&st, 1, task.id, board.paused_col);
+        move_to(&st, 1, task.id, board.started_col);
+        assert_eq!(queued_slips(&st, 2), 1, "restarting does not reprint");
+        move_to(&st, 1, task.id, board.columns[0].id);
+        move_to(&st, 1, task.id, board.started_col);
+        assert_eq!(queued_slips(&st, 2), 1, "nor does starting over");
+    }
+
+    #[test]
+    fn a_rule_can_print_for_named_people_who_have_to_be_known() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let task = make_task_with(
+            &st,
+            1,
+            &board,
+            TaskDraft {
+                title: "Dishes".into(),
+                print_rules: vec![rule(
+                    PrintWhen::OnCreate,
+                    SlipKind::Task,
+                    Recipients::Users(vec![3]),
+                )],
+                ..Default::default()
+            },
+        );
+        assert_eq!(queued_slips(&st, 3), 1, "carol asked for nothing, the task did");
+        assert_eq!(queued_slips(&st, 1), 0);
+
+        // A public board counts everyone as a member, so the draft check
+        // lets any uid through; somebody who never logged in is caught here.
+        let err = handle(
+            &st,
+            &session(1),
+            Request::CreateTask {
+                board_id: board.id,
+                column_id: None,
+                draft: TaskDraft {
+                    title: "Dishes".into(),
+                    print_rules: vec![rule(
+                        PrintWhen::OnCreate,
+                        SlipKind::Task,
+                        Recipients::Users(vec![42]),
+                    )],
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap_err();
+        let body = ErrorBody::from(err);
+        assert_eq!(body.code, ErrorCode::BadRequest);
+        assert!(body.reason.contains("never logged in"), "{body:?}");
+
+        // The rules survive the round trip, and taking them off is an edit
+        // the history can name.
+        let loaded = st.db.with(|c| repo::require_task(c, task.id)).unwrap();
+        assert_eq!(loaded.print_rules, task.print_rules);
+        handle(
+            &st,
+            &session(1),
+            Request::UpdateTask {
+                task_id: task.id,
+                version: loaded.version,
+                draft: TaskDraft {
+                    title: "Dishes".into(),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        let entries = match handle(&st, &session(1), Request::TaskHistory { task_id: task.id })
+            .unwrap()
+        {
+            Response::History { entries, .. } => entries,
+            other => panic!("{other:?}"),
+        };
+        let changed = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::TaskEdited { changed } => Some(changed),
+                _ => None,
+            })
+            .expect("the edit is in the log");
+        assert_eq!(
+            changed.iter().map(|c| c.label()).collect::<Vec<_>>(),
+            vec!["printing"]
+        );
+    }
+
+    fn minutes(n: u32) -> Offset {
+        Offset {
+            amount: n,
+            unit: OffsetUnit::Minutes,
+        }
+    }
+
+    fn step(key: &str, created: Vec<Trigger>) -> Step {
+        Step {
+            key: key.into(),
+            title: format!("Step {key}"),
+            created,
+            ..Default::default()
+        }
+    }
+
+    fn after(key: &str) -> Trigger {
+        Trigger::Finished { step: key.into() }
+    }
+
+    /// The apartment example without the wash question and the room
+    /// fan-out, the same shape the core tests use.
+    fn apartment() -> ProgramDraft {
+        ProgramDraft {
+            name: "Clean up".into(),
+            description: String::new(),
+            steps: vec![
+                Step {
+                    key: program::ROOT_KEY.into(),
+                    title: "Clean up the flat".into(),
+                    ..Default::default()
+                },
+                Step {
+                    start: StartRule::WhenRootStarts,
+                    time_limit: Some(minutes(20)),
+                    ..step("1", vec![Trigger::WithRoot])
+                },
+                Step {
+                    once: true,
+                    start: StartRule::AfterTrigger(minutes(0)),
+                    time_limit: Some(minutes(30)),
+                    ..step("2", vec![after("1")])
+                },
+                step("3a", vec![after("2")]),
+                step("3b", vec![after("2")]),
+                Step {
+                    counts_toward_root: false,
+                    start: StartRule::DaysLaterAt {
+                        days: 1,
+                        at: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+                    },
+                    ..step("4", vec![after("1")])
+                },
+            ],
+        }
+    }
+
+    fn make_program(st: &Arc<AppState>, uid: Uid, board: &Board, draft: ProgramDraft) -> Program {
+        match handle(
+            st,
+            &session(uid),
+            Request::CreateProgram {
+                board_id: board.id,
+                draft,
+            },
+        )
+        .unwrap()
+        {
+            Response::Program { program } => program,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn start_program(st: &Arc<AppState>, uid: Uid, program: &Program) -> Task {
+        match handle(
+            st,
+            &session(uid),
+            Request::StartProgram {
+                program_id: program.id,
+                column_id: None,
+                start_at: Some(Utc::now() + chrono::TimeDelta::minutes(30)),
+                fan_out: Vec::new(),
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn live_tasks(st: &Arc<AppState>, board: &Board) -> Vec<Task> {
+        st.db
+            .with(|c| repo::list_tasks(c, board.id, false))
+            .unwrap()
+    }
+
+    fn by_title<'a>(tasks: &'a [Task], title: &str) -> &'a Task {
+        tasks
+            .iter()
+            .find(|t| t.title == title)
+            .unwrap_or_else(|| panic!("no task {title:?} among {:?}", tasks.iter().map(|t| &t.title).collect::<Vec<_>>()))
+    }
+
+    fn runs(st: &Arc<AppState>, uid: Uid, board: &Board) -> Vec<RunEntry> {
+        match handle(st, &session(uid), Request::ListRuns { board_id: board.id }).unwrap() {
+            Response::Runs { runs } => runs,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn starting_a_program_makes_the_root_and_what_comes_with_it() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[2]);
+        let program = make_program(&st, 1, &board, apartment());
+        let root = start_program(&st, 2, &program);
+        assert_eq!(root.title, "Clean up the flat");
+        assert_eq!(root.assignees, vec![2], "assigned to whoever started it");
+        assert!(root.start_at.is_some(), "dated from the start dialog");
+        assert_eq!(root.program.as_ref().map(|p| p.step.as_str()), Some("root"));
+
+        let tasks = live_tasks(&st, &board);
+        assert_eq!(tasks.len(), 2, "the root and step 1, nothing else yet");
+        let one = by_title(&tasks, "Step 1");
+        assert_eq!(one.start_at, None, "it waits for the root to start");
+        assert_eq!(one.program.as_ref().map(|p| p.label()), Some("1".into()));
+        assert_eq!(root.depends_on, vec![one.id], "the root waits for what counts");
+
+        let listed = runs(&st, 1, &board);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].program_name, "Clean up");
+        assert_eq!((listed[0].open_steps, listed[0].done_steps), (1, 0));
+        assert!(listed[0].started_at.is_none());
+    }
+
+    #[test]
+    fn the_chain_runs_from_the_root_starting_to_the_root_finishing_itself() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let program = make_program(&st, 1, &board, apartment());
+        let root = start_program(&st, 1, &program);
+        let one = by_title(&live_tasks(&st, &board), "Step 1").id;
+
+        // Starting the root dates step 1, which waited for exactly that.
+        move_to(&st, 1, root.id, board.started_col);
+        let tasks = live_tasks(&st, &board);
+        assert!(by_title(&tasks, "Step 1").start_at.is_some());
+        assert!(runs(&st, 1, &board)[0].started_at.is_some());
+
+        // Finishing 1 makes the trash run, waiting on 1 and starting at
+        // once, and the laundry for tomorrow, which the root ignores.
+        move_to(&st, 1, one, board.finished_col);
+        let tasks = live_tasks(&st, &board);
+        let two = by_title(&tasks, "Step 2");
+        assert_eq!(two.depends_on, vec![one]);
+        assert!((Utc::now() - two.start_at.unwrap()).num_seconds().abs() < 5);
+        let four = by_title(&tasks, "Step 4");
+        assert!(four.start_at.unwrap() > Utc::now() + chrono::TimeDelta::hours(1));
+        let root_now = by_title(&tasks, "Clean up the flat");
+        assert!(root_now.depends_on.contains(&two.id));
+        assert!(!root_now.depends_on.contains(&four.id), "the laundry does not count");
+
+        // The trash run done: both rooms appear.
+        move_to(&st, 1, two.id, board.finished_col);
+        let tasks = live_tasks(&st, &board);
+        let (a, b) = (by_title(&tasks, "Step 3a").id, by_title(&tasks, "Step 3b").id);
+        move_to(&st, 1, a, board.finished_col);
+        assert_ne!(
+            by_title(&live_tasks(&st, &board), "Clean up the flat").column_id,
+            board.finished_col,
+            "one room still open"
+        );
+        move_to(&st, 1, b, board.finished_col);
+        let tasks = live_tasks(&st, &board);
+        let root_now = by_title(&tasks, "Clean up the flat");
+        assert_eq!(root_now.column_id, board.finished_col, "the root finished itself");
+        assert!(root_now.finished_at.is_some());
+        assert_ne!(
+            by_title(&tasks, "Step 4").column_id,
+            board.finished_col,
+            "the laundry is still tomorrow's problem"
+        );
+        let run = &runs(&st, 1, &board)[0];
+        assert!(run.finished_at.is_some());
+        assert_eq!((run.open_steps, run.done_steps), (0, 4));
+        // The root's own history says the run finished it, as nobody.
+        let n = st
+            .db
+            .with(|c| repo::event_count(c, root.id, "task_moved"))
+            .unwrap();
+        assert_eq!(n, 2, "into started by hand, into finished by the run");
+    }
+
+    #[test]
+    fn time_limits_follow_the_four_rules() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let program = make_program(&st, 1, &board, apartment());
+        let root = start_program(&st, 1, &program);
+        move_to(&st, 1, root.id, board.started_col);
+        let one = by_title(&live_tasks(&st, &board), "Step 1").id;
+        let due_of = || {
+            st.db
+                .with(|c| repo::require_task(c, one))
+                .unwrap()
+                .due_at
+        };
+        let todo = board.columns[0].id;
+        assert_eq!(due_of(), None, "no clock runs before it starts");
+
+        // Rule one: entering the started column sets the due date from the limit.
+        move_to(&st, 1, one, board.started_col);
+        let first = due_of().expect("a due date");
+        let ahead = (first - Utc::now()).num_seconds();
+        assert!((1_190..=1_200).contains(&ahead), "twenty minutes, was {ahead}s");
+
+        // Rule three: time spent paused is added back on return.
+        move_to(&st, 1, one, board.paused_col);
+        st.db
+            .with(|c| {
+                Ok(c.execute(
+                    "UPDATE program_tasks SET paused_at = paused_at - 300 WHERE task_id = ?1",
+                    rusqlite::params![one.0],
+                )?)
+            })
+            .unwrap();
+        move_to(&st, 1, one, board.started_col);
+        let shifted = due_of().unwrap();
+        let gained = (shifted - first).num_seconds();
+        assert!((299..=302).contains(&gained), "five minutes back, got {gained}s");
+
+        // Rule two: the due date is the truth, an edit by hand moves the limit.
+        let hand = Utc::now() + chrono::TimeDelta::hours(2);
+        let t = st.db.with(|c| repo::require_task(c, one)).unwrap();
+        handle(
+            &st,
+            &session(1),
+            Request::UpdateTask {
+                task_id: one,
+                version: t.version,
+                draft: TaskDraft {
+                    title: t.title.clone(),
+                    due_at: Some(hand),
+                    start_at: t.start_at,
+                    assignees: t.assignees.clone(),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        move_to(&st, 1, one, board.paused_col);
+        move_to(&st, 1, one, board.started_col);
+        assert!((due_of().unwrap() - hand).num_seconds().abs() < 5, "kept, only shifted by a moment paused");
+
+        // Rule four: back to todo clears it, and the next start sets it fresh.
+        move_to(&st, 1, one, todo);
+        assert_eq!(due_of(), None);
+        move_to(&st, 1, one, board.started_col);
+        let fresh = (due_of().unwrap() - Utc::now()).num_seconds();
+        assert!((1_190..=1_200).contains(&fresh), "twenty minutes again, was {fresh}s");
+    }
+
+    #[test]
+    fn deleting_a_step_skips_it_and_cancelling_can_take_the_open_tasks_along() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let draft = ProgramDraft {
+            name: "Two jobs".into(),
+            description: String::new(),
+            steps: vec![
+                Step {
+                    key: program::ROOT_KEY.into(),
+                    title: "Both".into(),
+                    ..Default::default()
+                },
+                step("a", vec![Trigger::WithRoot]),
+                step("b", vec![Trigger::WithRoot]),
+                step("c", vec![after("a")]),
+            ],
+        };
+        let program = make_program(&st, 1, &board, draft);
+        let root = start_program(&st, 1, &program);
+        move_to(&st, 1, root.id, board.started_col);
+        let tasks = live_tasks(&st, &board);
+        let (a, b) = (by_title(&tasks, "Step a").id, by_title(&tasks, "Step b").id);
+
+        // Deleting a skips it: c never appears, and the root does not wait.
+        handle(&st, &session(1), Request::DeleteTask { task_id: a }).unwrap();
+        assert!(!live_tasks(&st, &board).iter().any(|t| t.title == "Step c"));
+        assert_ne!(by_title(&live_tasks(&st, &board), "Both").column_id, board.finished_col);
+        move_to(&st, 1, b, board.finished_col);
+        assert_eq!(
+            by_title(&live_tasks(&st, &board), "Both").column_id,
+            board.finished_col,
+            "b was the last thing that counted"
+        );
+
+        // A second run, cancelled with its open tasks: they go to the
+        // archive, the finished one stays on the board.
+        let root2 = start_program(&st, 1, &program);
+        move_to(&st, 1, root2.id, board.started_col);
+        let tasks = live_tasks(&st, &board);
+        let a2 = tasks
+            .iter()
+            .find(|t| t.title == "Step a" && t.program.as_ref().is_some_and(|p| p.run != root.program.as_ref().unwrap().run))
+            .unwrap()
+            .id;
+        move_to(&st, 1, a2, board.finished_col);
+        let run2 = runs(&st, 1, &board)
+            .into_iter()
+            .find(|r| r.root.id == root2.id)
+            .unwrap();
+        // Only whoever started it, the owner or an admin may cancel.
+        let err = handle(
+            &st,
+            &session(2),
+            Request::CancelRun {
+                run_id: run2.id,
+                delete_open: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(code(err), ErrorCode::PermissionDenied);
+        handle(
+            &st,
+            &session(1),
+            Request::CancelRun {
+                run_id: run2.id,
+                delete_open: true,
+            },
+        )
+        .unwrap();
+        let live = live_tasks(&st, &board);
+        assert!(live.iter().all(|t| t.id != root2.id), "the root went with it");
+        assert!(live.iter().any(|t| t.id == a2), "the finished step stays");
+        let archived = st
+            .db
+            .with(|c| repo::list_tasks(c, board.id, true))
+            .unwrap();
+        assert!(archived.iter().any(|t| t.id == root2.id && t.is_deleted()));
+        let run2 = runs(&st, 1, &board)
+            .into_iter()
+            .find(|r| r.id == run2.id)
+            .unwrap();
+        assert!(run2.cancelled_at.is_some());
+        // Finishing c2 now, were it there, would do nothing: the run is over.
+        let err = handle(
+            &st,
+            &session(1),
+            Request::CancelRun {
+                run_id: run2.id,
+                delete_open: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(code(err), ErrorCode::BadRequest);
+    }
+
+    #[test]
+    fn a_run_keeps_the_steps_it_started_with() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let program = make_program(&st, 1, &board, apartment());
+        let root = start_program(&st, 1, &program);
+        // The program changes under the run: step 2 is renamed and a step
+        // is added that would also follow 1.
+        let mut draft = program.draft();
+        draft.steps[2].title = "Take out the trash".into();
+        draft.steps.push(step("extra", vec![after("1")]));
+        handle(
+            &st,
+            &session(1),
+            Request::UpdateProgram {
+                program_id: program.id,
+                draft,
+            },
+        )
+        .unwrap();
+        move_to(&st, 1, root.id, board.started_col);
+        let one = by_title(&live_tasks(&st, &board), "Step 1").id;
+        move_to(&st, 1, one, board.finished_col);
+        let titles: Vec<String> = live_tasks(&st, &board).into_iter().map(|t| t.title).collect();
+        assert!(titles.contains(&"Step 2".to_string()), "{titles:?}");
+        assert!(!titles.iter().any(|t| t == "Take out the trash" || t == "Step extra"));
+        // Even deleting the program leaves the run going.
+        handle(
+            &st,
+            &session(1),
+            Request::DeleteProgram {
+                program_id: program.id,
+            },
+        )
+        .unwrap();
+        let two = by_title(&live_tasks(&st, &board), "Step 2").id;
+        move_to(&st, 1, two, board.finished_col);
+        assert!(live_tasks(&st, &board).iter().any(|t| t.title == "Step 3a"));
+        assert_eq!(runs(&st, 1, &board)[0].program_name, "Clean up");
+    }
+
+    #[test]
+    fn programs_follow_the_template_rules_and_bad_ones_are_refused_with_a_reason() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let program = make_program(&st, 2, &board, apartment());
+        assert_eq!(program.owner_uid, 2);
+        // Another plain member may start it but not change or delete it.
+        start_program(&st, 3, &program);
+        let err = handle(
+            &st,
+            &session(3),
+            Request::UpdateProgram {
+                program_id: program.id,
+                draft: program.draft(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(code(err), ErrorCode::PermissionDenied);
+        let err = handle(
+            &st,
+            &session(3),
+            Request::DeleteProgram {
+                program_id: program.id,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(code(err), ErrorCode::PermissionDenied);
+        // The board owner may, and the list says so.
+        let mut renamed = program.draft();
+        renamed.name = "Deep clean".into();
+        handle(
+            &st,
+            &session(1),
+            Request::UpdateProgram {
+                program_id: program.id,
+                draft: renamed,
+            },
+        )
+        .unwrap();
+        match handle(&st, &session(3), Request::ListPrograms { board_id: board.id }).unwrap() {
+            Response::Programs { programs } => assert_eq!(programs[0].name, "Deep clean"),
+            other => panic!("{other:?}"),
+        }
+        // A step that waits for nothing is a program that cannot work.
+        let mut broken = apartment();
+        broken.steps[2].created.clear();
+        let err = handle(
+            &st,
+            &session(1),
+            Request::CreateProgram {
+                board_id: board.id,
+                draft: broken,
+            },
+        )
+        .unwrap_err();
+        let body = ErrorBody::from(err);
+        assert_eq!(body.code, ErrorCode::BadRequest);
+        assert!(body.reason.contains("nothing that makes it appear"), "{body:?}");
+        // Somebody nobody knows cannot be assigned a step.
+        let mut stranger = apartment();
+        stranger.steps[1].assign = Assign::Users(vec![42]);
+        let err = handle(
+            &st,
+            &session(1),
+            Request::CreateProgram {
+                board_id: board.id,
+                draft: stranger,
+            },
+        )
+        .unwrap_err();
+        assert!(ErrorBody::from(err).reason.contains("never logged in"));
+    }
+
+    /// The wash loop of the example: 1 asks whether this was the last load,
+    /// "no" makes another cycle that asks again, "yes" the final hang up;
+    /// the trash run follows 1 whatever the answer.
+    fn laundry() -> ProgramDraft {
+        let asks = |key: &str, created: Vec<Trigger>| Step {
+            question: Some(Question {
+                text: "Was that the last load?".into(),
+                kind: QuestionKind::YesNo,
+                default: None,
+            }),
+            ..step(key, created)
+        };
+        let answered = |k: &str, a: &str| Trigger::Answered {
+            step: k.into(),
+            answer: a.into(),
+        };
+        ProgramDraft {
+            name: "Laundry".into(),
+            description: String::new(),
+            steps: vec![
+                Step {
+                    key: program::ROOT_KEY.into(),
+                    title: "Laundry day".into(),
+                    ..Default::default()
+                },
+                asks("1", vec![Trigger::WithRoot]),
+                asks("1.1", vec![answered("1", "no"), answered("1.1", "no")]),
+                step("1.2", vec![answered("1", "yes"), answered("1.1", "yes")]),
+                Step {
+                    once: true,
+                    ..step("2", vec![after("1")])
+                },
+            ],
+        }
+    }
+
+    fn finish_with(st: &Arc<AppState>, uid: Uid, board: &Board, task: TaskId, answer: Option<&str>) -> Task {
+        match handle(
+            st,
+            &session(uid),
+            Request::MoveTask {
+                task_id: task,
+                to_column: board.finished_col,
+                position: None,
+                override_deps: false,
+                answer: answer.map(String::from),
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn scan_code(st: &Arc<AppState>, uid: Uid, task: &Task, action: taskologic_core::barcode::ScanAction) -> ScanOutcome {
+        let payload = ScanPayload {
+            action,
+            short_id: task.short_id,
+        }
+        .encode(taskologic_core::barcode::Magic::Dots);
+        match handle(st, &session(uid), Request::Scan { payload }).unwrap() {
+            Response::Scan(outcome) => outcome,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn answering_as_you_finish_picks_the_branch_and_the_loop_runs_until_yes() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let program = make_program(&st, 1, &board, laundry());
+        let root = start_program(&st, 1, &program);
+        move_to(&st, 1, root.id, board.started_col);
+        let one = by_title(&live_tasks(&st, &board), "Step 1").clone();
+        assert!(one.program.as_ref().unwrap().question.is_some(), "the task carries its question");
+
+        let done = finish_with(&st, 1, &board, one.id, Some("No"));
+        assert!(!done.program.as_ref().unwrap().pending_question, "answered on the spot");
+        let tasks = live_tasks(&st, &board);
+        assert!(tasks.iter().any(|t| t.title == "Step 1.1"), "another cycle");
+        assert!(tasks.iter().any(|t| t.title == "Step 2"), "the trash run follows 1 either way");
+        assert!(!tasks.iter().any(|t| t.title == "Step 1.2"));
+
+        // Round two of the loop, then the answer that ends it.
+        let cycle = by_title(&tasks, "Step 1.1").id;
+        finish_with(&st, 1, &board, cycle, Some("no"));
+        let tasks = live_tasks(&st, &board);
+        let again = tasks
+            .iter()
+            .find(|t| t.program.as_ref().is_some_and(|p| p.label() == "1.1#2"))
+            .expect("a second go at 1.1");
+        assert_eq!(again.depends_on, vec![cycle]);
+        finish_with(&st, 1, &board, again.id, Some("yes"));
+        let tasks = live_tasks(&st, &board);
+        assert!(tasks.iter().any(|t| t.title == "Step 1.2"));
+        assert_eq!(tasks.iter().filter(|t| t.title == "Step 1.1").count(), 2, "no third cycle");
+
+        // The history says how each was answered.
+        let entries = match handle(&st, &session(1), Request::TaskHistory { task_id: one.id }).unwrap() {
+            Response::History { entries, .. } => entries,
+            other => panic!("{other:?}"),
+        };
+        assert!(entries.iter().any(|e| matches!(&e.kind, EventKind::QuestionAnswered { answer } if answer == "no")));
+    }
+
+    #[test]
+    fn an_unanswered_question_holds_the_root_until_the_answer_comes_by_request_or_scan() {
+        use taskologic_core::barcode::ScanAction;
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let program = make_program(&st, 1, &board, laundry());
+        let root = start_program(&st, 1, &program);
+        move_to(&st, 1, root.id, board.started_col);
+        let one = by_title(&live_tasks(&st, &board), "Step 1").clone();
+
+        // Finished from the board without an answer: it waits.
+        let done = finish_with(&st, 1, &board, one.id, None);
+        assert!(done.program.as_ref().unwrap().pending_question);
+        let tasks = live_tasks(&st, &board);
+        assert!(!tasks.iter().any(|t| t.title.starts_with("Step 1.")), "no branch yet");
+        let two = by_title(&tasks, "Step 2").id;
+        move_to(&st, 1, two, board.finished_col);
+        assert_ne!(
+            by_title(&live_tasks(&st, &board), "Laundry day").column_id,
+            board.finished_col,
+            "everything that counts is done, but a question is open"
+        );
+
+        // Answered later by request: the branch appears, the mark goes.
+        let err = handle(
+            &st,
+            &session(1),
+            Request::AnswerQuestion {
+                task_id: one.id,
+                answer: "maybe".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(code(err), ErrorCode::BadRequest);
+        let answered = match handle(
+            &st,
+            &session(1),
+            Request::AnswerQuestion {
+                task_id: one.id,
+                answer: "yes".into(),
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        };
+        assert!(!answered.program.as_ref().unwrap().pending_question);
+        let tasks = live_tasks(&st, &board);
+        let hang = by_title(&tasks, "Step 1.2").id;
+        move_to(&st, 1, hang, board.finished_col);
+        assert_eq!(
+            by_title(&live_tasks(&st, &board), "Laundry day").column_id,
+            board.finished_col
+        );
+
+        // A second run, worked by barcode. A plain finish code leaves the
+        // question open; the N code then answers it without moving anything.
+        let root2 = start_program(&st, 1, &program);
+        move_to(&st, 1, root2.id, board.started_col);
+        let one2 = live_tasks(&st, &board)
+            .into_iter()
+            .find(|t| t.title == "Step 1" && t.column_id != board.finished_col)
+            .unwrap();
+        assert!(matches!(scan_code(&st, 1, &one2, ScanAction::Finish), ScanOutcome::Applied { .. }));
+        let one2 = st.db.with(|c| repo::require_task(c, one2.id)).unwrap();
+        assert!(one2.program.as_ref().unwrap().pending_question);
+        assert!(matches!(
+            scan_code(&st, 1, &one2, ScanAction::Choice(1)),
+            ScanOutcome::Refused { .. }
+        ), "not a choice question");
+        match scan_code(&st, 1, &one2, ScanAction::No) {
+            ScanOutcome::Answered { task, answer } => {
+                assert_eq!(answer, "no");
+                assert!(!task.program.as_ref().unwrap().pending_question);
+            }
+            other => panic!("{other:?}"),
+        }
+        let cycle = live_tasks(&st, &board)
+            .into_iter()
+            .find(|t| t.title == "Step 1.1" && t.column_id != board.finished_col)
+            .expect("the answer made another cycle");
+        // The Y code on a task still open finishes it and answers in one scan.
+        match scan_code(&st, 1, &cycle, ScanAction::Yes) {
+            ScanOutcome::Applied { moved_to, .. } => assert_eq!(moved_to, board.finished_col),
+            other => panic!("{other:?}"),
+        }
+        assert!(live_tasks(&st, &board).iter().filter(|t| t.title == "Step 1.2").count() == 2);
+        // And answering twice is refused.
+        assert!(matches!(
+            scan_code(&st, 1, &cycle, ScanAction::Yes),
+            ScanOutcome::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn a_question_tasks_slip_carries_the_answer_codes_in_place_of_the_finish_code() {
+        use taskologic_core::barcode::ScanAction;
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let program = make_program(&st, 1, &board, laundry());
+        start_program(&st, 1, &program);
+        let one = by_title(&live_tasks(&st, &board), "Step 1").id;
+        handle(&st, &session(1), Request::PrintTask { task_id: one }).unwrap();
+        let jobs = st
+            .db
+            .with(|c| repo::pending_print_jobs(c, 1, Utc::now()))
+            .unwrap();
+        let actions: Vec<ScanAction> = jobs[0].1.barcodes.iter().map(|b| b.action).collect();
+        assert_eq!(actions, vec![ScanAction::StartPause, ScanAction::Yes, ScanAction::No]);
+        assert_eq!(jobs[0].1.barcodes[1].label.as_deref(), Some("scan to finish: yes"));
+    }
+
+    #[test]
+    fn a_fan_out_step_makes_a_task_per_entry_prints_one_sheet_and_the_stop_code_finishes_them() {
+        use taskologic_core::barcode::ScanAction;
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let mut draft = apartment();
+        // Two rooms after the trash run, on one sheet.
+        draft.steps.retain(|s| s.key != "3b");
+        let rooms = draft.steps.iter_mut().find(|s| s.key == "3a").unwrap();
+        rooms.key = "3".into();
+        rooms.title = "Clean the {param}".into();
+        rooms.fan_out = Some(vec!["bedroom".into(), "kitchen".into(), "hall".into()]);
+        rooms.print = vec![rule(PrintWhen::OnCreate, SlipKind::Sheet, Recipients::Creator)];
+        let program = make_program(&st, 1, &board, draft);
+
+        // Started with the hall left out for this run.
+        let root = match handle(
+            &st,
+            &session(1),
+            Request::StartProgram {
+                program_id: program.id,
+                column_id: None,
+                start_at: None,
+                fan_out: vec![("3".into(), vec!["bedroom".into(), "kitchen".into()])],
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        };
+        move_to(&st, 1, root.id, board.started_col);
+        let one = by_title(&live_tasks(&st, &board), "Step 1").id;
+        move_to(&st, 1, one, board.finished_col);
+        let two = by_title(&live_tasks(&st, &board), "Step 2").id;
+        let before = queued_slips(&st, 1);
+        move_to(&st, 1, two, board.finished_col);
+
+        let tasks = live_tasks(&st, &board);
+        let bedroom = by_title(&tasks, "Clean the bedroom").clone();
+        let kitchen = by_title(&tasks, "Clean the kitchen").clone();
+        assert!(!tasks.iter().any(|t| t.title.contains("hall")), "left out at the start");
+        assert_eq!(bedroom.program.as_ref().unwrap().label(), "3");
+        let root_now = by_title(&tasks, "Clean up the flat");
+        assert!(root_now.depends_on.contains(&bedroom.id) && root_now.depends_on.contains(&kitchen.id));
+
+        // One sheet, not one per room: the root's title, both rooms with a
+        // start code each, and the stop code.
+        assert_eq!(queued_slips(&st, 1) - before, 1);
+        let jobs = st
+            .db
+            .with(|c| repo::pending_print_jobs(c, 1, Utc::now()))
+            .unwrap();
+        let sheet = &jobs.last().unwrap().1;
+        assert_eq!(sheet.kind, taskologic_core::print::PrintJobKind::Sheet);
+        assert_eq!(sheet.task_id, root.id);
+        assert_eq!(sheet.sheet.len(), 2);
+        assert_eq!(sheet.sheet[0].barcode.action, ScanAction::StartPause);
+        assert_eq!(sheet.barcodes[0].action, ScanAction::FinishChildren);
+
+        // The stop code finishes what is running and nothing else.
+        move_to(&st, 1, bedroom.id, board.started_col);
+        match scan_code(&st, 1, root_now, ScanAction::FinishChildren) {
+            ScanOutcome::FinishedChildren { finished, .. } => assert_eq!(finished, 1),
+            other => panic!("{other:?}"),
+        }
+        let tasks = live_tasks(&st, &board);
+        assert_eq!(by_title(&tasks, "Clean the bedroom").column_id, board.finished_col);
+        assert_ne!(by_title(&tasks, "Clean the kitchen").column_id, board.finished_col);
+        assert_ne!(by_title(&tasks, "Clean up the flat").column_id, board.finished_col, "the kitchen is still to do");
+        assert!(matches!(
+            scan_code(&st, 1, root_now, ScanAction::FinishChildren),
+            ScanOutcome::Refused { .. }
+        ), "nothing running now");
+        assert!(matches!(
+            scan_code(&st, 1, &kitchen, ScanAction::FinishChildren),
+            ScanOutcome::Refused { .. }
+        ), "only the root carries it");
+        move_to(&st, 1, kitchen.id, board.started_col);
+        scan_code(&st, 1, root_now, ScanAction::FinishChildren);
+        assert_eq!(
+            by_title(&live_tasks(&st, &board), "Clean up the flat").column_id,
+            board.finished_col,
+            "the last room finished the root"
+        );
+    }
+
+    #[test]
+    fn steps_average_across_runs_and_the_board_carries_an_estimate_once_there_is_history() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let draft = ProgramDraft {
+            name: "Kettle".into(),
+            description: String::new(),
+            steps: vec![
+                Step {
+                    key: program::ROOT_KEY.into(),
+                    title: "Tea".into(),
+                    ..Default::default()
+                },
+                step("boil", vec![Trigger::WithRoot]),
+            ],
+        };
+        let program = make_program(&st, 1, &board, draft);
+        // Three runs, the boil taking ten, twenty and thirty minutes.
+        for mins in [600i64, 1_200, 1_800] {
+            let root = start_program(&st, 1, &program);
+            move_to(&st, 1, root.id, board.started_col);
+            let boil = live_tasks(&st, &board)
+                .into_iter()
+                .find(|t| t.title == "Step boil" && t.column_id != board.finished_col)
+                .unwrap();
+            created_secs_ago(&st, boil.id, 20_000);
+            move_at(&st, 1, boil.id, board.started_col, 10_000);
+            move_at(&st, 1, boil.id, board.finished_col, 10_000 - mins);
+        }
+        let rows = analytics(&st, 1, AnalyticsFilter::default());
+        let boils: Vec<&AnalyticsRow> = rows.iter().filter(|r| r.title == "Step boil").collect();
+        assert_eq!(boils.len(), 3);
+        for r in &boils {
+            assert_eq!(r.average_secs, Some(1_200), "the mean of ten, twenty and thirty minutes");
+            assert_eq!(r.samples, 3);
+        }
+        // A fourth run's boil, still open, carries the estimate on the board.
+        let root = start_program(&st, 1, &program);
+        let detail = match handle(&st, &session(1), Request::GetBoard { board_id: board.id }).unwrap() {
+            Response::Board(d) => d,
+            other => panic!("{other:?}"),
+        };
+        let boil = detail
+            .tasks
+            .iter()
+            .find(|t| t.title == "Step boil" && t.column_id != board.finished_col)
+            .unwrap();
+        assert!(detail.estimates.contains(&(boil.id, 1_200)));
+        // Each earlier run closed the moment its boil did, so the root has
+        // three whole runs to average: a program's own estimate. They were
+        // all worked in the same instant, so it is a small number.
+        let root_estimate = detail
+            .estimates
+            .iter()
+            .find(|(id, _)| *id == root.id)
+            .map(|(_, s)| *s)
+            .expect("three finished runs make an estimate for the root");
+        assert!(root_estimate < 60, "{root_estimate}s");
     }
 
     #[test]
@@ -2304,6 +3838,7 @@ mod tests {
                 to_column: board.started_col,
                 position: None,
                 override_deps: false,
+                answer: None,
             },
         )
         .unwrap_err();
@@ -2323,6 +3858,7 @@ mod tests {
                 to_column: board.finished_col,
                 position: None,
                 override_deps: false,
+                answer: None,
             },
         )
         .unwrap()
@@ -2613,6 +4149,7 @@ mod tests {
                 to_column: board.finished_col,
                 position: None,
                 override_deps: false,
+                answer: None,
             },
         )
         .unwrap_err();
@@ -2625,6 +4162,7 @@ mod tests {
                 to_column: board.finished_col,
                 position: None,
                 override_deps: true,
+                answer: None,
             },
         )
         .unwrap();
@@ -2875,10 +4413,13 @@ mod tests {
 /// is compared against the others from that template; a repeated one against
 /// the other instances in its chain. Anything else is a one off with nothing
 /// to compare it to.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum SiblingGroup {
     Template(TemplateId),
     Chain(TaskId),
+    /// One step of one program, across every run of it. The root's group is
+    /// how long whole runs take.
+    Step(String),
 }
 
 /// The oldest instance in a repetition chain, which stands for the chain.
@@ -2935,6 +4476,7 @@ fn analytics_rows(
     let ids: Vec<TaskId> = candidates.iter().map(|(t, _)| t.id).collect();
     let trails = repo::transitions_for(c, &ids)?;
     let parents = repo::repeat_parents(c, uid)?;
+    let identities = repo::run_identities(c)?;
     // Only tasks that actually belong to a chain get a chain group. Every
     // other one off would otherwise be "averaged" against itself.
     let mut in_chain: HashSet<TaskId> = HashSet::new();
@@ -2944,6 +4486,11 @@ fn analytics_rows(
     }
 
     let group_of = |task: &Task| -> Option<SiblingGroup> {
+        if let Some(p) = &task.program
+            && let Some(identity) = identities.get(&p.run)
+        {
+            return Some(SiblingGroup::Step(format!("{identity}/{}", p.step)));
+        }
         if let Some(tpl) = task.template_id {
             return Some(SiblingGroup::Template(tpl));
         }

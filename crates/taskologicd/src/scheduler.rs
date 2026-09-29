@@ -31,7 +31,9 @@ pub fn tick_once(state: &Arc<AppState>) -> Result<(), AppError> {
     archive_finished(state)?;
     purge_deleted(state)?;
     fire_repeats(state)?;
+    auto_start(state)?;
     print_reminders(state)?;
+    crate::slips::print_dated(state)?;
     print_queue_housekeeping(state)?;
     Ok(())
 }
@@ -147,6 +149,31 @@ fn fire_repeats(state: &Arc<AppState>) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Tasks that asked to start themselves when their start date came. Each
+/// goes into the started column the way a person would move it, so a
+/// program run reacts and the prints fire, only with nobody named as the
+/// actor. One held back by open dependencies is left for a person.
+fn auto_start(state: &Arc<AppState>) -> Result<(), AppError> {
+    let now = Utc::now();
+    for task in state.db.with(|c| repo::auto_start_due(c, now))? {
+        let board = state.db.with(|c| repo::require_board(c, task.board_id))?;
+        match crate::handlers::move_task_by(
+            state,
+            None,
+            &board,
+            &task,
+            board.started_col,
+            None,
+            false,
+            None,
+        ) {
+            Ok(_) | Err(AppError::Blocked { .. }) => {}
+            Err(e) => tracing::warn!(task = %task.id, error = %e, "auto start failed"),
+        }
+    }
+    Ok(())
+}
+
 /// Print what the clock says is owed.
 ///
 /// A task with one date earns a reminder before it. A task with both earns a
@@ -168,6 +195,11 @@ fn print_reminders(state: &Arc<AppState>) -> Result<(), AppError> {
         for task in tasks {
             let board = state.db.with(|c| repo::require_board(c, task.board_id))?;
             if !board.is_member(user.uid) {
+                continue;
+            }
+            // A task with rules of its own has said how it prints, and the
+            // prefs stand down for it. Its dated rules run in `slips`.
+            if !task.print_rules.is_empty() {
                 continue;
             }
             for planned in plan_reminders(&task, &user.prefs.print) {
@@ -195,7 +227,11 @@ fn print_reminders(state: &Arc<AppState>) -> Result<(), AppError> {
                     continue;
                 }
                 let job = match planned.job {
-                    PrintJobKind::Reminder => build_reminder_job(&task, &board, &user, now),
+                    // A reminder never plans a sheet; the arm keeps the
+                    // match honest if a kind is ever added to the planner.
+                    PrintJobKind::Reminder | PrintJobKind::Sheet => {
+                        build_reminder_job(&task, &board, &user, now)
+                    }
                     // The slip you work from, so nobody gets two of them:
                     // whoever already has one, by autoprint or by hand, is
                     // not handed another.
@@ -279,6 +315,8 @@ mod tests {
     use taskologic_core::board::{
         Board, ColumnRole, DEFAULT_ARCHIVE_AFTER_SECS, DEFAULT_PURGE_DELETED_AFTER_SECS,
     };
+    use taskologic_core::offset::{Offset, OffsetUnit};
+    use taskologic_core::print::{PrintRule, PrintWhen, Recipients, SlipKind};
     use taskologic_core::task::TaskDraft;
     use taskologic_proto::{CreateBoard, Request, Response};
 
@@ -450,6 +488,7 @@ mod tests {
                     to_column: to,
                     position: None,
                     override_deps: false,
+                    answer: None,
                 },
             )
             .unwrap();
@@ -479,6 +518,224 @@ mod tests {
             vec![PrintJobKind::Task],
             "the due reminder saw the manual print and stood down"
         );
+    }
+
+    /// A task carrying its own print rules, dated the same way `dated_task`
+    /// dates one.
+    fn ruled_task(
+        st: &Arc<AppState>,
+        board: &Board,
+        rules: Vec<PrintRule>,
+        start_in_mins: Option<i64>,
+        due_in_mins: Option<i64>,
+    ) -> taskologic_core::task::Task {
+        let now = Utc::now();
+        let draft = TaskDraft {
+            title: "Water plants".into(),
+            start_at: start_in_mins.map(|m| now + TimeDelta::minutes(m)),
+            due_at: due_in_mins.map(|m| now + TimeDelta::minutes(m)),
+            print_rules: rules,
+            ..Default::default()
+        };
+        match handle(
+            st,
+            &Session {
+                uid: 1,
+                is_admin: true,
+            },
+            Request::CreateTask {
+                board_id: board.id,
+                column_id: None,
+                draft,
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn set_date(st: &Arc<AppState>, task: taskologic_core::ids::TaskId, column: &str, at: chrono::DateTime<Utc>) {
+        st.db
+            .with(|c| {
+                Ok(c.execute(
+                    &format!("UPDATE tasks SET {column} = ?2 WHERE id = ?1"),
+                    rusqlite::params![task.0, at.timestamp()],
+                )?)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_before_due_rule_prints_at_its_moment_and_follows_a_moved_due_date() {
+        // No reminder lead times at all: whatever prints, the rule did it.
+        let (st, board) = reminder_setup(None, None);
+        let rule = PrintRule {
+            when: PrintWhen::BeforeDue(Offset {
+                amount: 10,
+                unit: OffsetUnit::Minutes,
+            }),
+            slip: SlipKind::Task,
+            to: Recipients::Creator,
+        };
+        let task = ruled_task(&st, &board, vec![rule], None, Some(60));
+        tick_once(&st).unwrap();
+        assert!(slips(&st).is_empty(), "due in an hour, ten minutes before is not yet");
+
+        set_date(&st, task.id, "due_at", Utc::now() + TimeDelta::minutes(5));
+        tick_once(&st).unwrap();
+        assert_eq!(slips(&st), vec![PrintJobKind::Task], "the moment has come");
+        tick_once(&st).unwrap();
+        assert_eq!(slips(&st).len(), 1, "and it prints once");
+
+        // A moved due date is a new moment, with a slip of its own.
+        set_date(&st, task.id, "due_at", Utc::now() + TimeDelta::minutes(4));
+        tick_once(&st).unwrap();
+        assert_eq!(slips(&st).len(), 2);
+
+        // Long past its due date, a slip nobody printed is not worth spooling.
+        let late = ruled_task(
+            &st,
+            &board,
+            vec![PrintRule {
+                when: PrintWhen::BeforeDue(Offset {
+                    amount: 10,
+                    unit: OffsetUnit::Minutes,
+                }),
+                slip: SlipKind::Task,
+                to: Recipients::Creator,
+            }],
+            None,
+            Some(-120),
+        );
+        tick_once(&st).unwrap();
+        assert_eq!(slips(&st).len(), 2, "nothing for {}", late.title);
+    }
+
+    #[test]
+    fn an_on_start_rule_fires_by_date_or_by_move_but_never_both() {
+        // The prefs would print reminders here; the rules take their place.
+        let (st, board) = reminder_setup(Some(30), Some(6));
+        let rule = || PrintRule {
+            when: PrintWhen::OnStart,
+            slip: SlipKind::Task,
+            to: Recipients::Creator,
+        };
+        // Started a minute ago by the calendar and never touched: the date prints it.
+        let by_date = ruled_task(&st, &board, vec![rule()], Some(-1), None);
+        tick_once(&st).unwrap();
+        assert_eq!(
+            slips(&st),
+            vec![PrintJobKind::Task],
+            "one task slip, and no reminder from the prefs"
+        );
+        tick_once(&st).unwrap();
+        assert_eq!(slips(&st).len(), 1);
+        handle(
+            &st,
+            &Session {
+                uid: 1,
+                is_admin: true,
+            },
+            Request::MoveTask {
+                task_id: by_date.id,
+                to_column: board.started_col,
+                position: None,
+                override_deps: false,
+                answer: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(slips(&st).len(), 1, "starting it by hand afterwards adds nothing");
+
+        // The other way round: started by hand before its date, then the
+        // date comes and finds the slip already handed over.
+        let by_hand = ruled_task(&st, &board, vec![rule()], Some(10), None);
+        handle(
+            &st,
+            &Session {
+                uid: 1,
+                is_admin: true,
+            },
+            Request::MoveTask {
+                task_id: by_hand.id,
+                to_column: board.started_col,
+                position: None,
+                override_deps: false,
+                answer: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(slips(&st).len(), 2);
+        set_date(&st, by_hand.id, "start_at", Utc::now() - TimeDelta::minutes(1));
+        tick_once(&st).unwrap();
+        assert_eq!(slips(&st).len(), 2);
+    }
+
+    #[test]
+    fn a_task_with_the_flag_starts_itself_once_its_date_comes_and_only_once() {
+        let (st, board) = reminder_setup(None, None);
+        let now = Utc::now();
+        let draft = TaskDraft {
+            title: "Kettle on".into(),
+            start_at: Some(now + TimeDelta::minutes(10)),
+            auto_start: true,
+            ..Default::default()
+        };
+        let task = match handle(
+            &st,
+            &Session {
+                uid: 1,
+                is_admin: true,
+            },
+            Request::CreateTask {
+                board_id: board.id,
+                column_id: None,
+                draft,
+            },
+        )
+        .unwrap()
+        {
+            Response::Task { task } => task,
+            other => panic!("{other:?}"),
+        };
+        let column = || st.db.with(|c| repo::require_task(c, task.id)).unwrap().column_id;
+        tick_once(&st).unwrap();
+        assert_ne!(column(), board.started_col, "not yet");
+        set_date(&st, task.id, "start_at", now - TimeDelta::minutes(1));
+        tick_once(&st).unwrap();
+        assert_eq!(column(), board.started_col, "the date came");
+        // Put back to todo by hand: the scheduler does not start it again.
+        handle(
+            &st,
+            &Session {
+                uid: 1,
+                is_admin: true,
+            },
+            Request::MoveTask {
+                task_id: task.id,
+                to_column: board.columns[0].id,
+                position: None,
+                override_deps: false,
+                answer: None,
+            },
+        )
+        .unwrap();
+        tick_once(&st).unwrap();
+        assert_ne!(column(), board.started_col, "somebody decided otherwise");
+        // The move is on record, as the scheduler's.
+        let n = st
+            .db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM events WHERE task_id = ?1 AND kind = 'task_moved' AND actor_uid IS NULL",
+                    rusqlite::params![task.id.0],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
@@ -535,6 +792,7 @@ mod tests {
                 to_column: board.finished_col,
                 position: None,
                 override_deps: false,
+                answer: None,
             },
         )
         .unwrap();

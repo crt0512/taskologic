@@ -116,8 +116,10 @@ fn section(out: &mut Vec<Op>, row: &SlipRow, job: &PrintJob, cols: usize) {
                 scale: 1,
             }));
         }
-        SlipSection::BarcodeStart => barcode(out, job, ScanAction::StartPause),
-        SlipSection::BarcodeFinish => barcode(out, job, ScanAction::Finish),
+        SlipSection::BarcodeStart => barcodes(out, job, false),
+        // Every code that finishes the task: the plain one, or one per
+        // answer when a program gave the task a question.
+        SlipSection::BarcodeFinish => barcodes(out, job, true),
         SlipSection::Description => {
             let Some(desc) = &job.description else { return };
             for para in desc.lines() {
@@ -163,22 +165,44 @@ fn section(out: &mut Vec<Op>, row: &SlipRow, job: &PrintJob, cols: usize) {
                 out.push(row.line(fit(&line, row.columns(cols))));
             }
         }
+        SlipSection::Sheet => {
+            for entry in &job.sheet {
+                out.push(row.line(fit(
+                    &format!("#{} {}", entry.short_id, entry.title),
+                    row.columns(cols),
+                )));
+                let label = entry
+                    .barcode
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| "scan to start".to_string());
+                out.push(Op::Barcode {
+                    code: entry.barcode.clone(),
+                    label,
+                });
+            }
+        }
         SlipSection::Timestamp => out.push(row.line(local(job.created_at, job))),
     }
 }
 
-fn barcode(out: &mut Vec<Op>, job: &PrintJob, action: ScanAction) {
-    let Some(code) = job.barcodes.iter().find(|b| b.action == action) else {
-        return;
-    };
-    let label = code.label.clone().unwrap_or_else(|| {
-        match action {
-            ScanAction::StartPause => "scan to start / pause",
-            ScanAction::Finish => "scan to finish",
-        }
-        .to_string()
-    });
-    out.push(Op::Barcode { code: code.clone(), label });
+fn barcodes(out: &mut Vec<Op>, job: &PrintJob, finishing: bool) {
+    for code in job.barcodes.iter().filter(|b| b.action.finishes() == finishing) {
+        let label = code.label.clone().unwrap_or_else(|| {
+            match code.action {
+                ScanAction::StartPause => "scan to start / pause".to_string(),
+                ScanAction::Finish => "scan to finish".to_string(),
+                ScanAction::Yes => "scan to finish: yes".to_string(),
+                ScanAction::No => "scan to finish: no".to_string(),
+                ScanAction::Choice(n) => format!("scan to finish: answer {n}"),
+                ScanAction::FinishChildren => "scan to finish what is running".to_string(),
+            }
+        });
+        out.push(Op::Barcode {
+            code: code.clone(),
+            label,
+        });
+    }
 }
 
 pub fn local(t: DateTime<Utc>, job: &PrintJob) -> String {
@@ -270,6 +294,7 @@ mod tests {
                     label: None,
                 },
             ],
+            sheet: Vec::new(),
             timezone: chrono_tz::UTC,
             created_at: DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
         }

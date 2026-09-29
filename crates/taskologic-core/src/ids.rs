@@ -55,6 +55,14 @@ db_id!(
     /// Row id of a queued print job.
     PrintJobId
 );
+db_id!(
+    /// Row id of a program, a chain of tasks written once.
+    ProgramId
+);
+db_id!(
+    /// Row id of a run, one started copy of a program.
+    RunId
+);
 
 /// The base36 alphabet, uppercase, in value order.
 pub const BASE36_ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";

@@ -94,6 +94,9 @@ pub struct CardFields {
     pub description: bool,
     /// The barcode short id. Off by default, it is internal plumbing.
     pub short_id: bool,
+    /// How long this kind of task usually takes, for a task from a template
+    /// or a program step, once enough of them have been finished.
+    pub estimate: bool,
 }
 
 impl Default for CardFields {
@@ -105,6 +108,7 @@ impl Default for CardFields {
             dependencies: true,
             description: false,
             short_id: false,
+            estimate: false,
         }
     }
 }
@@ -117,6 +121,7 @@ impl CardFields {
             + u16::from(self.assignees)
             + u16::from(self.dependencies)
             + u16::from(self.description)
+            + u16::from(self.estimate)
     }
 }
 

@@ -29,6 +29,9 @@ pub fn migrations() -> Migrations<'static> {
             "../../migrations/0007_reminders_and_template_options.sql"
         )),
         M::up(include_str!("../../migrations/0008_time_tracking.sql")),
+        M::up(include_str!("../../migrations/0009_print_rules.sql")),
+        M::up(include_str!("../../migrations/0010_programs.sql")),
+        M::up(include_str!("../../migrations/0011_auto_start.sql")),
     ])
 }
 
@@ -192,6 +195,28 @@ mod migration_tests {
         assert_eq!(start_at, None);
         assert_eq!(excluded, 0);
         assert_eq!(template, None, "per template history starts at 0.1.11");
+        // 0.1.12: a task that predates print rules has none, and loads as
+        // such rather than as a broken row.
+        let rules: String = conn
+            .query_row("SELECT print_rules FROM tasks WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rules, "[]");
+        // 0.1.12 again: nothing starts itself unless asked, and the program
+        // tables are there, empty, for the first program somebody writes.
+        let auto: i64 = conn
+            .query_row("SELECT auto_start FROM tasks WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(auto, 0);
+        for table in ["programs", "program_runs", "program_tasks"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT count(*) FROM {table}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{table} exists and is empty");
+        }
 
         // The rebuilt bookkeeping table keeps what it knew, labelled.
         let (kind, anchor): (String, i64) = conn

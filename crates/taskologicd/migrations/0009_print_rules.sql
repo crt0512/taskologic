@@ -1,0 +1,12 @@
+-- Print rules on tasks, 0.1.12.
+--
+-- A task can now say for itself when it prints, which slip and for whom,
+-- instead of leaving all of that to each user's preferences. One JSON array
+-- on the row, like the checklist: the rules are read and written as one and
+-- have no identity outside their task. Every task that exists has none,
+-- which is exactly what it did before, so `make update` stops the daemon,
+-- runs this and starts it again with nothing left to convert by hand.
+--
+-- The rows that remember a slip was sent go in `reminders_sent` under new
+-- kind names, which is why that table needs no change.
+ALTER TABLE tasks ADD COLUMN print_rules TEXT NOT NULL DEFAULT '[]';

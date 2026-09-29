@@ -27,7 +27,7 @@ usage: scripts/dev.sh <command>
   stop      stop a background daemon
   socat     open a raw protocol session, type JSON lines (see docs/running.md)
   sql       open the dev database in sqlite3
-  barcode   print a scannable payload: scripts/dev.sh barcode K4M9Q2 [S|F]
+  barcode   print a scannable payload: scripts/dev.sh barcode K4M9Q2 [S|F|Y|N|1-8]
   reset     stop the daemon and delete the database, socket and log
   init      only write dev/taskologicd.toml and dev/client.toml
 

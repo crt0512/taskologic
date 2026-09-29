@@ -18,6 +18,7 @@ use taskologic_core::board::{Board, ColumnRole};
 use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, TaskId, Uid};
 use taskologic_core::prefs::{CardFields, CustomColors, ThemePreset};
 use taskologic_core::print::PrintJob;
+use taskologic_core::program::Question;
 use taskologic_core::task::Task;
 use taskologic_core::user::User;
 use taskologic_print::DeviceProfile;
@@ -33,9 +34,15 @@ use crate::forms::colors::{ColorsForm, ColorsOutcome};
 use crate::forms::columns::{ColumnsOutcome, ColumnsPanel};
 use crate::forms::confirm::{Confirm, ConfirmOutcome};
 use crate::forms::members::{MembersOutcome, MembersPanel};
+use crate::forms::print_rules::{PrintRulesForm, PrintRulesOutcome};
 use crate::forms::printer::{PrinterForm, PrinterOutcome};
+use crate::forms::program::{ProgramForm, ProgramOutcome};
+use crate::forms::programs::{ProgramsOutcome, ProgramsPanel};
 use crate::forms::repeats::{RepeatsOutcome, RepeatsPanel};
+use crate::forms::runs::{RunsOutcome, RunsPanel};
 use crate::forms::settings::{SettingsForm, SettingsOutcome};
+use crate::forms::start_program::{StartOutcome, StartProgramForm};
+use crate::forms::step::{StepForm, StepOutcome};
 use crate::forms::task::{FormMode, FormOutcome, TaskForm, TaskSave};
 use crate::forms::templates::{TemplatesOutcome, TemplatesPanel};
 use crate::forms::users::{UsersOutcome, UsersPanel};
@@ -125,7 +132,14 @@ pub(crate) enum Pending {
     Users,
     OpenBoard { focus_task: Option<TaskId> },
     RefreshBoard,
-    MoveTask { task: TaskId, to: ColumnId },
+    MoveTask {
+        task: TaskId,
+        to: ColumnId,
+        /// The answer that went with a finishing move, kept so an override
+        /// after a dependency refusal still carries it.
+        answer: Option<String>,
+    },
+    AnswerQuestion,
     DeleteTask,
     PurgeTask,
     DeleteBoard,
@@ -157,6 +171,12 @@ pub(crate) enum Pending {
     Analytics,
     TaskHistory { task: TaskId },
     ExcludeFromStats,
+    ProgramsPanel,
+    ProgramOp,
+    StartProgram,
+    RunsPanel,
+    CancelRun,
+    StepMembers,
 }
 
 pub enum Overlay {
@@ -168,6 +188,21 @@ pub enum Overlay {
         back: Option<Box<Overlay>>,
     },
     TaskForm(Box<TaskForm>),
+    /// Print rules, opened from the task form or a program step and
+    /// returning to whichever it came from.
+    PrintRules {
+        form: Box<PrintRulesForm>,
+        back: PrintRulesBack,
+    },
+    Programs(Box<ProgramsPanel>),
+    ProgramForm(Box<ProgramForm>),
+    /// One step, opened from the program editor and returning to it.
+    StepForm {
+        form: Box<StepForm>,
+        back: Box<ProgramForm>,
+    },
+    StartProgram(Box<StartProgramForm>),
+    Runs(Box<RunsPanel>),
     Settings(Box<SettingsForm>),
     /// The colour editor, opened from settings and returning to it.
     Colors {
@@ -213,6 +248,40 @@ pub enum Overlay {
         area: Rect,
     },
     Archive(Box<ArchivePanel>),
+    /// A step's question, asked before a finishing move goes out, or for a
+    /// finished task still waiting on one. The rects are recorded by the
+    /// renderer for clicks.
+    Question {
+        task: TaskId,
+        title: String,
+        question: Question,
+        sel: usize,
+        then: QuestionThen,
+        areas: Vec<Rect>,
+        area: Rect,
+    },
+}
+
+/// What happens once a question is answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuestionThen {
+    /// Send the finishing move with the answer.
+    Move {
+        to_column: ColumnId,
+        position: Option<i64>,
+        override_deps: bool,
+    },
+    /// The task is finished already: just answer.
+    Answer,
+}
+
+/// Where the print rules window goes back to.
+pub enum PrintRulesBack {
+    Task(Box<TaskForm>),
+    Step {
+        form: Box<StepForm>,
+        program: Box<ProgramForm>,
+    },
 }
 
 /// What a confirmed dialog does.
@@ -604,6 +673,12 @@ impl App {
                     | Overlay::Menu { .. }
                     | Overlay::Archive(_)
                     | Overlay::TaskForm(_)
+                    | Overlay::PrintRules { .. }
+                    | Overlay::Programs(_)
+                    | Overlay::ProgramForm(_)
+                    | Overlay::StepForm { .. }
+                    | Overlay::StartProgram(_)
+                    | Overlay::Runs(_)
                     | Overlay::Settings(_)
                     | Overlay::Colors { .. }
                     | Overlay::Printer { .. }
@@ -772,8 +847,21 @@ impl App {
                 if let Some(t) = focus_task {
                     view.select_task(t);
                 }
+                // A question nobody answered, finished by a plain scan, is
+                // asked the moment the board is open again.
+                let waiting = view
+                    .detail
+                    .tasks
+                    .iter()
+                    .find(|t| t.program.as_ref().is_some_and(|p| p.pending_question))
+                    .cloned();
                 self.board = Some(view);
                 self.hits.clear();
+                if let Some(task) = waiting
+                    && self.overlay.is_none()
+                {
+                    self.ask_question(&task, QuestionThen::Answer);
+                }
                 Vec::new()
             }
             (Some(Pending::RefreshBoard), Response::Board(detail)) => {
@@ -804,6 +892,20 @@ impl App {
                     if b.picked == Some(moved) {
                         b.select_task(moved);
                     }
+                }
+                Vec::new()
+            }
+            (Some(Pending::AnswerQuestion), Response::Task { task }) => {
+                self.toast(Severity::Success, format!("answered for {}", task.title));
+                if let Some(Overlay::TaskDetail { task: shown, .. }) = &mut self.overlay
+                    && shown.id == task.id
+                {
+                    *shown = task.clone();
+                }
+                if let Some(b) = &mut self.board
+                    && b.detail.board.id == task.board_id
+                {
+                    b.upsert(task);
                 }
                 Vec::new()
             }
@@ -987,6 +1089,92 @@ impl App {
                     None => Vec::new(),
                 }
             }
+            (Some(Pending::ProgramsPanel), Response::Programs { programs }) => {
+                let Some(board_id) = self.board.as_ref().map(|b| b.detail.board.id) else {
+                    return Vec::new();
+                };
+                let names: HashMap<Uid, String> = self.users.clone();
+                let name_of = move |uid: Uid| {
+                    names
+                        .get(&uid)
+                        .cloned()
+                        .unwrap_or_else(|| format!("uid {uid}"))
+                };
+                match &mut self.overlay {
+                    Some(Overlay::Programs(panel)) if panel.board_id == board_id => {
+                        panel.set_programs(programs, &name_of);
+                    }
+                    _ => {
+                        let me = self.me();
+                        let privileged = self.privileged_on_open_board();
+                        let mut panel = ProgramsPanel::new(board_id, me, privileged);
+                        panel.set_programs(programs, &name_of);
+                        self.overlay = Some(Overlay::Programs(Box::new(panel)));
+                    }
+                }
+                Vec::new()
+            }
+            (Some(Pending::ProgramOp), Response::Program { program }) => {
+                if matches!(self.overlay, Some(Overlay::ProgramForm(_))) {
+                    self.overlay = None;
+                }
+                self.toast(Severity::Success, format!("saved program {}", program.name));
+                let board_id = program.board_id;
+                vec![self.send(Request::ListPrograms { board_id }, Pending::ProgramsPanel)]
+            }
+            (Some(Pending::ProgramOp), Response::Done) => {
+                self.toast(Severity::Info, "program deleted, runs already going carry on");
+                match self.board.as_ref().map(|b| b.detail.board.id) {
+                    Some(board_id) => {
+                        vec![self.send(Request::ListPrograms { board_id }, Pending::ProgramsPanel)]
+                    }
+                    None => Vec::new(),
+                }
+            }
+            (Some(Pending::StartProgram), Response::Task { task }) => {
+                if matches!(self.overlay, Some(Overlay::StartProgram(_))) {
+                    self.overlay = None;
+                }
+                self.toast(
+                    Severity::Success,
+                    format!("started {}, move it to doing when you begin", task.title),
+                );
+                if let Some(b) = &mut self.board
+                    && b.detail.board.id == task.board_id
+                {
+                    b.upsert(task);
+                }
+                Vec::new()
+            }
+            (Some(Pending::RunsPanel), Response::Runs { runs }) => {
+                let Some(board_id) = self.board.as_ref().map(|b| b.detail.board.id) else {
+                    return Vec::new();
+                };
+                match &mut self.overlay {
+                    Some(Overlay::Runs(panel)) if panel.board_id == board_id => {
+                        panel.set_entries(runs)
+                    }
+                    _ => {
+                        let mut panel = RunsPanel::new(board_id, self.timezone(), self.users.clone());
+                        panel.set_entries(runs);
+                        self.overlay = Some(Overlay::Runs(Box::new(panel)));
+                    }
+                }
+                Vec::new()
+            }
+            (Some(Pending::CancelRun), Response::Done) => {
+                self.toast(Severity::Info, "run cancelled");
+                match self.board.as_ref().map(|b| b.detail.board.id) {
+                    Some(board_id) => vec![self.send(Request::ListRuns { board_id }, Pending::RunsPanel)],
+                    None => Vec::new(),
+                }
+            }
+            (Some(Pending::StepMembers), Response::Members { members }) => {
+                if let Some(Overlay::StepForm { form, .. }) = &mut self.overlay {
+                    form.set_members(&members);
+                }
+                Vec::new()
+            }
             (Some(Pending::Analytics), Response::Analytics { rows }) => {
                 if let Some(panel) = &mut self.analytics {
                     panel.set_rows(rows);
@@ -1127,13 +1315,41 @@ impl App {
             }
             ScanOutcome::BlockedByDependencies { task_id, open } => {
                 match self.board.as_ref().map(|b| b.detail.board.finished_col) {
-                    Some(to) => self.blocked_dialog(task_id, to, &open),
+                    Some(to) => self.blocked_dialog(task_id, to, &open, None),
                     None => self.toast(
                         Severity::Warning,
                         "scan: open dependencies, open the board to override",
                     ),
                 }
                 vec![self.bell()]
+            }
+            ScanOutcome::Answered { task, answer } => {
+                self.toast(
+                    Severity::Success,
+                    format!("{}: answered {answer}", task.title),
+                );
+                if let Some(b) = &mut self.board
+                    && b.detail.board.id == task.board_id
+                {
+                    b.upsert(*task);
+                }
+                Vec::new()
+            }
+            ScanOutcome::FinishedChildren { root, finished } => {
+                self.toast(
+                    Severity::Success,
+                    format!(
+                        "{}: finished {finished} running task{}",
+                        root.title,
+                        if finished == 1 { "" } else { "s" }
+                    ),
+                );
+                if let Some(b) = &mut self.board
+                    && b.detail.board.id == root.board_id
+                {
+                    b.upsert(*root);
+                }
+                Vec::new()
             }
         }
     }
@@ -1144,12 +1360,12 @@ impl App {
                 self.conn = Conn::Lost;
                 self.conn_error = Some(error.reason);
             }
-            (Some(Pending::MoveTask { task, to }), ErrorCode::BlockedByDependencies) => {
+            (Some(Pending::MoveTask { task, to, answer }), ErrorCode::BlockedByDependencies) => {
                 let open: Vec<TaskId> = error
                     .detail
                     .and_then(|d| serde_json::from_value(d).ok())
                     .unwrap_or_default();
-                self.blocked_dialog(task, to, &open);
+                self.blocked_dialog(task, to, &open, answer);
             }
             (Some(Pending::SaveTask), ErrorCode::Conflict) => {
                 let current: Option<Task> =
@@ -1233,6 +1449,25 @@ impl App {
             },
             (Some(Pending::StopRepeat), _) => match &mut self.overlay {
                 Some(Overlay::Repeats(panel)) => panel.error = Some(error.reason),
+                _ => self.toast(Severity::Error, error.reason),
+            },
+            (Some(Pending::ProgramOp), _) => match &mut self.overlay {
+                Some(Overlay::ProgramForm(form)) => {
+                    form.saving = false;
+                    form.error = Some(error.reason);
+                }
+                Some(Overlay::Programs(panel)) => panel.error = Some(error.reason),
+                _ => self.toast(Severity::Error, error.reason),
+            },
+            (Some(Pending::StartProgram), _) => match &mut self.overlay {
+                Some(Overlay::StartProgram(form)) => {
+                    form.saving = false;
+                    form.error = Some(error.reason);
+                }
+                _ => self.toast(Severity::Error, error.reason),
+            },
+            (Some(Pending::CancelRun), _) => match &mut self.overlay {
+                Some(Overlay::Runs(panel)) => panel.error = Some(error.reason),
                 _ => self.toast(Severity::Error, error.reason),
             },
             (_, _) => self.toast(Severity::Error, error.reason),
@@ -1355,6 +1590,7 @@ impl App {
             Some(Overlay::Conflict { .. }) => return self.conflict_key(k),
             Some(Overlay::PickColumn { .. }) => return self.pick_column_key(k),
             Some(Overlay::TaskDetail { .. }) => return self.task_detail_key(k),
+            Some(Overlay::Question { .. }) => return self.question_key(k),
             Some(_) => return self.overlay_key(k),
             None => {}
         }
@@ -1678,6 +1914,10 @@ impl App {
                     self.send(Request::ListTemplates { board_id }, Pending::TemplatesPanel),
                 ];
             }
+            KeyCode::Char('P') => {
+                let board_id = b.detail.board.id;
+                return vec![self.send(Request::ListPrograms { board_id }, Pending::ProgramsPanel)];
+            }
             KeyCode::Char('R') => {
                 let board_id = b.detail.board.id;
                 return vec![self.send(Request::ListRepeats { board_id }, Pending::RepeatsPanel)];
@@ -1741,18 +1981,144 @@ impl App {
             }
             _ => return Vec::new(),
         };
-        vec![self.send(
+        self.request_move(task_id, to_column, position, false)
+    }
+
+    /// Move a task, asking its question first when the move finishes a
+    /// step that has one and no default. Nothing is sent until the question
+    /// is answered, so leaving it unanswered leaves the task where it was.
+    fn request_move(
+        &mut self,
+        task_id: TaskId,
+        to_column: ColumnId,
+        position: Option<i64>,
+        override_deps: bool,
+    ) -> Vec<Cmd> {
+        let asked = self.board.as_ref().and_then(|b| {
+            let task = b.detail.tasks.iter().find(|t| t.id == task_id)?;
+            let finishing = to_column == b.detail.board.finished_col
+                && task.column_id != b.detail.board.finished_col;
+            let q = task.program.as_ref()?.question.as_ref()?;
+            finishing.then(|| (task.clone(), q.clone()))
+        });
+        match asked {
+            Some((_, q)) if q.default.is_some() => {
+                vec![self.send_move(task_id, to_column, position, override_deps, q.default)]
+            }
+            Some((task, _)) => {
+                self.ask_question(
+                    &task,
+                    QuestionThen::Move {
+                        to_column,
+                        position,
+                        override_deps,
+                    },
+                );
+                Vec::new()
+            }
+            None => vec![self.send_move(task_id, to_column, position, override_deps, None)],
+        }
+    }
+
+    fn send_move(
+        &mut self,
+        task_id: TaskId,
+        to_column: ColumnId,
+        position: Option<i64>,
+        override_deps: bool,
+        answer: Option<String>,
+    ) -> Cmd {
+        self.send(
             Request::MoveTask {
                 task_id,
                 to_column,
                 position,
-                override_deps: false,
+                override_deps,
+                answer: answer.clone(),
             },
             Pending::MoveTask {
                 task: task_id,
                 to: to_column,
+                answer,
             },
-        )]
+        )
+    }
+
+    fn ask_question(&mut self, task: &Task, then: QuestionThen) {
+        let Some(question) = task.program.as_ref().and_then(|p| p.question.clone()) else {
+            return;
+        };
+        self.overlay = Some(Overlay::Question {
+            task: task.id,
+            title: task.title.clone(),
+            question,
+            sel: 0,
+            then,
+            areas: Vec::new(),
+            area: Rect::default(),
+        });
+    }
+
+    /// The question popup: Up/Down or a digit picks, Enter answers, Esc
+    /// leaves the task exactly where it was.
+    fn question_key(&mut self, k: KeyEvent) -> Vec<Cmd> {
+        let Some(Overlay::Question { question, sel, .. }) = &mut self.overlay else {
+            return Vec::new();
+        };
+        let n = question.answers().len();
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                *sel = sel.saturating_sub(1);
+                Vec::new()
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *sel = (*sel + 1).min(n.saturating_sub(1));
+                Vec::new()
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let i = c.to_digit(10).unwrap_or(0) as usize;
+                if (1..=n).contains(&i) {
+                    *sel = i - 1;
+                    return self.answer_selected();
+                }
+                Vec::new()
+            }
+            KeyCode::Enter => self.answer_selected(),
+            _ => {
+                self.overlay = None;
+                Vec::new()
+            }
+        }
+    }
+
+    fn answer_selected(&mut self) -> Vec<Cmd> {
+        let Some(Overlay::Question {
+            task,
+            question,
+            sel,
+            then,
+            ..
+        }) = self.overlay.take()
+        else {
+            return Vec::new();
+        };
+        let Some(answer) = question.answers().get(sel).cloned() else {
+            return Vec::new();
+        };
+        match then {
+            QuestionThen::Move {
+                to_column,
+                position,
+                override_deps,
+            } => vec![self.send_move(task, to_column, position, override_deps, Some(answer))],
+            QuestionThen::Answer => vec![self.send(
+                Request::AnswerQuestion {
+                    task_id: task,
+                    answer,
+                },
+                Pending::AnswerQuestion,
+            )],
+        }
     }
 
     fn overlay_key(&mut self, _k: KeyEvent) -> Vec<Cmd> {
@@ -1787,6 +2153,18 @@ impl App {
             return Vec::new();
         };
         let items = task.checklist.len();
+        let pending = task.program.as_ref().filter(|p| p.pending_question);
+        if let (KeyCode::Char(c), Some(p)) = (k.code, pending)
+            && let Some(i) = c.to_digit(10)
+            && let Some(q) = &p.question
+            && let Some(answer) = q.answers().get((i as usize).wrapping_sub(1)).cloned()
+        {
+            let task_id = task.id;
+            return vec![self.send(
+                Request::AnswerQuestion { task_id, answer },
+                Pending::AnswerQuestion,
+            )];
+        }
         match k.code {
             KeyCode::Up | KeyCode::Char('k') if items > 0 => {
                 *sel = sel.saturating_sub(1);
@@ -1885,6 +2263,262 @@ impl App {
                 form.saving = true;
                 let mode = form.mode.clone();
                 self.save_task(mode, *save)
+            }
+            FormOutcome::EditPrinting(rules) => {
+                let Some(Overlay::TaskForm(back)) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                self.open_print_rules(rules, false, PrintRulesBack::Task(back));
+                Vec::new()
+            }
+        }
+    }
+
+    fn open_print_rules(
+        &mut self,
+        rules: Vec<taskologic_core::print::PrintRule>,
+        sheets: bool,
+        back: PrintRulesBack,
+    ) {
+        let me = self.me();
+        let names = self.users.clone();
+        self.overlay = Some(Overlay::PrintRules {
+            form: Box::new(PrintRulesForm::new(rules, me, names, sheets)),
+            back,
+        });
+    }
+
+    fn print_rules_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
+        let Some(Overlay::PrintRules { form, .. }) = &mut self.overlay else {
+            return Vec::new();
+        };
+        match form.handle(&ev) {
+            PrintRulesOutcome::Changed => Vec::new(),
+            PrintRulesOutcome::Done(rules) => {
+                let Some(Overlay::PrintRules { back, .. }) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                self.overlay = Some(match back {
+                    PrintRulesBack::Task(mut form) => {
+                        form.set_print_rules(rules);
+                        Overlay::TaskForm(form)
+                    }
+                    PrintRulesBack::Step { mut form, program } => {
+                        form.set_print_rules(rules);
+                        Overlay::StepForm {
+                            form,
+                            back: program,
+                        }
+                    }
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    fn programs_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
+        let Some(Overlay::Programs(panel)) = &mut self.overlay else {
+            return Vec::new();
+        };
+        let board_id = panel.board_id;
+        match panel.handle(&ev) {
+            ProgramsOutcome::Changed => Vec::new(),
+            ProgramsOutcome::Cancel => {
+                self.overlay = None;
+                Vec::new()
+            }
+            ProgramsOutcome::New => {
+                self.overlay = Some(Overlay::ProgramForm(Box::new(ProgramForm::create(board_id))));
+                Vec::new()
+            }
+            ProgramsOutcome::Edit(program) => {
+                self.overlay = Some(Overlay::ProgramForm(Box::new(ProgramForm::edit(&program))));
+                Vec::new()
+            }
+            ProgramsOutcome::Runs => vec![self.send(Request::ListRuns { board_id }, Pending::RunsPanel)],
+            ProgramsOutcome::Start(program) => {
+                // The root lands in the selected column, like a new task.
+                let Some(b) = &self.board else {
+                    return Vec::new();
+                };
+                let Some(column) = b.detail.board.columns.get(b.col) else {
+                    return Vec::new();
+                };
+                let form =
+                    StartProgramForm::new(*program, column.id, column.name.clone(), self.timezone());
+                self.overlay = Some(Overlay::StartProgram(Box::new(form)));
+                Vec::new()
+            }
+            ProgramsOutcome::Delete(program) => {
+                let Some(Overlay::Programs(panel)) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                self.confirm(
+                    "Delete program",
+                    format!(
+                        "Delete the program \"{}\"? Runs already going carry on with the steps they started with.",
+                        program.name
+                    ),
+                    ConfirmAction::Send {
+                        request: Request::DeleteProgram {
+                            program_id: program.id,
+                        },
+                        pending: Pending::ProgramOp,
+                    },
+                    Some(Box::new(Overlay::Programs(panel))),
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn program_form_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
+        let Some(Overlay::ProgramForm(form)) = &mut self.overlay else {
+            return Vec::new();
+        };
+        let board_id = form.board_id;
+        match form.handle(&ev) {
+            ProgramOutcome::Continue | ProgramOutcome::Changed => Vec::new(),
+            ProgramOutcome::Cancel => {
+                self.overlay = None;
+                vec![self.send(Request::ListPrograms { board_id }, Pending::ProgramsPanel)]
+            }
+            ProgramOutcome::EditStep { index, step } => {
+                let Some(Overlay::ProgramForm(back)) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                let form = StepForm::new(index, &step, back.other_keys(index));
+                self.overlay = Some(Overlay::StepForm {
+                    form: Box::new(form),
+                    back,
+                });
+                vec![self.send(Request::ListMembers { board_id }, Pending::StepMembers)]
+            }
+            ProgramOutcome::Save(draft) => {
+                form.saving = true;
+                let req = match form.program_id {
+                    Some(program_id) => Request::UpdateProgram {
+                        program_id,
+                        draft: *draft,
+                    },
+                    None => Request::CreateProgram {
+                        board_id,
+                        draft: *draft,
+                    },
+                };
+                vec![self.send(req, Pending::ProgramOp)]
+            }
+        }
+    }
+
+    fn step_form_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
+        let Some(Overlay::StepForm { form, .. }) = &mut self.overlay else {
+            return Vec::new();
+        };
+        match form.handle(&ev) {
+            StepOutcome::Changed => Vec::new(),
+            StepOutcome::Cancel => {
+                let Some(Overlay::StepForm { back, .. }) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                self.overlay = Some(Overlay::ProgramForm(back));
+                Vec::new()
+            }
+            StepOutcome::Save(step) => {
+                let Some(Overlay::StepForm { form, back }) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                let mut back = back;
+                back.set_step(form.index, *step);
+                self.overlay = Some(Overlay::ProgramForm(back));
+                Vec::new()
+            }
+            StepOutcome::EditPrinting { rules, sheets } => {
+                let Some(Overlay::StepForm { form, back }) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                self.open_print_rules(
+                    rules,
+                    sheets,
+                    PrintRulesBack::Step {
+                        form,
+                        program: back,
+                    },
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn start_program_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
+        let Some(Overlay::StartProgram(form)) = &mut self.overlay else {
+            return Vec::new();
+        };
+        match form.handle(&ev) {
+            StartOutcome::Continue | StartOutcome::Changed => Vec::new(),
+            StartOutcome::Cancel => {
+                self.overlay = None;
+                Vec::new()
+            }
+            StartOutcome::Start {
+                program_id,
+                column_id,
+                start_at,
+                fan_out,
+            } => {
+                form.saving = true;
+                vec![self.send(
+                    Request::StartProgram {
+                        program_id,
+                        column_id: Some(column_id),
+                        start_at,
+                        fan_out,
+                    },
+                    Pending::StartProgram,
+                )]
+            }
+        }
+    }
+
+    fn runs_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
+        let Some(Overlay::Runs(panel)) = &mut self.overlay else {
+            return Vec::new();
+        };
+        match panel.handle(&ev) {
+            RunsOutcome::Changed => Vec::new(),
+            RunsOutcome::Cancel => {
+                self.overlay = None;
+                Vec::new()
+            }
+            RunsOutcome::View(task) => {
+                self.open_detail(*task);
+                Vec::new()
+            }
+            RunsOutcome::CancelRun {
+                run_id,
+                delete_open,
+            } => {
+                let Some(Overlay::Runs(panel)) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                let text = if delete_open {
+                    "Cancel this run and move the open tasks it made to the archive?\nFinished ones stay."
+                } else {
+                    "Cancel this run? The tasks it made stay on the board as ordinary tasks."
+                };
+                self.confirm(
+                    "Cancel run",
+                    text,
+                    ConfirmAction::Send {
+                        request: Request::CancelRun {
+                            run_id,
+                            delete_open,
+                        },
+                        pending: Pending::CancelRun,
+                    },
+                    Some(Box::new(Overlay::Runs(panel))),
+                );
+                Vec::new()
             }
         }
     }
@@ -2003,7 +2637,13 @@ impl App {
         });
     }
 
-    fn blocked_dialog(&mut self, task_id: TaskId, to: ColumnId, open: &[TaskId]) {
+    fn blocked_dialog(
+        &mut self,
+        task_id: TaskId,
+        to: ColumnId,
+        open: &[TaskId],
+        answer: Option<String>,
+    ) {
         let titles: Vec<String> = self
             .board
             .as_ref()
@@ -2028,8 +2668,13 @@ impl App {
                     to_column: to,
                     position: None,
                     override_deps: true,
+                    answer: answer.clone(),
                 },
-                pending: Pending::MoveTask { task: task_id, to },
+                pending: Pending::MoveTask {
+                    task: task_id,
+                    to,
+                    answer,
+                },
             },
             None,
         );
@@ -2328,6 +2973,12 @@ impl App {
             Some(Overlay::Menu { .. }) => self.menu_event(ev),
             Some(Overlay::Archive(_)) => self.archive_event(ev),
             Some(Overlay::TaskForm(_)) => self.form_event(ev),
+            Some(Overlay::PrintRules { .. }) => self.print_rules_event(ev),
+            Some(Overlay::Programs(_)) => self.programs_event(ev),
+            Some(Overlay::ProgramForm(_)) => self.program_form_event(ev),
+            Some(Overlay::StepForm { .. }) => self.step_form_event(ev),
+            Some(Overlay::StartProgram(_)) => self.start_program_event(ev),
+            Some(Overlay::Runs(_)) => self.runs_event(ev),
             Some(Overlay::Settings(_)) => self.settings_event(ev),
             Some(Overlay::Colors { .. }) => self.colors_event(ev),
             Some(Overlay::Printer { .. }) => self.printer_event(ev),
@@ -2512,6 +3163,9 @@ impl App {
             repeat: None,
             template_id: None,
             exclude_from_stats: false,
+            print_rules: Vec::new(),
+            program: None,
+            auto_start: false,
         };
         let name = user.username.clone();
         let mut job = taskologic_core::print::build_task_job(
@@ -2910,6 +3564,21 @@ impl App {
                 }
                 return Vec::new();
             }
+            if let Overlay::Question { areas, area, .. } = overlay
+                && let MouseEventKind::Down(MouseButton::Left) = m.kind
+            {
+                let pos = Position::new(m.column, m.row);
+                if let Some(i) = areas.iter().position(|a| a.contains(pos)) {
+                    if let Some(Overlay::Question { sel, .. }) = &mut self.overlay {
+                        *sel = i;
+                    }
+                    return self.answer_selected();
+                }
+                if !area.contains(pos) {
+                    self.overlay = None;
+                }
+                return Vec::new();
+            }
             // Overlays that are only there to be read close on any click.
             let dismissable = matches!(overlay, Overlay::Help | Overlay::PickColumn { .. });
             if dismissable && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -3107,18 +3776,9 @@ impl App {
                             return Vec::new();
                         }
                         match b.column_id(to) {
-                            Some(to_column) => vec![self.send(
-                                Request::MoveTask {
-                                    task_id,
-                                    to_column,
-                                    position,
-                                    override_deps: false,
-                                },
-                                Pending::MoveTask {
-                                    task: task_id,
-                                    to: to_column,
-                                },
-                            )],
+                            Some(to_column) => {
+                                self.request_move(task_id, to_column, position, false)
+                            }
                             None => Vec::new(),
                         }
                     }
@@ -3240,7 +3900,11 @@ pub mod test_support {
         };
         app.update(server(ServerMessage::Ok {
             id: req.id,
-            response: Response::Board(BoardDetail { board, tasks }),
+            response: Response::Board(BoardDetail {
+                board,
+                tasks,
+                estimates: Vec::new(),
+            }),
         }));
     }
 
@@ -3290,7 +3954,11 @@ mod tests {
         };
         app.update(server(ServerMessage::Ok {
             id: req.id,
-            response: Response::Board(BoardDetail { board, tasks }),
+            response: Response::Board(BoardDetail {
+                board,
+                tasks,
+                estimates: Vec::new(),
+            }),
         }));
 
         // The view is what records where the cards landed, so it has to run.

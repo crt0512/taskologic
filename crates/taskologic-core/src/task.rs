@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::board::Board;
 use crate::ids::{BoardId, ColumnId, ShortId, TaskId, TemplateId, Uid};
+use crate::offset::MAX_OFFSET_AMOUNT;
+use crate::print::{PrintRule, PrintWhen, Recipients, SlipKind};
+use crate::program::StepRef;
 use crate::repeat::RepeatSpec;
 
 pub const MAX_TITLE_CHARS: usize = 200;
@@ -69,6 +72,21 @@ pub struct Task {
     /// reason of its own should not drag the estimate for all the others.
     #[serde(default)]
     pub exclude_from_stats: bool,
+    /// The task's own printing: when it prints, which slip and for whom.
+    /// While it has any, they stand in for every user's autoprint mode and
+    /// reminder lead times on this task. Empty means the prefs decide, which
+    /// is what every task did before 0.1.12.
+    #[serde(default)]
+    pub print_rules: Vec<PrintRule>,
+    /// Which run and step this task is, when a program made it. Set once
+    /// at creation, like the template link.
+    #[serde(default)]
+    pub program: Option<StepRef>,
+    /// Moved into the started column by the scheduler when the start date
+    /// arrives, instead of by a person. Nothing happens without a start
+    /// date, and a task somebody started already is left alone.
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 impl Task {
@@ -113,6 +131,8 @@ pub struct TaskDraft {
     pub depends_on: Vec<TaskId>,
     pub checklist: Vec<ChecklistItem>,
     pub repeat: Option<RepeatSpec>,
+    pub print_rules: Vec<PrintRule>,
+    pub auto_start: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -127,6 +147,14 @@ pub enum TaskError {
     ReminderTooEarly,
     #[error("the start date cannot be after the due date")]
     StartAfterDue,
+    #[error("uid {0} is not a member of this board and cannot be printed for")]
+    PrintRecipientNotMember(Uid),
+    #[error("a print rule for named people needs at least one")]
+    NoPrintRecipients,
+    #[error("a print rule cannot run more than {MAX_OFFSET_AMOUNT} units ahead of the due date")]
+    PrintLeadTooLarge,
+    #[error("a group sheet is printed by a program step that fans out, when its tasks are made")]
+    SheetNeedsFanOut,
     #[error("{0}")]
     Repeat(#[from] crate::repeat::RepeatError),
 }
@@ -165,6 +193,38 @@ pub fn validate_draft(draft: &TaskDraft, board: &Board) -> Result<(), TaskError>
     if let Some(r) = &draft.repeat {
         r.validate()?;
     }
+    validate_print_rules(&draft.print_rules, board, false)?;
+    Ok(())
+}
+
+/// The rules a task may carry: a lead time that lands on a real date, and
+/// named people who are on the board. Whether a named uid is a Taskologic
+/// user at all is the daemon's to check, this crate has no user list.
+/// `sheets` is whether a group sheet makes sense here, which it only does
+/// on a program step that fans out.
+pub fn validate_print_rules(
+    rules: &[PrintRule],
+    board: &Board,
+    sheets: bool,
+) -> Result<(), TaskError> {
+    for rule in rules {
+        if rule.slip == SlipKind::Sheet && (!sheets || rule.when != PrintWhen::OnCreate) {
+            return Err(TaskError::SheetNeedsFanOut);
+        }
+        if let PrintWhen::BeforeDue(lead) = rule.when
+            && lead.amount > MAX_OFFSET_AMOUNT
+        {
+            return Err(TaskError::PrintLeadTooLarge);
+        }
+        if let Recipients::Users(uids) = &rule.to {
+            if uids.is_empty() {
+                return Err(TaskError::NoPrintRecipients);
+            }
+            if let Some(u) = uids.iter().find(|u| !board.is_member(**u)) {
+                return Err(TaskError::PrintRecipientNotMember(*u));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -199,6 +259,9 @@ pub mod test_support {
             repeat: None,
             template_id: None,
             exclude_from_stats: false,
+            print_rules: Vec::new(),
+            program: None,
+            auto_start: false,
         }
     }
 }
@@ -268,6 +331,40 @@ mod tests {
         assert_eq!(validate_draft(&d, &board), Ok(()));
         d.start_at = None;
         d.due_at = Some(early);
+        assert_eq!(validate_draft(&d, &board), Ok(()));
+    }
+
+    #[test]
+    fn print_rules_may_only_name_members_and_a_lead_time_that_lands_somewhere() {
+        use crate::offset::{Offset, OffsetUnit};
+        use crate::print::SlipKind;
+        let board = board_with_members(1, &[1, 2]);
+        let rule = |when: PrintWhen, to: Recipients| PrintRule {
+            when,
+            slip: SlipKind::Task,
+            to,
+        };
+        let mut d = TaskDraft {
+            title: "Water plants".into(),
+            print_rules: vec![rule(PrintWhen::OnStart, Recipients::Users(vec![2]))],
+            ..Default::default()
+        };
+        assert_eq!(validate_draft(&d, &board), Ok(()));
+        d.print_rules = vec![rule(PrintWhen::OnStart, Recipients::Users(vec![2, 9]))];
+        assert_eq!(
+            validate_draft(&d, &board),
+            Err(TaskError::PrintRecipientNotMember(9))
+        );
+        d.print_rules = vec![rule(PrintWhen::OnCreate, Recipients::Users(vec![]))];
+        assert_eq!(validate_draft(&d, &board), Err(TaskError::NoPrintRecipients));
+        let far = Offset {
+            amount: MAX_OFFSET_AMOUNT + 1,
+            unit: OffsetUnit::Days,
+        };
+        d.print_rules = vec![rule(PrintWhen::BeforeDue(far), Recipients::Assignees)];
+        assert_eq!(validate_draft(&d, &board), Err(TaskError::PrintLeadTooLarge));
+        // Assignees and creator name nobody in particular and always pass.
+        d.print_rules = vec![rule(PrintWhen::OnCreate, Recipients::Creator)];
         assert_eq!(validate_draft(&d, &board), Ok(()));
     }
 }

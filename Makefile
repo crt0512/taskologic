@@ -7,12 +7,6 @@ UNITDIR ?= /etc/systemd/system
 CARGO   ?= cargo
 RESTART ?= yes
 
-# Only the steps that write outside the tree are elevated, and only when they
-# have to be. Building stays unprivileged on purpose: `sudo cargo build` uses
-# root's CARGO_HOME, so every dependency fingerprint changes and the whole
-# workspace rebuilds, then leaves root owned files in target/ that your next
-# ordinary build cannot write. A staged install (DESTDIR, i.e. packaging)
-# writes into a directory you already own, so it never needs sudo either.
 ifeq ($(strip $(DESTDIR)),)
 SUDO := $(shell if [ "$$(id -u)" = 0 ]; then echo; elif command -v sudo >/dev/null 2>&1; then echo sudo; fi)
 else
@@ -60,17 +54,10 @@ install: build
 setup:
 	@BINDIR=$(BINDIR) UNITDIR=$(UNITDIR) ./scripts/setup.sh
 
-# Upgrade a host that `make setup` already set up: new binaries, new unit,
-# daemon restarted. Config, database, users and groups are left as they are.
-# RESTART=no installs without restarting the running daemon.
+
 update:
 	@BINDIR=$(BINDIR) UNITDIR=$(UNITDIR) RESTART=$(RESTART) ./scripts/update.sh
 
-# The installed daemon answers both of these without starting up, so they are
-# safe to run while it is serving. `migrate` is not: stop the daemon first, or
-# it carries on against a schema that moved under it. `make update` does the
-# stop, the migration and the restart in the right order, and is what you
-# normally want; these two are for looking, and for fixing up by hand.
 db-status:
 	@test -x $(BINDIR)/taskologicd || { echo "error: no taskologicd at $(BINDIR), run 'make install' first" >&2; exit 1; }
 	@$(BINDIR)/taskologicd --db-status

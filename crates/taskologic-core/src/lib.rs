@@ -18,6 +18,7 @@ pub mod offset;
 pub mod permission;
 pub mod prefs;
 pub mod print;
+pub mod program;
 pub mod repeat;
 pub mod stats;
 pub mod task;

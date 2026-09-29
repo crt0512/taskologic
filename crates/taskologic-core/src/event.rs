@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::barcode::ScanAction;
-use crate::ids::{BoardId, ColumnId, EventId, TaskId, TemplateId, Uid};
+use crate::ids::{BoardId, ColumnId, EventId, ProgramId, RunId, TaskId, TemplateId, Uid};
 use crate::task::{Task, TaskDraft};
 
 /// One field an edit touched. What the analytics detail view reads back, so
@@ -39,6 +39,9 @@ pub enum FieldChange {
     Dependencies,
     Reminders,
     Repeat,
+    /// The task's own print rules.
+    PrintRules,
+    AutoStart,
 }
 
 impl FieldChange {
@@ -54,6 +57,8 @@ impl FieldChange {
             FieldChange::Dependencies => "dependencies",
             FieldChange::Reminders => "reminder",
             FieldChange::Repeat => "repetition",
+            FieldChange::PrintRules => "printing",
+            FieldChange::AutoStart => "auto start",
         }
     }
 }
@@ -99,6 +104,12 @@ pub fn diff(task: &Task, draft: &TaskDraft) -> Vec<FieldChange> {
     }
     if task.repeat != draft.repeat {
         out.push(FieldChange::Repeat);
+    }
+    if task.print_rules != draft.print_rules {
+        out.push(FieldChange::PrintRules);
+    }
+    if task.auto_start != draft.auto_start {
+        out.push(FieldChange::AutoStart);
     }
     out
 }
@@ -185,6 +196,28 @@ pub enum EventKind {
     TemplateDeleted {
         template: TemplateId,
     },
+    ProgramCreated {
+        program: ProgramId,
+    },
+    ProgramChanged {
+        program: ProgramId,
+    },
+    ProgramDeleted {
+        program: ProgramId,
+    },
+    /// On the root task: the run began. Every task the run makes carries
+    /// the run on its own creation event through the task's program link.
+    RunStarted {
+        run: RunId,
+    },
+    /// On the root task. Tasks deleted along with it get their own event.
+    RunCancelled {
+        run: RunId,
+    },
+    /// A step's question was answered, by scan, by popup or by its default.
+    QuestionAnswered {
+        answer: String,
+    },
 }
 
 impl EventKind {
@@ -216,6 +249,12 @@ impl EventKind {
             EventKind::TemplateCreated { .. } => "template_created",
             EventKind::TemplateChanged { .. } => "template_changed",
             EventKind::TemplateDeleted { .. } => "template_deleted",
+            EventKind::ProgramCreated { .. } => "program_created",
+            EventKind::ProgramChanged { .. } => "program_changed",
+            EventKind::ProgramDeleted { .. } => "program_deleted",
+            EventKind::RunStarted { .. } => "run_started",
+            EventKind::RunCancelled { .. } => "run_cancelled",
+            EventKind::QuestionAnswered { .. } => "question_answered",
         }
     }
 

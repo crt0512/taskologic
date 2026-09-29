@@ -67,6 +67,7 @@ pub struct BoardForm {
     card_assignees: CheckboxState,
     card_deps: CheckboxState,
     card_description: CheckboxState,
+    card_estimate: CheckboxState,
     is_private: CheckboxState,
     is_locked: CheckboxState,
     users: Vec<(Uid, String, CheckboxState)>,
@@ -98,6 +99,7 @@ impl BoardForm {
             card_assignees: check("card_assignees", cards.assignees),
             card_deps: check("card_deps", cards.dependencies),
             card_description: check("card_description", cards.description),
+            card_estimate: check("card_estimate", cards.estimate),
             is_private: CheckboxState::named("private"),
             is_locked: CheckboxState::named("locked"),
             users: Vec::new(),
@@ -205,6 +207,7 @@ impl BoardForm {
             .widget(&self.card_assignees)
             .widget(&self.card_deps)
             .widget(&self.card_description)
+            .widget(&self.card_estimate)
             .widget(&self.is_private)
             .widget(&self.is_locked);
         if !self.is_edit() && self.is_private.checked() {
@@ -266,6 +269,7 @@ impl BoardForm {
             &mut self.card_assignees,
             &mut self.card_deps,
             &mut self.card_description,
+            &mut self.card_estimate,
         ] {
             c.handle(ev, Regular);
         }
@@ -314,6 +318,7 @@ impl BoardForm {
             dependencies: self.card_deps.checked(),
             description: self.card_description.checked(),
             short_id: false,
+            estimate: self.card_estimate.checked(),
         }
     }
 
@@ -560,6 +565,12 @@ impl BoardForm {
             checkbox_at("description".into(), cb, t),
             cb,
             &mut self.card_description,
+        );
+        let cb = r.take(check_w("estimate"));
+        f.render_stateful_widget(
+            checkbox_at("estimate".into(), cb, t),
+            cb,
+            &mut self.card_estimate,
         );
 
         let (l, w) = split_label(rows[i], lw);

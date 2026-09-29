@@ -82,6 +82,7 @@ pub struct SettingsForm {
     card_deps: CheckboxState,
     card_description: CheckboxState,
     card_short_id: CheckboxState,
+    card_estimate: CheckboxState,
     print_button: CheckboxState,
     /// Lead times before each of a task's two dates, in hours.
     reminder_start_hours: TextInputState,
@@ -150,6 +151,7 @@ impl SettingsForm {
             card_deps: check("card_deps", cards.dependencies),
             card_description: check("card_description", cards.description),
             card_short_id: check("card_short_id", cards.short_id),
+            card_estimate: check("card_estimate", cards.estimate),
             print_button: check("print_button", p.print.show_print_button),
             reminder_start_hours,
             reminder_hours,
@@ -192,7 +194,8 @@ impl SettingsForm {
                 .widget(&self.card_assignees)
                 .widget(&self.card_deps)
                 .widget(&self.card_description)
-                .widget(&self.card_short_id);
+                .widget(&self.card_short_id)
+                .widget(&self.card_estimate);
         }
         b.widget(&self.print_button)
             .widget(&self.reminder_start_hours)
@@ -262,6 +265,7 @@ impl SettingsForm {
             &mut self.card_deps,
             &mut self.card_description,
             &mut self.card_short_id,
+            &mut self.card_estimate,
             &mut self.print_button,
             &mut self.filter_on,
             &mut self.filter_assigned,
@@ -331,6 +335,7 @@ impl SettingsForm {
                     dependencies: self.card_deps.checked(),
                     description: self.card_description.checked(),
                     short_id: self.card_short_id.checked(),
+                    estimate: self.card_estimate.checked(),
                 }),
                 touchscreen: self.touchscreen.checked(),
                 scanner_enabled: self.scanner.checked(),
@@ -499,6 +504,12 @@ impl SettingsForm {
             );
             let cb = r.take(check_w("id"));
             f.render_stateful_widget(checkbox_at("id".into(), cb, t), cb, &mut self.card_short_id);
+            let cb = r.take(check_w("estimate"));
+            f.render_stateful_widget(
+                checkbox_at("estimate".into(), cb, t),
+                cb,
+                &mut self.card_estimate,
+            );
         }
 
         let (l, w) = split_label(rows[7], lw);

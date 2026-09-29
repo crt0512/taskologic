@@ -73,6 +73,8 @@ pub enum Denial {
     NotTaskEditor,
     NotTaskDeleter,
     NotTemplateManager,
+    NotProgramManager,
+    NotRunCanceller,
 }
 
 impl Denial {
@@ -104,6 +106,14 @@ impl fmt::Display for Denial {
             Denial::NotTemplateManager => write!(
                 f,
                 "only the template creator, the board owner or an admin can change or delete this template"
+            ),
+            Denial::NotProgramManager => write!(
+                f,
+                "only the program creator, the board owner or an admin can change or delete this program"
+            ),
+            Denial::NotRunCanceller => write!(
+                f,
+                "only whoever started the program, the board owner or an admin can cancel it"
             ),
         }
     }
@@ -217,6 +227,25 @@ pub fn check_template_manage(actor: &Actor, board: &Board, owner_uid: Uid) -> Re
     }
 }
 
+/// Programs follow the template rules too: any member may save and start
+/// one, changing or deleting it is for its creator, the board owner or an
+/// admin. `owner_uid` is whoever saved the program.
+pub fn check_program_manage(actor: &Actor, board: &Board, owner_uid: Uid) -> Result<(), Denial> {
+    match check_template_manage(actor, board, owner_uid) {
+        Err(Denial::NotTemplateManager) => Err(Denial::NotProgramManager),
+        other => other,
+    }
+}
+
+/// Cancelling a run is for whoever started it, the board owner or an admin:
+/// it can delete the tasks the run made, which is more than moving them.
+pub fn check_run_cancel(actor: &Actor, board: &Board, started_by: Uid) -> Result<(), Denial> {
+    match check_template_manage(actor, board, started_by) {
+        Err(Denial::NotTemplateManager) => Err(Denial::NotRunCanceller),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +294,9 @@ mod tests {
         ("toggle_private", [true, true, false, false, false]),
         // CREATOR stands in as the template owner here.
         ("manage_template", [true, true, true, false, false]),
+        // And as the program owner, and as whoever started a run.
+        ("manage_program", [true, true, true, false, false]),
+        ("cancel_run", [true, true, true, false, false]),
     ];
 
     fn run(row: &str, uid: Uid) -> Result<(), Denial> {
@@ -288,6 +320,8 @@ mod tests {
             "toggle_lock" => check_board(BoardAction::ToggleLock, &a, &board),
             "toggle_private" => check_board(BoardAction::TogglePrivate, &a, &board),
             "manage_template" => check_template_manage(&a, &board, CREATOR),
+            "manage_program" => check_program_manage(&a, &board, CREATOR),
+            "cancel_run" => check_run_cancel(&a, &board, CREATOR),
             _ => unreachable!(),
         }
     }

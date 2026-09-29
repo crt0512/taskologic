@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::barcode::{ScanAction, ScanPayload};
 use crate::board::Board;
 use crate::ids::{ShortId, TaskId, Uid};
+use crate::offset::Offset;
 use crate::prefs::{PrintMode, PrintPrefs};
 use crate::task::{ChecklistItem, Task};
 use crate::user::User;
@@ -59,6 +60,135 @@ pub struct Barcode {
 pub enum PrintJobKind {
     Task,
     Reminder,
+    /// One slip for a whole group of tasks a program made at once: each with
+    /// its start code, and the root's code that finishes whatever is running.
+    Sheet,
+}
+
+/// When one of a task's own print rules fires.
+///
+/// A task that carries rules decides its own printing: for that task alone
+/// they stand in for every user's autoprint mode and reminder lead times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrintWhen {
+    /// The moment the task is made.
+    OnCreate,
+    /// When work begins: the start date arriving or the task entering the
+    /// started column, whichever comes first, and only once either way.
+    OnStart,
+    /// So long before the due date. Follows the due date if it moves.
+    BeforeDue(Offset),
+}
+
+impl PrintWhen {
+    /// Stable name for the row that remembers a slip went out. It shares a
+    /// table with the reminder kinds, so it must not collide with them.
+    pub fn name(self) -> &'static str {
+        match self {
+            PrintWhen::OnCreate => "rule_create",
+            PrintWhen::OnStart => "rule_start",
+            PrintWhen::BeforeDue(_) => "rule_due",
+        }
+    }
+}
+
+/// Which slip a rule prints. What a kind looks like is the printer's own
+/// layout, one per kind, so a rule picks the paper and never its shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlipKind {
+    /// The receipt you work from, laid out around the code that finishes.
+    #[default]
+    Task,
+    /// The nudge that says a thing is coming up, laid out around the code
+    /// that starts it.
+    Reminder,
+    /// One slip for every task a fan-out step made at once, each with its
+    /// start code, plus the root's code that finishes whatever is running.
+    /// Only a step that fans out can ask for one, and only when created.
+    Sheet,
+}
+
+impl SlipKind {
+    pub const ALL: [SlipKind; 3] = [SlipKind::Task, SlipKind::Reminder, SlipKind::Sheet];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SlipKind::Task => "task slip",
+            SlipKind::Reminder => "reminder slip",
+            SlipKind::Sheet => "group sheet",
+        }
+    }
+
+    /// The stable half of a sent key, next to the moment.
+    fn name(self) -> &'static str {
+        match self {
+            SlipKind::Task => "task",
+            SlipKind::Reminder => "reminder",
+            SlipKind::Sheet => "sheet",
+        }
+    }
+
+    pub fn job_kind(self) -> PrintJobKind {
+        match self {
+            SlipKind::Task => PrintJobKind::Task,
+            SlipKind::Reminder => PrintJobKind::Reminder,
+            SlipKind::Sheet => PrintJobKind::Sheet,
+        }
+    }
+}
+
+/// Who a rule prints for.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Recipients {
+    /// The task's assignees, or its creator while it has none.
+    #[default]
+    Assignees,
+    Creator,
+    /// These people, whether or not the task is theirs.
+    Users(Vec<Uid>),
+}
+
+/// One print rule on a task: when, which slip, for whom.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrintRule {
+    pub when: PrintWhen,
+    #[serde(default)]
+    pub slip: SlipKind,
+    #[serde(default)]
+    pub to: Recipients,
+}
+
+impl PrintRule {
+    /// What a sent row for this rule is called, per person: the moment and
+    /// the paper. Two rules that agree on both would hand over the same
+    /// slip twice, so they share the name and the second finds it taken.
+    pub fn sent_kind(&self) -> String {
+        format!("{}_{}", self.when.name(), self.slip.name())
+    }
+
+    /// One readable line: "on start: reminder slip to assignees".
+    pub fn summary(&self, name_of: &dyn Fn(Uid) -> String) -> String {
+        let when = match self.when {
+            PrintWhen::OnCreate => "when created".to_string(),
+            PrintWhen::OnStart => "on start".to_string(),
+            PrintWhen::BeforeDue(lead) => {
+                format!("{} {} before due", lead.amount, lead.unit.label())
+            }
+        };
+        let to = match &self.to {
+            Recipients::Assignees => "assignees".to_string(),
+            Recipients::Creator => "creator".to_string(),
+            Recipients::Users(uids) => uids
+                .iter()
+                .map(|u| name_of(*u))
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        format!("{when}: {} to {to}", self.slip.label())
+    }
 }
 
 /// One dependency line on a slip.
@@ -90,9 +220,21 @@ pub struct PrintJob {
     #[serde(default)]
     pub checklist: Vec<ChecklistItem>,
     pub barcodes: Vec<Barcode>,
+    /// The tasks a group sheet lists, each with its own start code. Empty
+    /// on every other kind of slip.
+    #[serde(default)]
+    pub sheet: Vec<SheetEntry>,
     /// For rendering timestamps. The job follows the user, so does the zone.
     pub timezone: Tz,
     pub created_at: DateTime<Utc>,
+}
+
+/// One line of a group sheet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheetEntry {
+    pub short_id: ShortId,
+    pub title: String,
+    pub barcode: Barcode,
 }
 
 fn barcode(user: &User, task: &Task, action: ScanAction) -> Barcode {
@@ -126,6 +268,24 @@ pub fn sample_barcode(symbology: Symbology, action: ScanAction) -> Barcode {
 /// carry it, and recognisable enough to check against what a scanner reads.
 pub const SAMPLE_BARCODE_PAYLOAD: &str = "123456789";
 
+/// The codes a slip for this task carries: one to start it, and either one
+/// to finish it or, when a program gave the task a question, one per answer
+/// in the plain finish code's place. Answering finishes the task too.
+fn barcodes_for(user: &User, task: &Task) -> Vec<Barcode> {
+    let mut codes = vec![barcode(user, task, ScanAction::StartPause)];
+    match task.program.as_ref().and_then(|p| p.question.as_ref()) {
+        Some(q) => {
+            for (i, answer) in q.answers().iter().enumerate() {
+                let mut code = barcode(user, task, q.barcode_action(i));
+                code.label = Some(format!("scan to finish: {answer}"));
+                codes.push(code);
+            }
+        }
+        None => codes.push(barcode(user, task, ScanAction::Finish)),
+    }
+    codes
+}
+
 /// A full task slip. `names` resolves uids to display names, `deps` is the
 /// task's dependency list with their current state.
 pub fn build_task_job(
@@ -136,10 +296,7 @@ pub fn build_task_job(
     user: &User,
     now: DateTime<Utc>,
 ) -> PrintJob {
-    let barcodes = vec![
-        barcode(user, task, ScanAction::StartPause),
-        barcode(user, task, ScanAction::Finish),
-    ];
+    let barcodes = barcodes_for(user, task);
     PrintJob {
         kind: PrintJobKind::Task,
         task_id: task.id,
@@ -155,6 +312,50 @@ pub fn build_task_job(
             .then(|| task.assignees.iter().map(|u| names(*u)).collect()),
         checklist: task.checklist.clone(),
         barcodes,
+        sheet: Vec::new(),
+        timezone: user.timezone,
+        created_at: now,
+    }
+}
+
+/// A group sheet: the run's root with, under it, every task in `group`
+/// and its start code, and the root's code that finishes whatever of the
+/// run is running. One piece of paper for a fan-out step.
+pub fn build_sheet_job(
+    root: &Task,
+    group: &[Task],
+    board: &Board,
+    user: &User,
+    now: DateTime<Utc>,
+) -> PrintJob {
+    let mut stop = barcode(user, root, ScanAction::FinishChildren);
+    stop.label = Some("scan to finish what is running".to_string());
+    PrintJob {
+        kind: PrintJobKind::Sheet,
+        task_id: root.id,
+        short_id: root.short_id,
+        board_name: board.name.clone(),
+        title: root.title.clone(),
+        description: None,
+        start_at: None,
+        due_at: None,
+        dependencies: None,
+        created_by: None,
+        assignees: None,
+        checklist: Vec::new(),
+        barcodes: vec![stop],
+        sheet: group
+            .iter()
+            .map(|t| {
+                let mut code = barcode(user, t, ScanAction::StartPause);
+                code.label = Some(format!("scan to start: {}", t.title));
+                SheetEntry {
+                    short_id: t.short_id,
+                    title: t.title.clone(),
+                    barcode: code,
+                }
+            })
+            .collect(),
         timezone: user.timezone,
         created_at: now,
     }
@@ -164,10 +365,7 @@ pub fn build_task_job(
 /// same reason: the printer's layout decides what a reminder shows, and it
 /// cannot show what was never sent.
 pub fn build_reminder_job(task: &Task, board: &Board, user: &User, now: DateTime<Utc>) -> PrintJob {
-    let barcodes = vec![
-        barcode(user, task, ScanAction::StartPause),
-        barcode(user, task, ScanAction::Finish),
-    ];
+    let barcodes = barcodes_for(user, task);
     PrintJob {
         kind: PrintJobKind::Reminder,
         task_id: task.id,
@@ -182,6 +380,7 @@ pub fn build_reminder_job(task: &Task, board: &Board, user: &User, now: DateTime
         assignees: None,
         checklist: task.checklist.clone(),
         barcodes,
+        sheet: Vec::new(),
         timezone: user.timezone,
         created_at: now,
     }
@@ -297,6 +496,70 @@ pub fn plan_reminders(task: &Task, prefs: &PrintPrefs) -> Vec<PlannedReminder> {
         });
     }
     out
+}
+
+/// Who a rule's slip goes to, among the board's members, each once.
+/// Assignees fall back to the creator when there are none, and anyone who
+/// has left the board since the rule was written is dropped rather than
+/// printed for.
+pub fn recipients_of(rule: &PrintRule, task: &Task, board: &Board) -> Vec<Uid> {
+    let mut uids: Vec<Uid> = match &rule.to {
+        Recipients::Assignees if task.assignees.is_empty() => vec![task.created_by],
+        Recipients::Assignees => task.assignees.clone(),
+        Recipients::Creator => vec![task.created_by],
+        Recipients::Users(uids) => uids.clone(),
+    };
+    uids.retain(|u| board.is_member(*u));
+    uids.sort_unstable();
+    uids.dedup();
+    uids
+}
+
+/// One of a task's rules whose moment is a date rather than an event: which
+/// rule, when it prints, the date it counts to, and the key it is remembered
+/// under once sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedRule {
+    pub index: usize,
+    pub at: DateTime<Utc>,
+    /// The date past which the slip is not worth printing, when there is
+    /// one. A "before due" slip is not, once the due date has gone by. A
+    /// start slip is the paper you work from and waits as long as the task
+    /// does, so it has none.
+    pub anchor: Option<DateTime<Utc>>,
+    /// What a sent row is keyed on. The due date for "before due", so moving
+    /// the date earns a fresh slip; the creation time for "on start", so the
+    /// date path and the move into the started column agree on one slip.
+    pub sent_anchor: DateTime<Utc>,
+}
+
+/// The dated rules of a task: "on start" once it has a start date, "before
+/// due" once it has a due date. The event driven moments, creation and
+/// entering the started column, are fired where those things happen.
+pub fn plan_rule_prints(task: &Task) -> Vec<PlannedRule> {
+    task.print_rules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rule)| {
+            let (at, anchor, sent_anchor) = match rule.when {
+                PrintWhen::OnCreate => return None,
+                PrintWhen::OnStart => {
+                    let start = task.start_at?;
+                    (start, None, task.created_at)
+                }
+                PrintWhen::BeforeDue(lead) => {
+                    let due = task.due_at?;
+                    (due.checked_sub_signed(lead.delta()?)?, Some(due), due)
+                }
+            };
+            Some(PlannedRule {
+                index,
+                at,
+                anchor,
+                sent_anchor,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -612,5 +875,133 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn minutes(n: u32) -> Offset {
+        Offset {
+            amount: n,
+            unit: crate::offset::OffsetUnit::Minutes,
+        }
+    }
+
+    #[test]
+    fn a_rules_recipients_are_members_each_once_and_assignees_fall_back_to_the_creator() {
+        let board = board_with_members(1, &[1, 2, 3]);
+        let mut task = task_on(&board, 1);
+        let rule = |to: Recipients| PrintRule {
+            when: PrintWhen::OnCreate,
+            slip: SlipKind::Task,
+            to,
+        };
+        // Nobody assigned: the creator gets it.
+        assert_eq!(recipients_of(&rule(Recipients::Assignees), &task, &board), vec![1]);
+        task.assignees = vec![3, 2, 3];
+        assert_eq!(recipients_of(&rule(Recipients::Assignees), &task, &board), vec![2, 3]);
+        assert_eq!(recipients_of(&rule(Recipients::Creator), &task, &board), vec![1]);
+        // Somebody who is not on the board any more is left out, not printed for.
+        assert_eq!(
+            recipients_of(&rule(Recipients::Users(vec![9, 2, 2])), &task, &board),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn dated_rules_are_planned_from_the_dates_the_task_has() {
+        let board = board_with_members(1, &[1]);
+        let mut task = task_on(&board, 1);
+        task.print_rules = vec![
+            PrintRule {
+                when: PrintWhen::OnCreate,
+                slip: SlipKind::Task,
+                to: Recipients::Assignees,
+            },
+            PrintRule {
+                when: PrintWhen::OnStart,
+                slip: SlipKind::Reminder,
+                to: Recipients::Assignees,
+            },
+            PrintRule {
+                when: PrintWhen::BeforeDue(minutes(10)),
+                slip: SlipKind::Task,
+                to: Recipients::Creator,
+            },
+        ];
+        // No dates: nothing the clock can decide, and creation is not its job.
+        assert_eq!(plan_rule_prints(&task), vec![]);
+
+        task.due_at = Some(at(20_000));
+        assert_eq!(
+            plan_rule_prints(&task),
+            vec![PlannedRule {
+                index: 2,
+                at: at(20_000 - 600),
+                anchor: Some(at(20_000)),
+                sent_anchor: at(20_000),
+            }]
+        );
+
+        // The start rule is keyed on the creation time, not the start date,
+        // so a slip printed by moving the task counts for this one too.
+        task.start_at = Some(at(10_000));
+        let planned = plan_rule_prints(&task);
+        assert_eq!(planned.len(), 2);
+        assert_eq!(
+            planned[0],
+            PlannedRule {
+                index: 1,
+                at: at(10_000),
+                anchor: None,
+                sent_anchor: task.created_at,
+            }
+        );
+    }
+
+    #[test]
+    fn rules_read_back_as_a_sentence_and_share_a_sent_key_when_they_agree() {
+        let names = |u: Uid| format!("user{u}");
+        let a = PrintRule {
+            when: PrintWhen::BeforeDue(minutes(10)),
+            slip: SlipKind::Task,
+            to: Recipients::Users(vec![2, 3]),
+        };
+        assert_eq!(
+            a.summary(&names),
+            "10 minutes before due: task slip to user2, user3"
+        );
+        assert_eq!(a.sent_kind(), "rule_due_task");
+        let b = PrintRule {
+            when: PrintWhen::BeforeDue(minutes(30)),
+            slip: SlipKind::Task,
+            to: Recipients::Assignees,
+        };
+        assert_eq!(b.sent_kind(), a.sent_kind(), "same moment, same paper");
+        let c = PrintRule {
+            when: PrintWhen::OnStart,
+            slip: SlipKind::Reminder,
+            to: Recipients::Assignees,
+        };
+        assert_eq!(c.summary(&names), "on start: reminder slip to assignees");
+        assert_eq!(c.sent_kind(), "rule_start_reminder");
+    }
+
+    #[test]
+    fn a_rule_on_the_wire_is_short_and_old_rows_without_the_extras_still_load() {
+        let rule = PrintRule {
+            when: PrintWhen::BeforeDue(minutes(10)),
+            slip: SlipKind::Reminder,
+            to: Recipients::Users(vec![3]),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert_eq!(
+            json,
+            r#"{"when":{"before_due":{"amount":10,"unit":"minutes"}},"slip":"reminder","to":{"users":[3]}}"#
+        );
+        let back: PrintRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rule);
+        // Only the moment is required; the rest has a sensible default.
+        let bare: PrintRule = serde_json::from_str(r#"{"when":"on_start"}"#).unwrap();
+        assert_eq!(bare.when, PrintWhen::OnStart);
+        assert_eq!(bare.slip, SlipKind::Task);
+        assert_eq!(bare.to, Recipients::Assignees);
     }
 }

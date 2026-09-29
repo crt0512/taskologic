@@ -19,6 +19,7 @@ use ratatui::widgets::{Clear, ListItem, Paragraph};
 use taskologic_core::ids::{BoardId, ColumnId, TaskId, TemplateId, Uid};
 use taskologic_core::offset::{MAX_OFFSET_AMOUNT, Offset, OffsetUnit};
 use taskologic_core::prefs::{parse_reminder_hours, reminder_hours_text};
+use taskologic_core::print::PrintRule;
 use taskologic_core::repeat::{Repeat, RepeatSpec};
 use taskologic_core::task::{ChecklistItem, Task, TaskDraft, validate_title};
 use taskologic_core::template::{
@@ -99,6 +100,9 @@ pub enum FormOutcome {
     Cancel,
     /// The dependency picker wants search results for this query.
     SearchDeps(String),
+    /// Open the print rules window with these rules; it hands them back
+    /// through [`TaskForm::set_print_rules`].
+    EditPrinting(Vec<PrintRule>),
 }
 
 struct Member {
@@ -124,6 +128,8 @@ pub struct TaskForm {
     /// When work on this should begin, read the same way the due field is.
     start: TextInputState,
     insert_now_start: ButtonState,
+    /// Move into the started column by itself when that date arrives.
+    auto_start: CheckboxState,
     due: TextInputState,
     /// Drops the current date and time into the due field.
     insert_now: ButtonState,
@@ -170,6 +176,10 @@ pub struct TaskForm {
     day_of_month: TextInputState,
     fixed_date: TextInputState,
     at_time: TextInputState,
+    /// The task's own print rules, edited in their own window. Empty means
+    /// the user's settings decide, as they always did.
+    print_rules: Vec<PrintRule>,
+    print_btn: ButtonState,
     save: ButtonState,
     cancel: ButtonState,
     pub error: Option<String>,
@@ -241,6 +251,7 @@ impl TaskForm {
             checklist: TextAreaState::named("checklist"),
             start: TextInputState::named("start"),
             insert_now_start: ButtonState::new(),
+            auto_start: CheckboxState::named("auto_start"),
             due: TextInputState::named("due"),
             insert_now: ButtonState::new(),
             start_prefill: CheckboxState::named("start_prefill"),
@@ -279,11 +290,18 @@ impl TaskForm {
             day_of_month: TextInputState::named("day_of_month"),
             fixed_date: TextInputState::named("fixed_date"),
             at_time,
+            print_rules: Vec::new(),
+            print_btn: ButtonState::new(),
             save: ButtonState::new(),
             cancel: ButtonState::new(),
             error: None,
             saving: false,
         }
+    }
+
+    /// The print rules window closed with these.
+    pub fn set_print_rules(&mut self, rules: Vec<PrintRule>) {
+        self.print_rules = rules;
     }
 
     pub fn create(board: BoardId, column: ColumnId, tz: Tz) -> Self {
@@ -400,6 +418,8 @@ impl TaskForm {
         self.title.set_text(draft.title.clone());
         self.description.set_text(&draft.description);
         self.apply_reminders(draft.reminder_start_minutes, draft.reminder_due_minutes);
+        self.print_rules = draft.print_rules.clone();
+        self.auto_start.set_checked(draft.auto_start);
         if !draft.checklist.is_empty() {
             let text: Vec<String> = draft
                 .checklist
@@ -493,6 +513,8 @@ impl TaskForm {
                 .set_text(due.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string());
         }
         f.apply_reminders(task.reminder_start_minutes, task.reminder_due_minutes);
+        f.print_rules = task.print_rules.clone();
+        f.auto_start.set_checked(task.auto_start);
         f.deps = task
             .depends_on
             .iter()
@@ -592,7 +614,9 @@ impl TaskForm {
                 b.widget(&self.min_samples);
             }
         } else {
-            b.widget(&self.start).widget(&self.insert_now_start);
+            b.widget(&self.start)
+                .widget(&self.insert_now_start)
+                .widget(&self.auto_start);
             b.widget(&self.due).widget(&self.insert_now);
         }
         b.widget(&self.remind_start_override);
@@ -644,7 +668,9 @@ impl TaskForm {
                     .widget(&self.repeat_due_unit);
             }
         }
-        b.widget(&self.save).widget(&self.cancel);
+        b.widget(&self.print_btn)
+            .widget(&self.save)
+            .widget(&self.cancel);
         b.build()
     }
 
@@ -679,6 +705,9 @@ impl TaskForm {
         }
         if self.cancel.handle(ev, Regular) == ButtonOutcome::Pressed {
             return FormOutcome::Cancel;
+        }
+        if self.print_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
+            return FormOutcome::EditPrinting(self.print_rules.clone());
         }
         // Written the way `parse_when` reads it back, so the field stays
         // editable rather than turning into a magic value.
@@ -794,6 +823,7 @@ impl TaskForm {
             self.dep_templates_list.handle(ev, Regular);
         } else {
             self.start.handle(ev, Regular);
+            self.auto_start.handle(ev, Regular);
             self.due.handle(ev, Regular);
             self.dep_search.handle(ev, Regular);
             self.dep_hits_list.handle(ev, Regular);
@@ -945,6 +975,10 @@ impl TaskForm {
                 depends_on,
                 checklist,
                 repeat,
+                print_rules: self.print_rules.clone(),
+                // A template's tasks get the flag when they are stamped out;
+                // the template itself never starts.
+                auto_start: !self.is_template() && self.auto_start.checked(),
             },
             options,
         })
@@ -1134,9 +1168,11 @@ impl TaskForm {
             f.render_stateful_widget(field(t), r.take(17), &mut self.start);
             let btn = r.take(super::button_w(" Insert current ") + pad);
             render_button(f, btn, " Insert current ", &mut self.insert_now_start, t);
-            f.render_widget(
-                Paragraph::new(" when work should begin").style(t.surface_dim()),
-                r.rest(),
+            let cb = r.take(super::check_w("starts by itself then"));
+            f.render_stateful_widget(
+                checkbox_at("starts by itself then".into(), cb, t),
+                cb,
+                &mut self.auto_start,
             );
         }
 
@@ -1207,10 +1243,12 @@ impl TaskForm {
                 r.rest(),
             );
         } else if !self.remind_start_override.checked() {
-            f.render_widget(
-                Paragraph::new("your settings decide").style(t.surface_dim()),
-                r.rest(),
-            );
+            let text = if self.print_rules.is_empty() {
+                "your settings decide"
+            } else {
+                "the print rules take over, see Printing"
+            };
+            f.render_widget(Paragraph::new(text).style(t.surface_dim()), r.rest());
         }
 
         let (l, w) = split(rows[11]);
@@ -1396,6 +1434,16 @@ impl TaskForm {
             f.render_widget(Paragraph::new(e.clone()).style(t.error()), rows[19]);
         }
 
+        // Printing sits at the left of the button row, Save and Cancel at
+        // the right where every other form has them.
+        let printing = format!(" Printing ({}) ", self.print_rules.len());
+        let pb = Rect::new(
+            rows[20].x,
+            rows[20].y,
+            (super::button_w(&printing) + pad).min(rows[20].width),
+            rows[20].height,
+        );
+        render_button(f, pb, &printing, &mut self.print_btn, t);
         let (save, cancel) = button_row(rows[20], " Save ", " Cancel ", t);
         render_button(f, save, " Save ", &mut self.save, t);
         render_button(f, cancel, " Cancel ", &mut self.cancel, t);
@@ -1597,6 +1645,12 @@ pub fn conflict_lines(
     }
     if draft.repeat != current.repeat {
         out.push("Repetition: both changed".into());
+    }
+    if draft.print_rules != current.print_rules {
+        out.push("Printing: both changed".into());
+    }
+    if draft.auto_start != current.auto_start {
+        out.push("Auto start: both changed".into());
     }
     if out.is_empty() {
         out.push("No field differs from the current version, saving again is safe.".into());
@@ -1872,10 +1926,10 @@ mod tests {
     #[test]
     fn dependency_picker_searches_then_adds() {
         let mut form = TaskForm::create(BoardId(1), ColumnId(1), chrono_tz::UTC);
-        // Tab from title: description, checklist, start, its Insert current,
-        // due, its Insert current, the two reminder boxes, then (no members
-        // yet) the search box.
-        for _ in 0..9 {
+        // Tab from title: description, checklist, start, its Insert current
+        // and its auto start box, due, its Insert current, the two reminder
+        // boxes, then (no members yet) the search box.
+        for _ in 0..10 {
             form.handle(&key(KeyCode::Tab));
         }
         assert!(form.dep_search.is_focused());
@@ -1904,9 +1958,9 @@ mod tests {
     fn insert_current_fills_a_due_date_the_form_reads_back() {
         let mut form = TaskForm::create(BoardId(1), ColumnId(1), chrono_tz::Europe::Berlin);
         type_str(&mut form, "Feed the cat");
-        // Tab from title: description, checklist, start, its own button,
-        // due, then the button beside it.
-        for _ in 0..6 {
+        // Tab from title: description, checklist, start, its own button and
+        // its auto start box, due, then the button beside it.
+        for _ in 0..7 {
             form.handle(&key(KeyCode::Tab));
         }
         assert!(form.insert_now.is_focused());
@@ -1931,9 +1985,10 @@ mod tests {
     fn a_reminder_override_is_typed_in_hours_and_saved_in_minutes() {
         let mut form = TaskForm::create(BoardId(1), ColumnId(1), chrono_tz::UTC);
         type_str(&mut form, "Take the bins out");
-        // Tab from title: description, checklist, start, its Insert current,
-        // due, its Insert current, the start reminder box, then the due one.
-        for _ in 0..8 {
+        // Tab from title: description, checklist, start, its Insert current
+        // and auto start box, due, its Insert current, the start reminder
+        // box, then the due one.
+        for _ in 0..9 {
             form.handle(&key(KeyCode::Tab));
         }
         assert!(form.remind_override.is_focused());
@@ -1953,6 +2008,53 @@ mod tests {
         let draft = form.values().unwrap().draft;
         assert_eq!(draft.reminder_start_minutes, Some(30));
         assert_eq!(draft.reminder_due_minutes, Some(90));
+    }
+
+    #[test]
+    fn print_rules_ride_along_with_the_draft_and_the_button_opens_their_window() {
+        use taskologic_core::print::{PrintWhen, Recipients, SlipKind};
+        let board = board_with_members(1, &[1]);
+        let mut task = task_on(&board, 1);
+        task.print_rules = vec![PrintRule {
+            when: PrintWhen::OnStart,
+            slip: SlipKind::Reminder,
+            to: Recipients::Creator,
+        }];
+        let mut form = TaskForm::edit(&task, chrono_tz::UTC, &|_| None);
+        assert_eq!(form.values().unwrap().draft.print_rules, task.print_rules);
+        // Tab from title: description, checklist, start with its button and
+        // auto start box, due and its button, the two reminder boxes, the
+        // three dependency widgets, the repeat rule, then Printing, the last
+        // stop before Save.
+        for _ in 0..14 {
+            form.handle(&key(KeyCode::Tab));
+        }
+        assert!(form.print_btn.is_focused());
+        assert_eq!(
+            form.handle(&key(KeyCode::Enter)),
+            FormOutcome::EditPrinting(task.print_rules.clone())
+        );
+        form.set_print_rules(Vec::new());
+        assert!(form.values().unwrap().draft.print_rules.is_empty());
+        let lines = conflict_lines(&form, &task, &|u| format!("u{u}"));
+        assert!(lines.contains(&"Printing: both changed".to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn the_auto_start_flag_rides_along_and_a_template_never_carries_it() {
+        let board = board_with_members(1, &[1]);
+        let mut task = task_on(&board, 1);
+        task.start_at = Some(Utc::now());
+        task.auto_start = true;
+        let form = TaskForm::edit(&task, chrono_tz::UTC, &|_| None);
+        assert!(form.values().unwrap().draft.auto_start);
+        task.auto_start = false;
+        let lines = conflict_lines(&form, &task, &|u| format!("u{u}"));
+        assert!(lines.contains(&"Auto start: both changed".to_string()), "{lines:?}");
+        let mut tpl = TaskForm::template_new(BoardId(1), chrono_tz::UTC);
+        tpl.title.set_text("Weekly".to_string());
+        tpl.auto_start.set_checked(true);
+        assert!(!tpl.values().unwrap().draft.auto_start);
     }
 
     #[test]

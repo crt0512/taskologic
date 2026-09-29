@@ -1,0 +1,106 @@
+{
+  "taskologic": {
+    "format": 1,
+    "kind": "program",
+    "taskologic": "0.1.12",
+    "exported_at": "2026-09-29T12:00:00Z",
+    "board": "demo"
+  },
+  "users": [],
+  "program": {
+    "name": "Clean Up Entire Apartment",
+    "description": "Clean up the entire apartment by maintainer of Taskologic (crt0512).",
+    "steps": [
+      {
+        "key": "root",
+        "title": "Clean Up Entire Apartment",
+        "description": "Holds no work of its own, it only tracks its steps and finishes itself once 1 to 3 are done. Give it a start date when you start the program, half an hour from now say; the slip it prints lets you start early.",
+        "assign": "starter",
+        "start": "manual",
+        "print": [
+          { "when": "on_create", "slip": "reminder", "to": "assignees" }
+        ]
+      },
+      {
+        "key": "1",
+        "title": "Gather and start wash cycle",
+        "description": "Go through each room, collect clothes, load the machine, start a cycle.",
+        "created": [ "with_root" ],
+        "start": "when_root_starts",
+        "time_limit": { "amount": 20, "unit": "minutes" },
+        "question": { "text": "Is this the last load?", "kind": "yes_no" },
+        "print": [
+          { "when": "on_start", "slip": "task" }
+        ]
+      },
+      {
+        "key": "1.1",
+        "title": "Hang up clothes and start next wash cycle",
+        "description": "Hang up the finished load, reload the machine, start the next cycle.",
+        "created": [
+          { "answered": { "step": "1", "answer": "no" } },
+          { "answered": { "step": "1.1", "answer": "no" } }
+        ],
+        "start": { "after_trigger": { "amount": 45, "unit": "minutes" } },
+        "time_limit": { "amount": 20, "unit": "minutes" },
+        "question": { "text": "Is this the last load?", "kind": "yes_no" },
+        "print": [
+          { "when": "on_start", "slip": "task" }
+        ]
+      },
+      {
+        "key": "1.2",
+        "title": "Hang up clothes",
+        "description": "Hang up the last load.",
+        "created": [
+          { "answered": { "step": "1", "answer": "yes" } },
+          { "answered": { "step": "1.1", "answer": "yes" } }
+        ],
+        "start": { "after_trigger": { "amount": 45, "unit": "minutes" } },
+        "time_limit": { "amount": 10, "unit": "minutes" },
+        "print": [
+          { "when": "on_start", "slip": "task" }
+        ]
+      },
+      {
+        "key": "2",
+        "title": "Trash run",
+        "description": "Get a bag, pick up the easy and the bulky trash in every room, empty each room's bin, take it all to the dump.",
+        "created": [
+          { "finished": { "step": "1" } },
+          { "finished": { "step": "1.2" } }
+        ],
+        "once": true,
+        "start": { "after_trigger": { "amount": 0, "unit": "minutes" } },
+        "time_limit": { "amount": 30, "unit": "minutes" },
+        "print": [
+          { "when": "on_create", "slip": "reminder" },
+          { "when": { "before_due": { "amount": 10, "unit": "minutes" } }, "slip": "task" }
+        ]
+      },
+      {
+        "key": "3",
+        "title": "Clean up {param}",
+        "description": "Clean up the {param}. Start a room from the sheet or by moving its task; the sheet's stop code finishes whatever rooms are in progress.",
+        "created": [
+          { "finished": { "step": "2" } }
+        ],
+        "start": "manual",
+        "fan_out": [ "bedroom", "office", "hallway", "bathroom", "living room", "kitchen" ],
+        "print": [
+          { "when": "on_create", "slip": "sheet" }
+        ]
+      },
+      {
+        "key": "4",
+        "title": "Put dried clothes away",
+        "description": "Put away the clothes hung up in 1.1 and 1.2. Not part of the root's work: the apartment counts as done without it.",
+        "created": [
+          { "finished": { "step": "1.2" } }
+        ],
+        "start": { "days_later_at": { "days": 1, "at": "09:00:00" } },
+        "counts_toward_root": false
+      }
+    ]
+  }
+}

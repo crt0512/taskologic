@@ -3,9 +3,12 @@ use serde::{Deserialize, Serialize};
 use taskologic_core::barcode::ScanAction;
 use taskologic_core::board::{Board, ColumnRole};
 use taskologic_core::event::EventKind;
-use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, ShortId, TaskId, TemplateId, Uid};
+use taskologic_core::ids::{
+    BoardId, ColumnId, PrintJobId, ProgramId, RunId, ShortId, TaskId, TemplateId, Uid,
+};
 use taskologic_core::prefs::{CardFields, UserPrefs};
 use taskologic_core::print::PrintJob;
+use taskologic_core::program::{Program, ProgramDraft};
 use taskologic_core::task::{Task, TaskDraft};
 use taskologic_core::template::{Template, TemplateOptions};
 use taskologic_core::user::{User, UserSummary};
@@ -72,6 +75,11 @@ pub struct BoardDetail {
     pub board: Board,
     /// Live tasks only, archived ones come from `ListArchived`.
     pub tasks: Vec<Task>,
+    /// How long tasks like each of these usually take, in seconds, for the
+    /// ones from a template or a program step with enough finished history
+    /// to say. Cards show it when the board or the user asks.
+    #[serde(default)]
+    pub estimates: Vec<(TaskId, i64)>,
 }
 
 /// Columns are named up front and the designated ones referenced by index
@@ -203,6 +211,17 @@ pub enum Request {
         position: Option<i64>,
         #[serde(default)]
         override_deps: bool,
+        /// The answer to the task's question, when a program gave it one
+        /// and this move finishes it. None on a question without a default
+        /// leaves it pending, to be answered later.
+        #[serde(default)]
+        answer: Option<String>,
+    },
+    /// Answer the question on a finished task of a program run, or finish
+    /// an unfinished one with the answer.
+    AnswerQuestion {
+        task_id: TaskId,
+        answer: String,
     },
     /// Moves the task to the archive marked as deleted. Anyone who can see
     /// the board can restore it until the retention period purges it.
@@ -260,6 +279,46 @@ pub enum Request {
     /// Template creator, board owner or admin.
     DeleteTemplate {
         template_id: TemplateId,
+    },
+
+    ListPrograms {
+        board_id: BoardId,
+    },
+    /// Any member can save a program, the way templates work.
+    CreateProgram {
+        board_id: BoardId,
+        draft: ProgramDraft,
+    },
+    /// Program creator, board owner or admin. Runs already going keep the
+    /// steps they started with.
+    UpdateProgram {
+        program_id: ProgramId,
+        draft: ProgramDraft,
+    },
+    DeleteProgram {
+        program_id: ProgramId,
+    },
+    /// Start a run: makes the root task, dated `start_at`, plus every step
+    /// that comes with it. `column_id` None means the board's first column.
+    StartProgram {
+        program_id: ProgramId,
+        column_id: Option<ColumnId>,
+        start_at: Option<DateTime<Utc>>,
+        /// The entries to fan out over for this run, per step key, for the
+        /// steps whose list the start dialog narrowed. Steps not named keep
+        /// the program's own list.
+        #[serde(default)]
+        fan_out: Vec<(String, Vec<String>)>,
+    },
+    /// Every run on one board, newest first.
+    ListRuns {
+        board_id: BoardId,
+    },
+    /// Stop a run reacting to anything. `delete_open` also deletes the
+    /// tasks it made that are still open; finished ones stay for history.
+    CancelRun {
+        run_id: RunId,
+        delete_open: bool,
     },
 
     /// Active repetitions on one board with their next fire time.
@@ -348,6 +407,15 @@ pub enum Response {
     Repeats {
         entries: Vec<RepeatEntry>,
     },
+    Program {
+        program: Program,
+    },
+    Programs {
+        programs: Vec<Program>,
+    },
+    Runs {
+        runs: Vec<RunEntry>,
+    },
     Analytics {
         rows: Vec<AnalyticsRow>,
     },
@@ -382,8 +450,9 @@ pub struct AnalyticsFilter {
     pub show_deleted: bool,
     pub assigned_to_me: bool,
     pub created_by_me: bool,
-    /// Only tasks stamped from a template or spawned by a repetition, which
-    /// are the only ones an average can be computed for.
+    /// Only tasks stamped from a template, spawned by a repetition or made
+    /// by a program step, which are the only ones an average can be
+    /// computed for.
     pub repeating_only: bool,
     /// Bounds on when the task was finished, or created if it never was.
     pub since: Option<DateTime<Utc>>,
@@ -463,6 +532,23 @@ pub struct HistoryEntry {
     pub kind: EventKind,
 }
 
+/// One row of the runs list: a started program and how far it got.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunEntry {
+    pub id: RunId,
+    /// The program's name when the run started; the program may be gone.
+    pub program_name: String,
+    pub root: Task,
+    pub started_by: Uid,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    /// Steps the root waits for that are still open, and that are done.
+    pub open_steps: u32,
+    pub done_steps: u32,
+}
+
 /// One row of the repeating tasks list.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RepeatEntry {
@@ -507,6 +593,18 @@ pub enum ScanOutcome {
     BlockedByDependencies {
         task_id: TaskId,
         open: Vec<TaskId>,
+    },
+    /// An answer code on a task that was finished already: the question is
+    /// answered and nothing moved.
+    Answered {
+        task: Box<Task>,
+        answer: String,
+    },
+    /// The stop code on a run's root: this many of its tasks that were in
+    /// the started column are finished now.
+    FinishedChildren {
+        root: Box<Task>,
+        finished: u32,
     },
 }
 
@@ -709,7 +807,8 @@ mod tests {
                 task_id: TaskId(5),
                 to_column: ColumnId(2),
                 position: None,
-                override_deps: false
+                override_deps: false,
+                answer: None,
             }
         );
         let line = r#"{"id":9,"request":{"type":"search","query":"plants"}}"#;

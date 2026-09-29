@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use taskologic_core::ids::TaskId;
 use taskologic_core::task::Task;
 
-use crate::app::{App, Conn, MIN_HEIGHT, MIN_WIDTH, Overlay};
+use crate::app::{App, Conn, MIN_HEIGHT, MIN_WIDTH, Overlay, QuestionThen};
 use crate::forms::task::conflict_lines;
 use adapter::{HasScreenCursor, checkbox_at, text_input};
 use card::CardCtx;
@@ -327,6 +327,7 @@ fn menu_items(app: &App) -> Vec<MenuItem> {
             ("Boards", 'b'),
             ("New task", 'n'),
             ("Templates", 'T'),
+            ("Programs", 'P'),
             ("Analytics", 'A'),
         ];
         if has_task {
@@ -593,12 +594,19 @@ fn board_body(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
             .count();
         (open, total)
     };
+    let estimates: std::collections::HashMap<TaskId, i64> = app
+        .board
+        .as_ref()
+        .map(|b| b.detail.estimates.iter().copied().collect())
+        .unwrap_or_default();
+    let estimate = move |task: &Task| -> Option<i64> { estimates.get(&task.id).copied() };
     let ctx = CardCtx {
         theme: t,
         fields,
         tz,
         names: &|u| names.get(&u).cloned().unwrap_or_else(|| format!("uid {u}")),
         deps: &deps,
+        estimate: &estimate,
         finished_col,
     };
 
@@ -719,7 +727,15 @@ fn board_body(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         let gap = 1u16;
         let heights: Vec<u16> = tasks
             .iter()
-            .map(|task| card::task_card_height(task, fields, (deps)(task).1, t.touch))
+            .map(|task| {
+                card::task_card_height(
+                    task,
+                    fields,
+                    (deps)(task).1,
+                    (estimate)(task).is_some(),
+                    t.touch,
+                )
+            })
             .collect();
         let fits_from = |start: usize| -> usize {
             let mut used = 0;
@@ -961,6 +977,12 @@ fn overlay(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         Overlay::Colors { form, .. } => form.render(f, area, t),
         Overlay::Printer { form, .. } => form.render(f, area, t),
         Overlay::TaskForm(form) => form.render(f, area, t),
+        Overlay::PrintRules { form, .. } => form.render(f, area, t),
+        Overlay::Programs(panel) => panel.render(f, area, t),
+        Overlay::ProgramForm(form) => form.render(f, area, t),
+        Overlay::StepForm { form, .. } => form.render(f, area, t),
+        Overlay::StartProgram(form) => form.render(f, area, t),
+        Overlay::Runs(panel) => panel.render(f, area, t),
         Overlay::Settings(form) => form.render(f, area, t),
         Overlay::BoardForm(form) => form.render(f, area, t),
         Overlay::Members(panel) => panel.render(f, area, t),
@@ -1032,10 +1054,38 @@ fn overlay(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
                     t.surface_dim(),
                 )),
             ];
+            if let Some(p) = &task.program {
+                let what = if p.is_root() {
+                    "the root of a program run".to_string()
+                } else {
+                    format!("step {} of a program run", p.label())
+                };
+                lines.push(Line::from(Span::styled(what, t.surface_dim())));
+                if let Some(q) = &p.question {
+                    let answers: Vec<String> = q
+                        .answers()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| format!("{} {a}", i + 1))
+                        .collect();
+                    let text = if p.pending_question {
+                        format!("Asks: {}  awaiting an answer, press {}", q.text, answers.join("  "))
+                    } else {
+                        format!("Asks when finished: {}", q.text)
+                    };
+                    let style = if p.pending_question {
+                        t.surface().patch(t.severity(taskologic_proto::Severity::Warning))
+                    } else {
+                        t.surface_dim()
+                    };
+                    lines.push(Line::from(Span::styled(text, style)));
+                }
+            }
             if let Some(start) = task.start_at {
                 lines.push(Line::from(format!(
-                    "Start: {}",
-                    start.with_timezone(&tz).format("%Y-%m-%d %H:%M")
+                    "Start: {}{}",
+                    start.with_timezone(&tz).format("%Y-%m-%d %H:%M"),
+                    if task.auto_start { "  (starts by itself then)" } else { "" }
                 )));
             }
             if let Some(due) = task.due_at {
@@ -1060,6 +1110,12 @@ fn overlay(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
                         None => "  a task on another board".to_string(),
                     };
                     lines.push(Line::from(text));
+                }
+            }
+            if !task.print_rules.is_empty() {
+                lines.push(Line::from("Prints:"));
+                for rule in &task.print_rules {
+                    lines.push(Line::from(format!("  {}", rule.summary(&name_of))));
                 }
             }
             if !task.description.trim().is_empty() {
@@ -1114,6 +1170,50 @@ fn overlay(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
             }
         }
         Overlay::Archive(panel) => panel.render(f, area, t),
+        Overlay::Question {
+            title,
+            question,
+            sel,
+            then,
+            areas,
+            area: popup_area,
+            ..
+        } => {
+            let answers = question.answers();
+            let mut lines: Vec<Line> = vec![
+                Line::from(Span::styled(title.clone(), t.surface_dim())),
+                Line::from(Span::styled(
+                    question.text.clone(),
+                    t.surface().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+            ];
+            let first = lines.len();
+            for (i, a) in answers.iter().enumerate() {
+                let style = if i == *sel { t.selected() } else { t.surface() };
+                lines.push(Line::from(Span::styled(format!(" {}  {a}", i + 1), style)));
+            }
+            lines.push(Line::from(""));
+            let hint = match then {
+                QuestionThen::Move { .. } => "Enter or the number answers and finishes   Esc leaves it where it was",
+                QuestionThen::Answer => "Enter or the number answers   Esc asks again later",
+            };
+            lines.push(Line::from(Span::styled(hint, t.surface_dim())));
+            let popup = centered(area, 70, lines.len() as u16 + 2);
+            f.render_widget(Clear, popup);
+            let block = surface_block("Question", t);
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            f.render_widget(Paragraph::new(lines).style(t.surface()), inner);
+            *popup_area = popup;
+            areas.clear();
+            for i in 0..answers.len() {
+                let y = inner.y + (first + i) as u16;
+                if y < inner.bottom() {
+                    areas.push(Rect::new(inner.x, y, inner.width, 1));
+                }
+            }
+        }
     }
 }
 
@@ -1129,6 +1229,7 @@ const HELP: &[&str] = &[
     "a               Archive (v views, D purges)",
     "t               Sort column by due date",
     "A               Analytics (time taken)",
+    "T               Templates   P  Programs",
     "/               Search   i  include archived",
     "N               New board (dashboard)",
     "D               Delete board (dashboard)",

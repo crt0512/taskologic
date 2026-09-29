@@ -24,6 +24,9 @@ pub enum SlipSection {
     Creator,
     Assignee,
     Dependencies,
+    /// The tasks a group sheet lists, each with its start code. Empty on
+    /// any other slip, so it costs a plain task slip nothing.
+    Sheet,
     BarcodeFinish,
     /// When the slip was printed.
     Timestamp,
@@ -31,7 +34,7 @@ pub enum SlipSection {
 
 impl SlipSection {
     /// Every section, in the order a new profile starts with.
-    pub const ALL: [SlipSection; 13] = [
+    pub const ALL: [SlipSection; 14] = [
         SlipSection::Custom,
         SlipSection::BoardTitle,
         SlipSection::TaskTitle,
@@ -43,6 +46,7 @@ impl SlipSection {
         SlipSection::Creator,
         SlipSection::Assignee,
         SlipSection::Dependencies,
+        SlipSection::Sheet,
         SlipSection::BarcodeFinish,
         SlipSection::Timestamp,
     ];
@@ -60,6 +64,7 @@ impl SlipSection {
             SlipSection::Creator => "Creator",
             SlipSection::Assignee => "Assignees",
             SlipSection::Dependencies => "Dependencies",
+            SlipSection::Sheet => "Group sheet: tasks and start codes",
             SlipSection::BarcodeFinish => "Barcode: finish",
             SlipSection::Timestamp => "Date and time",
         }
@@ -67,7 +72,10 @@ impl SlipSection {
 
     /// Whether this section draws a barcode, which text output cannot do.
     pub fn is_barcode(self) -> bool {
-        matches!(self, SlipSection::BarcodeStart | SlipSection::BarcodeFinish)
+        matches!(
+            self,
+            SlipSection::BarcodeStart | SlipSection::BarcodeFinish | SlipSection::Sheet
+        )
     }
 }
 
@@ -127,6 +135,7 @@ impl SlipLayout {
                 SlipRow::new(S::Creator, false, false, false, false),
                 SlipRow::new(S::Assignee, false, false, false, false),
                 SlipRow::new(S::Dependencies, true, false, true, true),
+                SlipRow::new(S::Sheet, true, false, false, true),
                 SlipRow::new(S::BarcodeFinish, true, false, false, true),
                 SlipRow::new(S::Timestamp, true, true, false, true),
             ],
@@ -229,6 +238,9 @@ impl SlipSet {
         match kind {
             PrintJobKind::Task => &self.task,
             PrintJobKind::Reminder => &self.reminder,
+            // A sheet is the root's task slip with its group listed in the
+            // sheet section, so it is shaped by the same layout.
+            PrintJobKind::Sheet => &self.task,
         }
     }
 }
