@@ -53,11 +53,12 @@ The short version of [barcode-commands.md](barcode-commands.md). Print the codes
 | `--1DEL--`                                  | archive, no confirmation                           |
 | `--1AM--` `--1AU--` `--1AT--`               | assign me / unassign me / toggle                   |
 | `--1PR--` `--1PF--` `--1PP--` `--1PC--`     | print reminder / finish / pause / both slips       |
-| `--1SH--`                                   | open the task                                      |
+| `--1SH--`                                   | open the task to read (view only)                  |
+| `--1ED--`                                   | open the task in the edit form                     |
 | `--1SEL--`                                  | apply the armed command to the highlighted task    |
 
 **Set a field on the next scanned task**: `--1S<field>--` opens the form on that field, `--1S<field>/<value>--` sets it straight away.
-Fields: `T` title, `D` description, `S` start, `U` due, `B` start and due together, `RS` / `RU` reminder before start / due, `A` assign, `C` checklist (`SC/V.text` adds, `SC3` ticks item 3), `X` exclude from stats. `--1SU/X--` clears the due date.
+Set codes fill the form when it is already open, so `--1ED/SEL--` then `--1ST/V.New title--` then `--1XF2--` edits the highlighted task by scan. Fields: `T` title, `D` description, `S` start, `U` due, `B` start and due together, `RS` / `RU` reminder before start / due, `A` assign, `C` checklist (`SC/V.text` adds, `SC3` ticks item 3), `X` exclude from stats. `--1SU/X--` clears the due date.
 
 **Boards, templates, programs** (printed where they live; `<id>` is the six character short id)
 

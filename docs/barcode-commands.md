@@ -26,7 +26,7 @@ Control codes are the other kind, framed by `--` on both ends, and they can do .
   - `--1DEL--` archives it
   - `--1PP--` prints its pause card
   - `--1AM--` assigns it to you
-  - `--1SH--` opens it. The status line says what is armed
+  - `--1SH--` opens it to read, `--1ED--` opens it in the edit form. The status line says what is armed
   - `--1SEL--` applies the armed command to the task highlighted on screen instead of a scan. 
   - A code printed sticky (`/STK`) stays armed for every scan until Esc or the timeout.
   - A "move to" without a column (`--1MC--`) asks on screen, columns numbered; a digit or Enter picks.

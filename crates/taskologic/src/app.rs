@@ -1953,7 +1953,7 @@ impl App {
                 Vec::new()
             }
             MoveLeft | MoveRight | MoveUp | MoveDown | MoveTop | MoveBottom | MoveTo(_) | Delete
-            | Print(_) | AssignMe | UnassignMe | ToggleAssign | Set(_) | Show(None) => {
+            | Print(_) | AssignMe | UnassignMe | ToggleAssign | Set(_) | Show(None) | Edit => {
                 let armed = Armed { command: cmd, values, sticky: false };
                 let label = armed.label();
                 self.control.arm(armed, self.now_ms);
@@ -2224,6 +2224,7 @@ impl App {
                 self.open_detail(task);
                 Vec::new()
             }
+            Edit => self.open_task_form(FormMode::Edit { task: task.id, version: task.version }, Some(&task)),
             _ => Vec::new(),
         }
     }
@@ -5709,6 +5710,27 @@ mod tests {
         ok(&mut app, id, orig.clone());
         let cmds = inject_all(&mut app, "--1UNDO--");
         assert!(matches!(sent(&cmds).1, Request::RestoreTask { task_id } if task_id == orig.id));
+    }
+
+    #[test]
+    fn ed_opens_the_edit_form_where_sh_opens_the_view() {
+        let mut app = ready_app(true);
+        open_board(&mut app);
+        inject_all(&mut app, "--1SH/SEL--");
+        assert!(matches!(app.overlay, Some(Overlay::TaskDetail { .. })), "view");
+        press(&mut app, KeyCode::Esc);
+        inject_all(&mut app, "--1ED/SEL--");
+        match &app.overlay {
+            Some(Overlay::TaskForm(form)) => assert!(matches!(form.mode, FormMode::Edit { task, .. } if task == TaskId(10))),
+            _ => panic!("expected the edit form"),
+        }
+        // With the form open, set codes fill it and F2 saves the edit.
+        inject_all(&mut app, "--1ST/V.Water the ferns--");
+        let cmds = inject_all(&mut app, "--1XF2--");
+        let Some(Cmd::Send(ClientMessage { request: Request::UpdateTask { task_id, draft, .. }, .. })) = cmds.first() else {
+            panic!("{cmds:?}");
+        };
+        assert_eq!((*task_id, draft.title.as_str()), (TaskId(10), "Water the ferns"));
     }
 
     #[test]

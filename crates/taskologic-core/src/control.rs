@@ -448,6 +448,8 @@ pub enum Control {
     /// Opens the next scanned task, or the one named.
     Show(Option<ShortId>),
     /// The highlighted task stands in for a scan.
+    /// Open the next scanned task in the edit form.
+    Edit,
     Selected,
     /// Modifier: the override stays armed after each use.
     Sticky,
@@ -501,6 +503,7 @@ impl Control {
             Show(None) => "SH".into(),
             Show(Some(id)) => format!("SH{id}"),
             Selected => "SEL".into(),
+            Edit => "ED".into(),
             Sticky => "STK".into(),
             Key(c) => format!("K{c}"),
             Named(k) => format!("X{}", k.code()),
@@ -545,6 +548,7 @@ impl Control {
             Show(None) => "show task".into(),
             Show(Some(id)) => format!("show task {id}"),
             Selected => "the selected task".into(),
+            Edit => "edit task".into(),
             Sticky => "sticky".into(),
             Key(c) => format!("press {c}"),
             Named(k) => format!("press {}", k.label()),
@@ -615,6 +619,7 @@ impl Control {
             "AT" => ToggleAssign,
             "SH" => Show(None),
             "SEL" => Selected,
+            "ED" => Edit,
             "STK" => Sticky,
             "GD" => Dashboard,
             "GN" => NextBoard,
@@ -935,6 +940,7 @@ pub fn entries(category: Category) -> Vec<Entry> {
                 Entry::armed("Unassign me", vec![UnassignMe]),
                 Entry::armed("Toggle assigning to me", vec![ToggleAssign]),
                 Entry::armed("Show the task", vec![Show(None)]),
+                Entry::armed("Edit the task", vec![Edit]),
             ];
             for f in [
                 Field::Title,
@@ -1091,7 +1097,7 @@ mod tests {
             MoveTo(None), MoveTo(Some(ColumnRef::Todo)), MoveTo(Some(ColumnRef::Index(3))), MoveTo(Some(ColumnRef::Last)),
             Delete, Print(SlipChoice::Pause), AssignMe, UnassignMe, ToggleAssign,
             Set(Field::Title), Set(Field::RemindDue), Set(Field::StartAndDue), Set(Field::ChecklistItem(4)), Set(Field::ExcludeFromStats),
-            Show(None), Show(Some(id("K4M9Q2"))), Selected, Sticky,
+            Show(None), Show(Some(id("K4M9Q2"))), Edit, Selected, Sticky,
             Key('T'), Key('n'), Key('?'), Named(NamedKey::BackTab), Named(NamedKey::F(1)), Named(NamedKey::F(12)), NamedTimes(NamedKey::Tab, 3), NamedTimes(NamedKey::BackTab, 12), Dashboard, NextBoard, PrevBoard,
             Search { archive: false }, Search { archive: true }, Ping, Undo, Insert, Replace,
             Value(self::Value::Now), Value(self::Value::Today), Value(self::Value::Time),
