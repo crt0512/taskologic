@@ -29,6 +29,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, ListItem};
 
+use crate::ui::adapter::ListState;
 use crate::ui::theme::Theme;
 
 /// Places widgets left to right on one line.
@@ -87,6 +88,54 @@ pub fn button_w(label: &str) -> u16 {
 /// Rows a button takes: three when "bigger buttons" is on, one otherwise.
 pub fn button_h(t: &Theme) -> u16 {
     if t.touch { 3 } else { 1 }
+}
+
+/// Touch scrolling for a list: `^` and `v` in its bottom right corner when
+/// there is something off screen, the way a board column scrolls. Drawn
+/// after the list; keep what comes back for [`list_arrow_tap`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListArrows {
+    pub up: Option<Rect>,
+    pub down: Option<Rect>,
+}
+
+pub fn list_arrows(f: &mut Frame, area: Rect, state: &ListState, t: &Theme) -> ListArrows {
+    let mut out = ListArrows::default();
+    if area.height == 0 || area.width < 8 {
+        return out;
+    }
+    let y = area.bottom().saturating_sub(1);
+    if state.offset() > 0 {
+        let r = Rect::new(area.right().saturating_sub(7), y, 3, 1);
+        f.render_widget(Paragraph::new(" ^ ").style(t.hover_if(t.button(), r)), r);
+        out.up = Some(r);
+    }
+    if state.offset() + state.page_len() < state.rows() {
+        let r = Rect::new(area.right().saturating_sub(4), y, 3, 1);
+        f.render_widget(Paragraph::new(" v ").style(t.hover_if(t.button(), r)), r);
+        out.down = Some(r);
+    }
+    out
+}
+
+/// A tap on one of the arrows moves the selection a page that way, which
+/// scrolls the list along with it, and says whether it did.
+pub fn list_arrow_tap(ev: &Event, arrows: ListArrows, state: &mut ListState) -> bool {
+    let Event::Mouse(m) = ev else { return false };
+    if !matches!(m.kind, MouseEventKind::Down(_)) {
+        return false;
+    }
+    let pos = Position::new(m.column, m.row);
+    let page = state.page_len().max(1);
+    if arrows.up.is_some_and(|r| r.contains(pos)) {
+        state.move_up(page);
+        return true;
+    }
+    if arrows.down.is_some_and(|r| r.contains(pos)) {
+        state.move_down(page);
+        return true;
+    }
+    false
 }
 
 /// A press of a mouse button (or a finger) somewhere other than `window`.

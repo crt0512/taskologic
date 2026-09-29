@@ -11,7 +11,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Clear, ListItem, Paragraph, Wrap};
 use taskologic_core::control::{self, Asks, Category, ColumnRef, Control, Entry, Unit, Value};
 
-use super::{Row, button_bar, button_h, check_w, clicked_outside, frame_block, label, popup, split_label, tall_item};
+use super::{ListArrows, Row, button_bar, button_h, check_w, clicked_outside, frame_block, label, list_arrow_tap, list_arrows, popup, split_label, tall_item};
 use crate::ui::adapter::{checkbox_at, dropdown, dropdown_marker, dropdown_popup_hover};
 use crate::ui::adapter::{
     ButtonOutcome, ButtonState, CheckboxState, ChoiceState, Focus, FocusBuilder, HandleEvent,
@@ -89,6 +89,8 @@ pub struct CodesPanel {
     view: View,
     list: ListState,
     area: Rect,
+    /// The scroll arrows drawn last, for taps.
+    arrows: ListArrows,
     /// Print overrides so they stay armed until Esc.
     sticky: CheckboxState,
     print_btn: ButtonState,
@@ -116,6 +118,7 @@ impl CodesPanel {
             view: View::Categories,
             list,
             area: Rect::default(),
+            arrows: ListArrows::default(),
             sticky: CheckboxState::named("sticky"),
             print_btn: ButtonState::new(),
             all_btn: ButtonState::new(),
@@ -307,6 +310,9 @@ impl CodesPanel {
         };
         if clicked_outside(ev, self.area) {
             return CodesOutcome::Cancel;
+        }
+        if list_arrow_tap(ev, self.arrows, &mut self.list) {
+            return CodesOutcome::Changed;
         }
         // An ask has its own keys: Enter answers, Esc goes back.
         if let View::Ask { from, ask } = &mut self.view {
@@ -583,6 +589,7 @@ impl CodesPanel {
                         .collect(),
                 };
                 f.render_stateful_widget(list(items, t), l, &mut self.list);
+                self.arrows = list_arrows(f, l, &self.list, t);
             }
         }
         if let Some(e) = &self.error {
@@ -767,6 +774,36 @@ mod tests {
         term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
         let second = p.list.row_areas[1];
         assert!(matches!(p.handle(&click(second.x + 2, second.y + 1)), CodesOutcome::Print { .. }));
+    }
+
+    #[test]
+    fn a_long_list_grows_arrows_that_page_the_selection() {
+        use crossterm::event::{KeyModifiers, MouseEvent};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut p = CodesPanel::new();
+        p.handle(&key(KeyCode::Enter)); // next scanned task: thirty odd entries
+        let theme = crate::ui::theme::Theme::default().with_touch(true);
+        let mut term = Terminal::new(TestBackend::new(100, 44)).unwrap();
+        term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        assert!(p.arrows.up.is_none(), "at the top");
+        let down = p.arrows.down.expect("more below");
+        let tap = |r: Rect| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x + 1,
+                row: r.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert_eq!(p.handle(&tap(down)), CodesOutcome::Changed);
+        let after = p.list.selected().unwrap();
+        assert!(after > 0, "a page down: {after}");
+        term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        assert!(p.list.offset() > 0, "and the list scrolled with it");
+        let up = p.arrows.up.expect("now something is above");
+        p.handle(&tap(up));
+        assert!(p.list.selected().unwrap() < after);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use taskologic_core::ids::{BoardId, RunId, Uid};
 use taskologic_core::task::Task;
 use taskologic_proto::RunEntry;
 
-use super::{button_bar, button_h, frame_block, popup};
+use super::{ListArrows, button_bar, button_h, frame_block, list_arrow_tap, list_arrows, popup};
 use crate::ui::adapter::{
     ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, ListState, Outcome,
     Regular, list, render_button,
@@ -35,6 +35,8 @@ pub struct RunsPanel {
     names: HashMap<Uid, String>,
     entries: Vec<RunEntry>,
     list: ListState,
+    /// The scroll arrows drawn last, for taps.
+    arrows: ListArrows,
     view_btn: ButtonState,
     keep_btn: ButtonState,
     delete_btn: ButtonState,
@@ -52,6 +54,7 @@ impl RunsPanel {
             names,
             entries: Vec::new(),
             list,
+            arrows: ListArrows::default(),
             view_btn: ButtonState::new(),
             keep_btn: ButtonState::new(),
             delete_btn: ButtonState::new(),
@@ -95,6 +98,9 @@ impl RunsPanel {
     }
 
     pub fn handle(&mut self, ev: &Event) -> RunsOutcome {
+        if list_arrow_tap(ev, self.arrows, &mut self.list) {
+            return RunsOutcome::Changed;
+        }
         let key = match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => Some(k.code),
             _ => None,
@@ -188,6 +194,7 @@ impl RunsPanel {
                 .collect()
         };
         f.render_stateful_widget(list(items, t), l, &mut self.list);
+        self.arrows = list_arrows(f, l, &self.list, t);
         f.render_widget(
             Paragraph::new("cancelling stops the run; finished tasks always stay on the board")
                 .style(t.surface_dim()),
