@@ -18,6 +18,7 @@ use crate::barcode::ScanAction;
 use crate::board::Board;
 use crate::ids::{BoardId, ColumnId, ProgramId, RunId, TaskId, Uid};
 use crate::offset::{MAX_OFFSET_AMOUNT, Offset};
+use crate::template::DEFAULT_MIN_SAMPLES;
 use crate::print::{PrintRule, SlipKind};
 use crate::repeat::local_to_utc;
 use crate::task::{ChecklistItem, TaskDraft, TaskError, validate_print_rules, validate_title};
@@ -39,15 +40,37 @@ pub struct Program {
     pub name: String,
     pub description: String,
     pub steps: Vec<Step>,
+    /// How many finished tasks of a step there have to be before the board
+    /// shows an estimate for that step (the root's is the whole run). One
+    /// long afternoon must not become everybody's estimate, so it starts at
+    /// [`DEFAULT_MIN_SAMPLES`]; a program that runs rarely may want fewer.
+    #[serde(default = "default_min_samples")]
+    pub min_samples: u32,
+}
+
+fn default_min_samples() -> u32 {
+    DEFAULT_MIN_SAMPLES
 }
 
 /// What a client sends to save a program: everything but the ids.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProgramDraft {
     pub name: String,
     pub description: String,
     pub steps: Vec<Step>,
+    pub min_samples: u32,
+}
+
+impl Default for ProgramDraft {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            steps: Vec::new(),
+            min_samples: DEFAULT_MIN_SAMPLES,
+        }
+    }
 }
 
 impl Program {
@@ -56,6 +79,7 @@ impl Program {
             name: self.name.clone(),
             description: self.description.clone(),
             steps: self.steps.clone(),
+            min_samples: self.min_samples,
         }
     }
 }
@@ -312,6 +336,8 @@ pub enum ProgramError {
     NameTooLong,
     #[error("a program needs a step with the key \"{ROOT_KEY}\"")]
     NoRoot,
+    #[error("an estimate needs at least one finished task to come from")]
+    NoSamples,
     #[error("every step needs a key")]
     EmptyKey,
     #[error("the key {0:?} is used twice")]
@@ -356,6 +382,9 @@ pub fn validate(draft: &ProgramDraft, board: &Board) -> Result<(), ProgramError>
     }
     if !draft.steps.iter().any(Step::is_root) {
         return Err(ProgramError::NoRoot);
+    }
+    if draft.min_samples == 0 {
+        return Err(ProgramError::NoSamples);
     }
     let mut keys: Vec<&str> = Vec::new();
     for step in &draft.steps {

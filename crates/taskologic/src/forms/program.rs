@@ -8,11 +8,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Clear, ListItem, Paragraph};
 use taskologic_core::ids::{BoardId, ProgramId};
+use taskologic_core::template::DEFAULT_MIN_SAMPLES;
 use taskologic_core::program::{
     Program, ProgramDraft, ROOT_KEY, Step, start_rule_summary, triggers_summary,
 };
 
-use super::{button_bar, button_h, button_row, frame_block, label, popup, split_label};
+use super::{Row, button_bar, button_h, button_row, frame_block, label, popup, split_label};
 use crate::ui::adapter::{
     ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, HasScreenCursor,
     ListState, Outcome, Regular, TextInputState, field, list, render_button,
@@ -35,6 +36,8 @@ pub struct ProgramForm {
     pub program_id: Option<ProgramId>,
     name: TextInputState,
     description: TextInputState,
+    /// Finished tasks of a step before the board shows its estimate.
+    min_samples: TextInputState,
     steps: Vec<Step>,
     list: ListState,
     add: ButtonState,
@@ -60,6 +63,11 @@ impl ProgramForm {
             program_id,
             name,
             description: TextInputState::named("description"),
+            min_samples: {
+                let mut s = TextInputState::named("min_samples");
+                s.set_text(DEFAULT_MIN_SAMPLES.to_string());
+                s
+            },
             steps,
             list,
             add: ButtonState::new(),
@@ -91,6 +99,7 @@ impl ProgramForm {
         let mut f = Self::blank(program.board_id, Some(program.id), program.steps.clone());
         f.name.set_text(program.name.clone());
         f.description.set_text(program.description.clone());
+        f.min_samples.set_text(program.min_samples.to_string());
         f
     }
 
@@ -121,6 +130,7 @@ impl ProgramForm {
         let mut b = FocusBuilder::new(None);
         b.widget(&self.name)
             .widget(&self.description)
+            .widget(&self.min_samples)
             .widget(&self.list)
             .widget(&self.add)
             .widget(&self.edit)
@@ -228,6 +238,7 @@ impl ProgramForm {
         }
         self.name.handle(ev, Regular);
         self.description.handle(ev, Regular);
+        self.min_samples.handle(ev, Regular);
         self.list.handle(ev, Regular);
         ProgramOutcome::Changed
     }
@@ -255,10 +266,19 @@ impl ProgramForm {
         if self.steps.iter().find(|s| s.is_root()).is_none_or(|r| r.title.trim().is_empty()) {
             return Err("give the root step a title, it is the task the program starts with".into());
         }
+        let min_samples: u32 = self
+            .min_samples
+            .text()
+            .trim()
+            .parse()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| "the estimate needs a whole number of finished tasks, at least 1".to_string())?;
         Ok(ProgramDraft {
             name,
             description: self.description.text().trim().to_string(),
             steps: self.steps.clone(),
+            min_samples,
         })
     }
 
@@ -279,7 +299,9 @@ impl ProgramForm {
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
         let bh = button_h(t);
-        let p = popup(area, 84, 22 + bh);
+        // Most of the screen, whatever its size, with three cells of desktop
+        // around it: a program is read as a list and wants the room.
+        let p = popup(area, area.width.saturating_sub(6), area.height.saturating_sub(6));
         f.render_widget(Clear, p);
         let title = if self.program_id.is_some() {
             " Edit program "
@@ -294,7 +316,7 @@ impl ProgramForm {
         let block = frame_block(title, hint, t);
         let inner = block.inner(p);
         f.render_widget(block, p);
-        let [name_row, desc_row, _, heading, steps, step_buttons, err, buttons] = Layout::vertical([
+        let [name_row, desc_row, est_row, heading, steps, step_buttons, err, buttons] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -312,6 +334,16 @@ impl ProgramForm {
         let (l, w) = split_label(desc_row, lw);
         label(f, l, "Description", t);
         f.render_stateful_widget(field(t), w, &mut self.description);
+        let (l, w) = split_label(est_row, lw);
+        label(f, l, "Estimate", t);
+        let mut r = Row::new(w);
+        f.render_widget(Paragraph::new("after").style(t.surface_dim()), r.text("after"));
+        f.render_stateful_widget(field(t), r.take(4), &mut self.min_samples);
+        f.render_widget(
+            Paragraph::new("finished tasks of a step, the board shows how long it usually takes")
+                .style(t.surface_dim()),
+            r.rest(),
+        );
         f.render_widget(
             Paragraph::new("Steps, in the order they are listed. Every program has a root step.")
                 .style(t.surface_dim()),
@@ -337,7 +369,11 @@ impl ProgramForm {
         let (save, cancel) = button_row(buttons, " Save ", " Cancel ", t);
         render_button(f, save, " Save ", &mut self.save, t);
         render_button(f, cancel, " Cancel ", &mut self.cancel, t);
-        if let Some(pos) = [self.name.screen_cursor(), self.description.screen_cursor()]
+        if let Some(pos) = [
+            self.name.screen_cursor(),
+            self.description.screen_cursor(),
+            self.min_samples.screen_cursor(),
+        ]
             .into_iter()
             .flatten()
             .next()
@@ -385,6 +421,32 @@ mod tests {
         let draft = form.values().unwrap();
         assert_eq!(draft.name, "Clean up");
         assert_eq!(draft.steps[0].title, "Clean up the flat");
+    }
+
+    #[test]
+    fn the_editor_takes_the_screen_but_for_three_cells_around() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut form = ProgramForm::create(BoardId(1));
+        for (w, h) in [(100u16, 40u16), (80, 24), (160, 60)] {
+            let theme = crate::ui::theme::Theme::default();
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| form.render(f, f.area(), &theme)).unwrap();
+            let out = term.backend().to_string();
+            let lines: Vec<&str> = out.lines().collect();
+            let framed: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains('│') || l.contains('─'))
+                .map(|(y, _)| y)
+                .collect();
+            assert_eq!((framed[0], *framed.last().unwrap()), (3, h as usize - 4), "{w}x{h}:\n{out}");
+            // The test backend quotes each line; count in characters past it.
+            let top = lines[3].trim_matches('"');
+            let first = top.chars().take_while(|c| c.is_whitespace()).count();
+            let last = top.trim_end().chars().count() - 1;
+            assert_eq!((first, last), (3, w as usize - 4), "{w}x{h}:\n{out}");
+        }
     }
 
     #[test]

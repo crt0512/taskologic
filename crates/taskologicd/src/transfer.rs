@@ -1181,14 +1181,15 @@ fn import_board_rows(
 
     for p in &b.programs {
         c.execute(
-            "INSERT INTO programs (board_id, owner_uid, name, description, steps_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO programs (board_id, owner_uid, name, description, steps_json, min_samples) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 new_board.0,
                 i64::from(p.owner_uid),
                 p.name,
                 p.description,
-                serde_json::to_string(&p.steps)?
+                serde_json::to_string(&p.steps)?,
+                i64::from(p.min_samples)
             ],
         )?;
         m.programs.insert(p.id, ProgramId(c.last_insert_rowid()));
@@ -1547,7 +1548,7 @@ fn remap_users(
     if people.is_empty() {
         return Err(AppError::bad(
             "this file names nobody, so there are no usernames to match; only files written by \
-             Taskologic 0.1.12 or later carry them",
+             Taskologic 0.1.13 or later carry them",
         ));
     }
     let mut local: HashMap<String, Uid> = HashMap::new();
@@ -1638,6 +1639,7 @@ mod tests {
     fn a_program_round_trips_and_loses_only_the_people_the_other_board_lacks() {
         let (db, from, to) = db_with_boards();
         let draft = ProgramDraft {
+            min_samples: 3,
             name: "Clean up".into(),
             description: "the flat".into(),
             steps: vec![
@@ -1818,6 +1820,7 @@ mod tests {
                 from.id,
                 1,
                 &ProgramDraft {
+                    min_samples: 3,
                     name: "Clean up".into(),
                     description: String::new(),
                     steps: vec![Step {
@@ -1977,14 +1980,11 @@ mod tests {
         // The same file as another server would have written it: alice was
         // 501 there, bob 502, and dave is somebody this server never had.
         let mut foreign = original.clone();
-        assert_eq!(remap_uids(&mut foreign, &HashMap::from([(1, 501), (2, 502)])), {
-            let mut n = HashSet::new();
-            uids_in(&foreign, &mut n);
-            assert_eq!(n, HashSet::from([501, 502]));
-            // Every place a uid sat got rewritten, the users list included.
-            foreign["users"][0]["uid"].as_u64().unwrap();
-            serde_json::to_string(&original).unwrap().matches("1").count() * 0 + count_uids(&original)
-        });
+        let changed = remap_uids(&mut foreign, &HashMap::from([(1, 501), (2, 502)]));
+        assert_eq!(changed, count_uids(&original), "every place a uid sat was rewritten");
+        let mut left = HashSet::new();
+        uids_in(&foreign, &mut left);
+        assert_eq!(left, HashSet::from([501, 502]), "the users list included");
         foreign["users"]
             .as_array_mut()
             .unwrap()
@@ -2020,7 +2020,7 @@ mod tests {
         let fresh = Db::open_in_memory().unwrap();
         let notes = fresh.tx(|c| import_everything(c, &json, false)).unwrap();
         assert!(notes.iter().any(|n| n.starts_with("no accounts made for the 2 people")), "{notes:?}");
-        assert!(fresh.with(|c| repo::list_users(c)).unwrap().is_empty());
+        assert!(fresh.with(repo::list_users).unwrap().is_empty());
         assert_eq!(fresh.with(|c| repo::list_tasks(c, BoardId(1), false)).unwrap().len(), 2);
         // And a whole server file is what --import-all wants.
         let err = fresh.tx(|c| import_everything(c, &json, true)).unwrap_err();

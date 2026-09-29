@@ -383,6 +383,7 @@ mod tests {
 
     fn program() -> Program {
         Program {
+            min_samples: 3,
             id: ProgramId(3),
             board_id: BoardId(1),
             owner_uid: 1,

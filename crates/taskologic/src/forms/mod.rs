@@ -22,10 +22,11 @@ pub mod task;
 pub mod templates;
 pub mod users;
 
+use crossterm::event::{Event, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, ListItem};
 
 use crate::ui::theme::Theme;
 
@@ -85,6 +86,29 @@ pub fn button_w(label: &str) -> u16 {
 /// Rows a button takes: three when "bigger buttons" is on, one otherwise.
 pub fn button_h(t: &Theme) -> u16 {
     if t.touch { 3 } else { 1 }
+}
+
+/// A press of a mouse button (or a finger) somewhere other than `window`.
+/// Panels that are lists use it to close on a click on the board behind
+/// them, which is what the click was for. Nothing before the first draw.
+pub fn clicked_outside(ev: &Event, window: Rect) -> bool {
+    match ev {
+        Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
+            window.width > 0 && !window.contains(Position::new(m.column, m.row))
+        }
+        _ => false,
+    }
+}
+
+/// A list entry that is as tall as a button: three rows with the text in
+/// the middle when "bigger buttons" is on, so a finger lands on it, one
+/// row otherwise.
+pub fn tall_item<'a>(text: String, t: &Theme) -> ListItem<'a> {
+    if t.touch {
+        ListItem::new(vec![Line::raw(""), Line::raw(text), Line::raw("")])
+    } else {
+        ListItem::new(text)
+    }
 }
 
 /// A row of buttons along the bottom of a panel, each as wide as its label.

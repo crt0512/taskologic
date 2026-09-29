@@ -13,15 +13,7 @@
 #   scripts/transfer.sh users remap     server.json [remapped.json]
 #
 # Without a file an export prints to stdout; an import reads "-" as stdin.
-# Everything here needs root or a Taskologic admin. To move to another
-# server: export there, copy the file here, "users remap" it so the old
-# server's uids become this one's by username, then import it. A board
-# arrives as a new board; an import stops if its name is taken already.
-#
-# These are one shot commands of taskologicd, run here with the right binary
-# and config: the installed ones on a server, the checkout's own under dev/
-# when there is one. The database belongs to the daemon user, so on a server
-# they run through sudo; a file written that way is handed back to you.
+
 set -eu
 
 fail() { echo "error: $1" >&2; exit 1; }

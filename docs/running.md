@@ -33,6 +33,12 @@ went to 3 at the same time: a 0.1.11 client is refused by a 0.1.12 daemon
 rather than allowed to strip the new fields off every task it saves. Anyone
 with a session open has to log out and back in to get the new client.
 
+0.1.13 adds migration 0012, one column with a default: how many finished
+tasks a program wants before the board shows an estimate. Programs saved by
+0.1.12 keep loading, a "next day at" start rule included, which reads as one
+day. The protocol went to 4, since a 0.1.12 client cannot read the new start
+rule; the same log out and back in applies.
+
 ## Moving things around: programs, templates, boards, whole servers
 
 `scripts/transfer.sh` writes things to JSON files and reads them back, here

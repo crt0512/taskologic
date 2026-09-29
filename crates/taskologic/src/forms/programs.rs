@@ -10,7 +10,7 @@ use ratatui::widgets::{Clear, ListItem, Paragraph};
 use taskologic_core::ids::{BoardId, Uid};
 use taskologic_core::program::Program;
 
-use super::{button_bar, button_h, frame_block, popup};
+use super::{button_bar, button_h, clicked_outside, frame_block, popup, tall_item};
 use crate::ui::adapter::{
     ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, ListState, Outcome,
     Regular, list, render_button,
@@ -31,6 +31,8 @@ pub enum ProgramsOutcome {
 pub struct ProgramsPanel {
     pub board_id: BoardId,
     me: Uid,
+    /// Where the window was last drawn; a click anywhere else closes it.
+    area: Rect,
     privileged: bool,
     programs: Vec<(Program, String)>,
     list: ListState,
@@ -48,6 +50,7 @@ impl ProgramsPanel {
         let list = ListState::named("programs");
         list.focus().set(true);
         Self {
+            area: Rect::default(),
             board_id,
             me,
             privileged,
@@ -116,7 +119,7 @@ impl ProgramsPanel {
             Event::Key(k) if k.kind != KeyEventKind::Release => Some(k.code),
             _ => None,
         };
-        if matches!(key, Some(KeyCode::Esc | KeyCode::Char('q'))) {
+        if matches!(key, Some(KeyCode::Esc | KeyCode::Char('q'))) || clicked_outside(ev, self.area) {
             return ProgramsOutcome::Cancel;
         }
         let mut focus = self.focus();
@@ -163,7 +166,9 @@ impl ProgramsPanel {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
-        let p = popup(area, 70, 18);
+        // The same window as a task's, so the panels line up.
+        let p = popup(area, 78, 32 + button_h(t));
+        self.area = p;
         f.render_widget(Clear, p);
         let block = frame_block(
             " Programs ",
@@ -189,11 +194,14 @@ impl ProgramsPanel {
                 .iter()
                 .map(|(p, owner)| {
                     let steps = p.steps.len().saturating_sub(1);
-                    ListItem::new(format!(
-                        "{:<28} {steps} step{}  by {owner}",
-                        p.name,
-                        if steps == 1 { "" } else { "s" }
-                    ))
+                    tall_item(
+                        format!(
+                            "{:<28} {steps} step{}  by {owner}",
+                            p.name,
+                            if steps == 1 { "" } else { "s" }
+                        ),
+                        t,
+                    )
                 })
                 .collect()
         };

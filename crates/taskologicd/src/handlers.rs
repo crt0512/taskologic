@@ -1315,30 +1315,38 @@ fn columns_changed(state: &AppState, s: &Session, board_id: taskologic_core::ids
 
 /// A board with its live tasks and, for the tasks that come from a
 /// template or a program step, how long that kind of task usually takes.
-/// Nothing is said until [`DEFAULT_MIN_SAMPLES`] of them have finished: one
-/// long afternoon must not become everybody's estimate.
+/// Nothing is said until enough of them have finished, one long afternoon
+/// must not become everybody's estimate: [`DEFAULT_MIN_SAMPLES`] for a
+/// template, and for a program step as many as the program asks for.
 fn board_detail(c: &rusqlite::Connection, board: Board) -> Result<BoardDetail, AppError> {
     let tasks = repo::list_tasks(c, board.id, false)?;
     let now = Utc::now();
     let identities = repo::run_identities(c)?;
+    // A run whose program is gone keeps the default.
+    let wanted: HashMap<String, u32> = repo::list_programs(c, board.id)?
+        .into_iter()
+        .map(|p| (format!("program:{}", p.id), p.min_samples))
+        .collect();
     let mut cache: HashMap<String, Option<i64>> = HashMap::new();
     let mut estimates = Vec::new();
     for task in &tasks {
         if task.is_done(&board) {
             continue;
         }
-        let (key, lookup): (String, Box<dyn Fn() -> Average>) =
+        let (key, need, lookup): (String, u32, Box<dyn Fn() -> Average>) =
             match (&task.program, task.template_id) {
                 (Some(p), _) => {
                     let Some(identity) = identities.get(&p.run).cloned() else {
                         continue;
                     };
+                    let need = wanted.get(&identity).copied().unwrap_or(DEFAULT_MIN_SAMPLES);
                     let step = p.step.clone();
                     let key = format!("{identity}/{step}");
-                    (key, Box::new(move || repo::step_average(c, &identity, &step, now)))
+                    (key, need, Box::new(move || repo::step_average(c, &identity, &step, now)))
                 }
                 (None, Some(tpl)) => (
                     format!("template:{tpl}"),
+                    DEFAULT_MIN_SAMPLES,
                     Box::new(move || repo::template_average(c, tpl, now)),
                 ),
                 (None, None) => continue,
@@ -1347,7 +1355,7 @@ fn board_detail(c: &rusqlite::Connection, board: Board) -> Result<BoardDetail, A
             Some(s) => *s,
             None => {
                 let s = lookup()?
-                    .filter(|(_, n)| *n >= DEFAULT_MIN_SAMPLES)
+                    .filter(|(_, n)| *n >= need)
                     .map(|(d, _)| d.num_seconds());
                 cache.insert(key, s);
                 s
@@ -2459,6 +2467,7 @@ mod tests {
     /// fan-out, the same shape the core tests use.
     fn apartment() -> ProgramDraft {
         ProgramDraft {
+            min_samples: 3,
             name: "Clean up".into(),
             description: String::new(),
             steps: vec![
@@ -2703,6 +2712,7 @@ mod tests {
         let st = state();
         let board = make_board(&st, 1, false, &[]);
         let draft = ProgramDraft {
+            min_samples: 3,
             name: "Two jobs".into(),
             description: String::new(),
             steps: vec![
@@ -2925,6 +2935,7 @@ mod tests {
             answer: a.into(),
         };
         ProgramDraft {
+            min_samples: 3,
             name: "Laundry".into(),
             description: String::new(),
             steps: vec![
@@ -3219,6 +3230,7 @@ mod tests {
         let st = state();
         let board = make_board(&st, 1, false, &[]);
         let draft = ProgramDraft {
+            min_samples: 3,
             name: "Kettle".into(),
             description: String::new(),
             steps: vec![
@@ -3272,6 +3284,78 @@ mod tests {
             .map(|(_, s)| *s)
             .expect("three finished runs make an estimate for the root");
         assert!(root_estimate < 60, "{root_estimate}s");
+    }
+
+    #[test]
+    fn a_program_says_how_many_finished_tasks_its_estimate_needs() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let one_run_is_enough = ProgramDraft {
+            name: "Coffee".into(),
+            min_samples: 1,
+            steps: vec![
+                Step {
+                    key: program::ROOT_KEY.into(),
+                    title: "Coffee".into(),
+                    ..Default::default()
+                },
+                step("grind", vec![Trigger::WithRoot]),
+            ],
+            ..Default::default()
+        };
+        let program = make_program(&st, 1, &board, one_run_is_enough);
+        let estimate_for = |title: &str| {
+            let detail = match handle(&st, &session(1), Request::GetBoard { board_id: board.id }).unwrap() {
+                Response::Board(d) => d,
+                other => panic!("{other:?}"),
+            };
+            let task = detail
+                .tasks
+                .iter()
+                .find(|t| t.title == title && t.column_id != board.finished_col)
+                .unwrap();
+            detail.estimates.iter().find(|(id, _)| *id == task.id).map(|(_, s)| *s)
+        };
+        // One run: its grind took ten minutes.
+        let root = start_program(&st, 1, &program);
+        move_to(&st, 1, root.id, board.started_col);
+        let grind = live_tasks(&st, &board)
+            .into_iter()
+            .find(|t| t.title == "Step grind")
+            .unwrap();
+        created_secs_ago(&st, grind.id, 20_000);
+        move_at(&st, 1, grind.id, board.started_col, 10_000);
+        move_at(&st, 1, grind.id, board.finished_col, 9_400);
+        // The second run's grind already carries an estimate, since one is
+        // all this program asks for.
+        start_program(&st, 1, &program);
+        assert_eq!(estimate_for("Step grind"), Some(600));
+        // Asking for the usual three again takes it away.
+        let mut stricter = program.draft();
+        stricter.min_samples = 3;
+        handle(
+            &st,
+            &session(1),
+            Request::UpdateProgram {
+                program_id: program.id,
+                draft: stricter,
+            },
+        )
+        .unwrap();
+        assert_eq!(estimate_for("Step grind"), None);
+        // And zero is refused: an estimate has to come from something.
+        let mut nothing = program.draft();
+        nothing.min_samples = 0;
+        let err = handle(
+            &st,
+            &session(1),
+            Request::UpdateProgram {
+                program_id: program.id,
+                draft: nothing,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at least one finished task"), "{err}");
     }
 
     #[test]

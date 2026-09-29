@@ -32,6 +32,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0009_print_rules.sql")),
         M::up(include_str!("../../migrations/0010_programs.sql")),
         M::up(include_str!("../../migrations/0011_auto_start.sql")),
+        M::up(include_str!("../../migrations/0012_program_min_samples.sql")),
     ])
 }
 
@@ -217,6 +218,16 @@ mod migration_tests {
                 .unwrap();
             assert_eq!(n, 0, "{table} exists and is empty");
         }
+        // And a program written before the estimate count was a setting
+        // keeps the three it always had.
+        let min: i64 = conn
+            .query_row(
+                "SELECT dflt_value FROM pragma_table_info('programs') WHERE name = 'min_samples'",
+                [],
+                |r| r.get::<_, String>(0).map(|v| v.parse().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(min, 3);
 
         // The rebuilt bookkeeping table keeps what it knew, labelled.
         let (kind, anchor): (String, i64) = conn

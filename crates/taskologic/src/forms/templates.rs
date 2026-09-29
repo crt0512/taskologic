@@ -10,7 +10,7 @@ use ratatui::widgets::{Clear, ListItem, Paragraph};
 use taskologic_core::ids::{BoardId, Uid};
 use taskologic_core::template::Template;
 
-use super::{button_bar, button_h, frame_block, popup};
+use super::{button_bar, button_h, clicked_outside, frame_block, popup, tall_item};
 use crate::ui::adapter::{
     ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, ListState, Outcome,
     Regular, list, render_button,
@@ -30,6 +30,8 @@ pub enum TemplatesOutcome {
 pub struct TemplatesPanel {
     pub board_id: BoardId,
     me: Uid,
+    /// Where the window was last drawn; a click anywhere else closes it.
+    area: Rect,
     /// Board owner or admin: may manage every template here.
     privileged: bool,
     /// Template plus its owner's name for the list line.
@@ -48,6 +50,7 @@ impl TemplatesPanel {
         let list = ListState::named("templates");
         list.focus().set(true);
         Self {
+            area: Rect::default(),
             board_id,
             me,
             privileged,
@@ -122,7 +125,7 @@ impl TemplatesPanel {
             Event::Key(k) if k.kind != KeyEventKind::Release => Some(k.code),
             _ => None,
         };
-        if matches!(key, Some(KeyCode::Esc | KeyCode::Char('q'))) {
+        if matches!(key, Some(KeyCode::Esc | KeyCode::Char('q'))) || clicked_outside(ev, self.area) {
             return TemplatesOutcome::Cancel;
         }
         let mut focus = self.focus();
@@ -162,7 +165,9 @@ impl TemplatesPanel {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
-        let p = popup(area, 62, 18);
+        // The same window as a task's, so the panels line up.
+        let p = popup(area, 78, 32 + button_h(t));
+        self.area = p;
         f.render_widget(Clear, p);
         let block = frame_block(
             " Templates ",
@@ -185,7 +190,7 @@ impl TemplatesPanel {
         } else {
             self.templates
                 .iter()
-                .map(|(tpl, owner)| ListItem::new(format!("{:<32} by {owner}", tpl.name)))
+                .map(|(tpl, owner)| tall_item(format!("{:<32} by {owner}", tpl.name), t))
                 .collect()
         };
         f.render_stateful_widget(list(items, t), l, &mut self.list);
@@ -238,5 +243,66 @@ mod tests {
         p.set_templates(vec![tpl(1, 1)], &|u| format!("u{u}"));
         p.list.select(Some(0));
         assert!(p.manageable().is_some());
+    }
+
+    /// Where a text lands on a rendered screen, as (row, column). The test
+    /// backend quotes every line, and the frame is drawn in wide glyphs, so
+    /// columns are counted in characters past the quote.
+    fn find(out: &str, text: &str) -> (usize, usize) {
+        out.lines()
+            .enumerate()
+            .find_map(|(y, l)| {
+                let l = l.trim_matches('"');
+                l.find(text).map(|x| (y, l[..x].chars().count()))
+            })
+            .unwrap_or_else(|| panic!("{text:?} not on screen:\n{out}"))
+    }
+
+    #[test]
+    fn a_click_on_the_board_behind_the_window_closes_it() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let press = |column, row| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let mut p = TemplatesPanel::new(BoardId(1), 1, true);
+        p.set_templates(vec![tpl(1, 1)], &|u| format!("u{u}"));
+        // Before the first draw nothing counts as outside.
+        assert!(!matches!(p.handle(&press(0, 0)), TemplatesOutcome::Cancel));
+        let theme = crate::ui::theme::Theme::default();
+        let mut term = Terminal::new(TestBackend::new(100, 44)).unwrap();
+        term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        // The window is 78 wide from column 11, 33 tall from row 5.
+        assert!(matches!(p.handle(&press(0, 0)), TemplatesOutcome::Cancel));
+        assert!(matches!(p.handle(&press(95, 20)), TemplatesOutcome::Cancel));
+        assert!(!matches!(p.handle(&press(20, 8)), TemplatesOutcome::Cancel), "inside is a list click");
+    }
+
+    #[test]
+    fn with_bigger_buttons_every_row_is_three_tall_and_the_panel_is_the_task_window() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut p = TemplatesPanel::new(BoardId(1), 1, true);
+        p.set_templates(vec![tpl(1, 1), tpl(2, 1)], &|u| format!("u{u}"));
+        let render = |p: &mut TemplatesPanel, touch: bool| {
+            let theme = crate::ui::theme::Theme::default().with_touch(touch);
+            let mut term = Terminal::new(TestBackend::new(100, 44)).unwrap();
+            term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+            term.backend().to_string()
+        };
+        let plain = render(&mut p, false);
+        assert_eq!(find(&plain, "t2").0 - find(&plain, "t1").0, 1, "one row each:\n{plain}");
+        let touch = render(&mut p, true);
+        assert_eq!(find(&touch, "t2").0 - find(&touch, "t1").0, 3, "three rows each:\n{touch}");
+        // 78 wide like the task form: centred in 100 columns, so 11 in.
+        assert_eq!(find(&touch, "┌ Templates ").1, 11, "{touch}");
+        let frame_rows = touch.lines().filter(|l| l.contains('│')).count();
+        assert_eq!(frame_rows, 32 + 3 - 2, "32 rows plus a three high button row, minus the corners");
     }
 }

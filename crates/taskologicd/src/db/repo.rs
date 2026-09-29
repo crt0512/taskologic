@@ -1242,6 +1242,7 @@ fn program_from_row(r: &Row) -> rusqlite::Result<Program> {
         name: r.get("name")?,
         description: r.get("description")?,
         steps: serde_json::from_str(&steps).unwrap_or_default(),
+        min_samples: r.get::<_, i64>("min_samples")?.max(1) as u32,
     })
 }
 
@@ -1274,13 +1275,15 @@ pub fn create_program(
     draft: &ProgramDraft,
 ) -> R<Program> {
     c.execute(
-        "INSERT INTO programs (board_id, owner_uid, name, description, steps_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO programs (board_id, owner_uid, name, description, steps_json, min_samples) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             board_id.0,
             i64::from(owner),
             draft.name.trim(),
             draft.description.trim(),
-            serde_json::to_string(&draft.steps)?
+            serde_json::to_string(&draft.steps)?,
+            i64::from(draft.min_samples)
         ],
     )?;
     require_program(c, ProgramId(c.last_insert_rowid()))
@@ -1288,12 +1291,13 @@ pub fn create_program(
 
 pub fn update_program(c: &Connection, id: ProgramId, draft: &ProgramDraft) -> R<Program> {
     c.execute(
-        "UPDATE programs SET name = ?2, description = ?3, steps_json = ?4 WHERE id = ?1",
+        "UPDATE programs SET name = ?2, description = ?3, steps_json = ?4, min_samples = ?5 WHERE id = ?1",
         params![
             id.0,
             draft.name.trim(),
             draft.description.trim(),
-            serde_json::to_string(&draft.steps)?
+            serde_json::to_string(&draft.steps)?,
+            i64::from(draft.min_samples)
         ],
     )?;
     require_program(c, id)

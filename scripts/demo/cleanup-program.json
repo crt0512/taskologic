@@ -2,13 +2,14 @@
   "taskologic": {
     "format": 1,
     "kind": "program",
-    "taskologic": "0.1.12",
+    "taskologic": "0.1.13",
     "exported_at": "2026-09-29T12:00:00Z",
     "board": "demo"
   },
   "users": [],
   "program": {
     "name": "Clean Up Entire Apartment",
+    "min_samples": 3,
     "description": "Clean up the entire apartment by maintainer of Taskologic (crt0512).",
     "steps": [
       {

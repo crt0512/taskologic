@@ -23,4 +23,8 @@ pub use message::*;
 ///
 /// 3 is 0.1.12. Tasks gained their own print rules, which a 0.1.11 client
 /// does not know about and would strip from every task it saved.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// 4 is 0.1.13. A step's "next day at" start rule became "so many days
+/// later at", and a program carries how many finished tasks its estimate
+/// needs; a 0.1.12 client cannot read the first and would drop the second.
+pub const PROTOCOL_VERSION: u32 = 4;
