@@ -9,7 +9,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use serde::Deserialize;
-use taskologic_core::prefs::{CustomColors, Darkness, ThemePreset};
+use taskologic_core::prefs::{Contrast, CustomColors, Darkness, ThemePreset};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,30 +172,37 @@ fn default_palette(full: bool) -> Palette {
 
 /// Deep reds from the desktop up, light grey text, white on the selection.
 /// The bars sit a shade above the buttons, cards share the button red. On a
-/// sixteen colour terminal it is black with red accents.
-fn blood_palette(full: bool) -> Palette {
+/// sixteen colour terminal it is black with red accents. Low is the original
+/// look, whose muted text and borders sit at roughly 2.6:1 and 1.4:1 against
+/// the reds; normal lifts them to about 5:1 and 3:1, high to 8:1 and 5:1 and
+/// spreads the layers apart.
+fn blood_palette(full: bool, contrast: Contrast) -> Palette {
     let c = |f: Color, a: Color| Some(if full { f } else { a });
     let rgb = |n: u32| Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8);
-    let text = rgb(0xD3D3D3);
-    let muted = rgb(0xA43136);
-    let accent = rgb(0x610001);
-    let button = rgb(0x450000);
+    // Desktop, dialogs, bar, cards and buttons; text, muted text, borders and
+    // titles, and the selected row.
+    let (screen, surface, bar, card, button, text, muted, accent, select) = match contrast {
+        Contrast::Low => (0x260000, 0x310000, 0x4A0000, 0x450000, 0x450000, 0xD3D3D3, 0xA43136, 0x610001, 0x610001),
+        Contrast::Normal => (0x260000, 0x310000, 0x4A0000, 0x450000, 0x450000, 0xE8E8E8, 0xD0666B, 0xB8232B, 0xB8232B),
+        Contrast::High => (0x1A0000, 0x2C0000, 0x520000, 0x4C0000, 0x5C0000, 0xFFFFFF, 0xF08A90, 0xF04048, 0xC0202A),
+    };
+    let (text, muted, accent, select) = (rgb(text), rgb(muted), rgb(accent), rgb(select));
     Palette {
-        screen_bg: c(rgb(0x260000), Color::Black),
+        screen_bg: c(rgb(screen), Color::Black),
         screen_fg: c(text, Color::Gray),
-        bar_bg: c(rgb(0x4A0000), Color::DarkGray),
+        bar_bg: c(rgb(bar), Color::DarkGray),
         bar_fg: c(text, Color::White),
-        surface_bg: c(rgb(0x310000), Color::Black),
+        surface_bg: c(rgb(surface), Color::Black),
         surface_fg: c(text, Color::Gray),
         surface_muted: c(muted, Color::DarkGray),
-        card_bg: c(button, Color::Black),
+        card_bg: c(rgb(card), Color::Black),
         card_fg: c(text, Color::Gray),
         card_muted: c(muted, Color::DarkGray),
         accent: c(accent, Color::Red),
         outline: c(rgb(0xFFFFFF), Color::White),
-        select_bg: c(accent, Color::Red),
+        select_bg: c(select, Color::Red),
         select_fg: c(rgb(0xFFFFFF), Color::White),
-        button_bg: c(button, Color::DarkGray),
+        button_bg: c(rgb(button), Color::DarkGray),
         button_fg: c(text, Color::Gray),
         warn: c(Color::Indexed(214), Color::Yellow),
         danger: c(Color::Indexed(203), Color::LightRed),
@@ -316,6 +323,8 @@ pub struct Theme {
     pub touch: bool,
     /// One of the dark grey presets, which the darkness level applies to.
     pub dark: bool,
+    /// The blood theme, which the contrast level applies to.
+    pub blood: bool,
     /// Where the pointer is, so anything clickable can light up under it.
     pub mouse: Option<(u16, u16)>,
     pub palette: Palette,
@@ -340,7 +349,7 @@ impl Theme {
             (m, ThemePreset::DarkOrange) => dark_palette(m == ColorMode::Full, Accent::Orange),
             (m, ThemePreset::DarkYellow) => dark_palette(m == ColorMode::Full, Accent::Yellow),
             (m, ThemePreset::DarkGreen) => dark_palette(m == ColorMode::Full, Accent::Green),
-            (m, ThemePreset::Blood) => blood_palette(m == ColorMode::Full),
+            (m, ThemePreset::Blood) => blood_palette(m == ColorMode::Full, Contrast::Low),
             (m, ThemePreset::Custom) => custom_palette(custom, m == ColorMode::Full),
         };
         Theme {
@@ -348,6 +357,7 @@ impl Theme {
             ascii,
             touch: false,
             dark: preset.is_dark(),
+            blood: preset == ThemePreset::Blood,
             mouse: None,
             palette,
         }
@@ -369,6 +379,15 @@ impl Theme {
             self.palette.card_bg = Some(card);
             self.palette.bar_bg = Some(card);
             self.palette.button_bg = Some(button);
+        }
+        self
+    }
+
+    /// How strongly the blood theme stands out. The other themes ignore it,
+    /// and so does a sixteen colour terminal, which has no such steps.
+    pub fn with_contrast(mut self, level: Contrast) -> Theme {
+        if self.blood && self.mode == ColorMode::Full {
+            self.palette = blood_palette(true, level);
         }
         self
     }
@@ -749,6 +768,66 @@ mod tests {
             serde_json::from_str::<ThemePreset>("\"blood\"").unwrap(),
             ThemePreset::Blood
         );
+    }
+
+    /// WCAG contrast ratio of two RGB colours.
+    fn ratio(a: Option<Color>, b: Option<Color>) -> f64 {
+        let lum = |c: Option<Color>| {
+            let Some(Color::Rgb(r, g, b)) = c else { panic!("{c:?}") };
+            let f = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn blood_contrast_low_is_the_original_and_normal_and_high_climb() {
+        let blood = |level| {
+            Theme::preset(ThemePreset::Blood, &CustomColors::default(), ColorMode::Full, false)
+                .with_contrast(level)
+                .palette
+        };
+        let original = Theme::preset(ThemePreset::Blood, &CustomColors::default(), ColorMode::Full, false).palette;
+        assert_eq!(blood(Contrast::Low), original, "low is what it always was");
+        let (low, normal, high) = (blood(Contrast::Low), blood(Contrast::Normal), blood(Contrast::High));
+        let measure = |p: &Palette| {
+            (
+                ratio(p.surface_fg, p.surface_bg),
+                ratio(p.surface_muted, p.surface_bg),
+                ratio(p.accent, p.screen_bg),
+                ratio(p.select_fg, p.select_bg),
+            )
+        };
+        let (l, n, h) = (measure(&low), measure(&normal), measure(&high));
+        // Every step up reads better, and normal and high pass the usual bars.
+        assert!(l.1 < n.1 && n.1 < h.1, "muted text {l:?} {n:?} {h:?}");
+        assert!(l.2 < n.2 && n.2 < h.2, "borders and titles {l:?} {n:?} {h:?}");
+        assert!(n.1 >= 4.5 && h.1 >= 7.0, "muted text: normal {n:?}, high {h:?}");
+        assert!(n.2 >= 3.0 && h.2 >= 4.5, "borders: normal {n:?}, high {h:?}");
+        assert!(l.0 >= 7.0 && n.0 >= 7.0 && h.0 >= 7.0, "body text stays high everywhere");
+        assert!(n.3 >= 4.5 && h.3 >= 4.5, "selected text stays readable: {n:?} {h:?}");
+    }
+
+    #[test]
+    fn contrast_only_touches_blood_in_full_colour() {
+        for preset in [ThemePreset::Default, ThemePreset::DarkBlue, ThemePreset::Custom] {
+            let t = Theme::preset(preset, &CustomColors::default(), ColorMode::Full, false);
+            assert_eq!(t.with_contrast(Contrast::High).palette, t.palette, "{preset:?}");
+        }
+        let t = Theme::preset(ThemePreset::Blood, &CustomColors::default(), ColorMode::Ansi16, false);
+        assert_eq!(t.with_contrast(Contrast::High).palette, t.palette, "sixteen colours has no steps");
+    }
+
+    #[test]
+    fn old_saved_prefs_load_with_low_contrast() {
+        let ui: taskologic_core::prefs::UiPrefs = serde_json::from_str(r#"{"theme":"blood"}"#).unwrap();
+        assert_eq!(ui.contrast, Contrast::Low);
+        let ui: taskologic_core::prefs::UiPrefs = serde_json::from_str(r#"{"theme":"blood","contrast":"high"}"#).unwrap();
+        assert_eq!(ui.contrast, Contrast::High);
     }
 
     #[test]

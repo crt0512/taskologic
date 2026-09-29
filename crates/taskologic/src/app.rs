@@ -19,7 +19,7 @@ use taskologic_core::control::{self, Control, Value};
 use crate::control::{Armed, ControlState, UNDO_DEPTH, UndoStep, Waiting, named_key_event, values_date, values_minutes, values_text};
 use taskologic_core::board::{Board, ColumnRole};
 use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, TaskId, Uid};
-use taskologic_core::prefs::{CardFields, CustomColors, Darkness, ThemePreset};
+use taskologic_core::prefs::{CardFields, Contrast, CustomColors, Darkness, ThemePreset};
 use taskologic_core::print::PrintJob;
 use taskologic_core::program::Question;
 use taskologic_core::task::Task;
@@ -621,18 +621,19 @@ impl App {
     /// Colours and glyphs, rebuilt per frame so a prefs change shows at once.
     /// While the settings form is open it previews what is picked there.
     pub fn theme(&self) -> Theme {
-        let (preset, colors, darkness) = match &self.overlay {
+        let (preset, colors, darkness, contrast) = match &self.overlay {
             Some(Overlay::Settings(form)) => form.preview(),
             Some(Overlay::Colors { back, .. }) => back.preview(),
             Some(Overlay::Printer { back, .. }) => back.preview(),
             Some(Overlay::Codes { back, .. }) => back.preview(),
             _ => match &self.user {
-                Some(u) => (u.prefs.ui.theme, u.prefs.ui.custom_colors.clone(), u.prefs.ui.darkness),
-                None => (ThemePreset::default(), CustomColors::default(), Darkness::default()),
+                Some(u) => (u.prefs.ui.theme, u.prefs.ui.custom_colors.clone(), u.prefs.ui.darkness, u.prefs.ui.contrast),
+                None => (ThemePreset::default(), CustomColors::default(), Darkness::default(), Contrast::default()),
             },
         };
         Theme::preset(preset, &colors, self.color_mode, self.ascii)
             .with_darkness(darkness)
+            .with_contrast(contrast)
             .with_touch(self.touchscreen())
             .with_mouse(self.mouse_pos)
     }

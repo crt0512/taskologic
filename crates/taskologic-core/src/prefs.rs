@@ -25,7 +25,7 @@ pub enum ThemePreset {
     /// With green accents.
     DarkGreen,
     /// Deep reds throughout, light grey text. Fixed colours, no darkness
-    /// level.
+    /// level; it has a contrast setting instead.
     Blood,
     /// Whatever the user put in [`CustomColors`], dark blue to start with.
     Custom,
@@ -55,6 +55,32 @@ impl Darkness {
             Darkness::Darker => "darker",
             Darkness::Default => "default",
             Darkness::Lighter => "lighter",
+        }
+    }
+}
+
+/// How far the blood theme's text, borders and selection stand out from its
+/// reds. Low is the original look.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Contrast {
+    /// Muted reds, borders that nearly vanish: the original palette.
+    #[default]
+    Low,
+    /// Readable secondary text and visible borders.
+    Normal,
+    /// Bright text and borders, wider steps between the layers.
+    High,
+}
+
+impl Contrast {
+    pub const ALL: [Contrast; 3] = [Contrast::Low, Contrast::Normal, Contrast::High];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Contrast::Low => "low",
+            Contrast::Normal => "normal",
+            Contrast::High => "high",
         }
     }
 }
@@ -210,6 +236,8 @@ pub struct UiPrefs {
     pub custom_colors: CustomColors,
     /// How dark a dark theme's greys are, the desktop included.
     pub darkness: Darkness,
+    /// How strongly the blood theme's text and borders stand out.
+    pub contrast: Contrast,
     /// Overrides the board's own card fields when set.
     pub card_fields: Option<CardFields>,
     /// Bigger buttons.
@@ -230,6 +258,7 @@ impl Default for UiPrefs {
             theme: ThemePreset::default(),
             custom_colors: CustomColors::default(),
             darkness: Darkness::default(),
+            contrast: Contrast::default(),
             card_fields: None,
             touchscreen: false,
             scanner_enabled: true,

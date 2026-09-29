@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Clear, Paragraph};
 use taskologic_core::prefs::{
-    AutoprintFilter, CardFields, CustomColors, Darkness, PrintMode, PrintPrefs, ScannerPrefs,
+    AutoprintFilter, CardFields, Contrast, CustomColors, Darkness, PrintMode, PrintPrefs, ScannerPrefs,
     ThemePreset, UiPrefs, UserPrefs, parse_reminder_hours, reminder_hours_text,
 };
 use taskologic_core::print::Symbology;
@@ -58,6 +58,11 @@ const DARKNESS_ITEMS: [(Darkness, &str); 4] = [
     (Darkness::Default, "default"),
     (Darkness::Lighter, "lighter"),
 ];
+const CONTRAST_ITEMS: [(Contrast, &str); 3] = [
+    (Contrast::Low, "low"),
+    (Contrast::Normal, "normal"),
+    (Contrast::High, "high"),
+];
 const THEME_ITEMS: [(ThemePreset, &str); 8] = [
     (ThemePreset::Default, "default"),
     (ThemePreset::DarkBlue, "dark blue"),
@@ -79,6 +84,7 @@ pub struct SettingsForm {
     theme: ChoiceState<ThemePreset>,
     /// How dark the dark themes are.
     darkness: ChoiceState<Darkness>,
+    contrast: ChoiceState<Contrast>,
     colors: CustomColors,
     edit_colors: ButtonState,
     board_tabs: CheckboxState,
@@ -150,10 +156,13 @@ impl SettingsForm {
         theme.set_value(p.ui.theme);
         let mut darkness = ChoiceState::named("darkness");
         darkness.set_value(p.ui.darkness);
+        let mut contrast = ChoiceState::named("contrast");
+        contrast.set_value(p.ui.contrast);
         Self {
             theme,
 
             darkness,
+            contrast,
             colors: p.ui.custom_colors.clone(),
             edit_colors: ButtonState::new(),
             board_tabs,
@@ -203,6 +212,9 @@ impl SettingsForm {
         }
         if self.theme.value().is_dark() {
             b.widget(&self.darkness);
+        }
+        if self.theme.value() == ThemePreset::Blood {
+            b.widget(&self.contrast);
         }
         b.widget(&self.board_tabs)
             .widget(&self.touchscreen)
@@ -254,7 +266,8 @@ impl SettingsForm {
         let popup_open = self.mode.is_popup_active()
             || self.format.is_popup_active()
             || self.theme.is_popup_active()
-            || self.darkness.is_popup_active();
+            || self.darkness.is_popup_active()
+            || self.contrast.is_popup_active();
         match key {
             Some(KeyCode::Esc) if !popup_open => return SettingsOutcome::Cancel,
             Some(KeyCode::F(2)) => return self.try_save(),
@@ -304,6 +317,7 @@ impl SettingsForm {
             c.handle(ev, Regular);
         }
         self.darkness.handle(ev, Regular);
+        self.contrast.handle(ev, Regular);
         self.timezone.handle(ev, Regular);
         self.reminder_start_hours.handle(ev, Regular);
         self.reminder_hours.handle(ev, Regular);
@@ -340,8 +354,8 @@ impl SettingsForm {
 
     /// What the screen should look like while this form is open, so a theme
     /// change shows the moment it is picked.
-    pub fn preview(&self) -> (ThemePreset, CustomColors, Darkness) {
-        (self.theme.value(), self.colors.clone(), self.darkness.value())
+    pub fn preview(&self) -> (ThemePreset, CustomColors, Darkness, Contrast) {
+        (self.theme.value(), self.colors.clone(), self.darkness.value(), self.contrast.value())
     }
 
     pub fn values(&self) -> Result<(UserPrefs, Option<Tz>), String> {
@@ -357,6 +371,7 @@ impl SettingsForm {
                 theme: self.theme.value(),
                 custom_colors: self.colors.clone(),
                 darkness: self.darkness.value(),
+                contrast: self.contrast.value(),
                 card_fields: (!self.card_default.checked()).then(|| CardFields {
                     start_date: self.card_start.checked(),
                     due_date: self.card_due.checked(),
@@ -421,6 +436,8 @@ impl SettingsForm {
         let mut r = Row::new(w);
         let mut darkness_area = Rect::default();
         let mut darkness_popup = None;
+        let mut contrast_area = Rect::default();
+        let mut contrast_popup = None;
         let theme_area = r.take(15);
         let (theme_w, theme_popup) = dropdown(THEME_ITEMS, theme_area, t);
         f.render_stateful_widget(theme_w, theme_area, &mut self.theme);
@@ -435,6 +452,13 @@ impl SettingsForm {
             f.render_stateful_widget(dw, darkness_area, &mut self.darkness);
             dropdown_marker(f, &self.darkness, t);
             darkness_popup = Some(dp);
+        } else if self.theme.value() == ThemePreset::Blood {
+            label(f, r.text("contrast"), "contrast", t);
+            contrast_area = r.take(11);
+            let (cw, cp) = dropdown(CONTRAST_ITEMS, contrast_area, t);
+            f.render_stateful_widget(cw, contrast_area, &mut self.contrast);
+            dropdown_marker(f, &self.contrast, t);
+            contrast_popup = Some(cp);
         } else {
             f.render_widget(
                 Paragraph::new("pick custom to choose your own colours").style(t.surface_dim()),
@@ -685,6 +709,10 @@ impl SettingsForm {
         if let Some(dp) = darkness_popup {
             f.render_stateful_widget(dp, darkness_area, &mut self.darkness);
             dropdown_popup_hover(f, &self.darkness, t);
+        }
+        if let Some(cp) = contrast_popup {
+            f.render_stateful_widget(cp, contrast_area, &mut self.contrast);
+            dropdown_popup_hover(f, &self.contrast, t);
         }
         f.render_stateful_widget(mode_popup, mode_area, &mut self.mode);
         dropdown_popup_hover(f, &self.mode, t);
