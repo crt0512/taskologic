@@ -109,6 +109,9 @@ pub struct Palette {
     pub card_fg: Option<Color>,
     pub card_muted: Option<Color>,
     pub accent: Option<Color>,
+    /// The frame of the selected card or column: the accent, unless the
+    /// accent is too dark to read as a highlight.
+    pub outline: Option<Color>,
     pub select_bg: Option<Color>,
     pub select_fg: Option<Color>,
     pub button_bg: Option<Color>,
@@ -130,6 +133,7 @@ const MONO: Palette = Palette {
     card_fg: None,
     card_muted: None,
     accent: None,
+    outline: None,
     select_bg: None,
     select_fg: None,
     button_bg: None,
@@ -155,6 +159,7 @@ fn default_palette(full: bool) -> Palette {
         card_fg: c(Color::Indexed(16), Color::Black),
         card_muted: c(Color::Indexed(238), Color::DarkGray),
         accent: c(Color::Indexed(124), Color::Red),
+        outline: c(Color::Indexed(124), Color::Red),
         select_bg: c(Color::Indexed(124), Color::Red),
         select_fg: c(Color::Indexed(231), Color::White),
         button_bg: c(Color::Indexed(250), Color::Gray),
@@ -162,6 +167,39 @@ fn default_palette(full: bool) -> Palette {
         warn: c(Color::Indexed(130), Color::Yellow),
         danger: c(Color::Indexed(124), Color::Red),
         ok: c(Color::Indexed(28), Color::Green),
+    }
+}
+
+/// Deep reds from the desktop up, light grey text, white on the selection.
+/// The bars sit a shade above the buttons, cards share the button red. On a
+/// sixteen colour terminal it is black with red accents.
+fn blood_palette(full: bool) -> Palette {
+    let c = |f: Color, a: Color| Some(if full { f } else { a });
+    let rgb = |n: u32| Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8);
+    let text = rgb(0xD3D3D3);
+    let muted = rgb(0xA43136);
+    let accent = rgb(0x610001);
+    let button = rgb(0x450000);
+    Palette {
+        screen_bg: c(rgb(0x260000), Color::Black),
+        screen_fg: c(text, Color::Gray),
+        bar_bg: c(rgb(0x4A0000), Color::DarkGray),
+        bar_fg: c(text, Color::White),
+        surface_bg: c(rgb(0x310000), Color::Black),
+        surface_fg: c(text, Color::Gray),
+        surface_muted: c(muted, Color::DarkGray),
+        card_bg: c(button, Color::Black),
+        card_fg: c(text, Color::Gray),
+        card_muted: c(muted, Color::DarkGray),
+        accent: c(accent, Color::Red),
+        outline: c(rgb(0xFFFFFF), Color::White),
+        select_bg: c(accent, Color::Red),
+        select_fg: c(rgb(0xFFFFFF), Color::White),
+        button_bg: c(button, Color::DarkGray),
+        button_fg: c(text, Color::Gray),
+        warn: c(Color::Indexed(214), Color::Yellow),
+        danger: c(Color::Indexed(203), Color::LightRed),
+        ok: c(Color::Indexed(114), Color::Green),
     }
 }
 
@@ -222,6 +260,7 @@ fn dark_palette(full: bool, accent: Accent) -> Palette {
         card_fg: c(Color::Indexed(253), Color::White),
         card_muted: c(Color::Indexed(245), Color::Gray),
         accent: c(accent_full, accent_ansi),
+        outline: c(accent_full, accent_ansi),
         select_bg: c(accent_full, accent_ansi),
         select_fg: c(on_full, on_ansi),
         button_bg: c(button, Color::Gray),
@@ -259,6 +298,7 @@ fn custom_palette(c: &CustomColors, full: bool) -> Palette {
         card_fg: text,
         card_muted: muted,
         accent,
+        outline: accent,
         select_bg: select,
         select_fg: base.select_fg,
         button_bg: button,
@@ -274,7 +314,7 @@ pub struct Theme {
     pub mode: ColorMode,
     pub ascii: bool,
     pub touch: bool,
-    /// One of the dark presets, which the black background toggle applies to.
+    /// One of the dark grey presets, which the darkness level applies to.
     pub dark: bool,
     /// Where the pointer is, so anything clickable can light up under it.
     pub mouse: Option<(u16, u16)>,
@@ -300,6 +340,7 @@ impl Theme {
             (m, ThemePreset::DarkOrange) => dark_palette(m == ColorMode::Full, Accent::Orange),
             (m, ThemePreset::DarkYellow) => dark_palette(m == ColorMode::Full, Accent::Yellow),
             (m, ThemePreset::DarkGreen) => dark_palette(m == ColorMode::Full, Accent::Green),
+            (m, ThemePreset::Blood) => blood_palette(m == ColorMode::Full),
             (m, ThemePreset::Custom) => custom_palette(custom, m == ColorMode::Full),
         };
         Theme {
@@ -445,7 +486,7 @@ impl Theme {
 
     pub fn card_border(&self, selected: bool) -> Style {
         if selected {
-            Self::style(self.palette.accent, self.palette.card_bg).add_modifier(Modifier::BOLD)
+            Self::style(self.palette.outline, self.palette.card_bg).add_modifier(Modifier::BOLD)
         } else {
             Self::style(self.palette.card_muted, self.palette.card_bg)
         }
@@ -467,11 +508,13 @@ impl Theme {
         Self::style(self.palette.warn, self.palette.screen_bg).add_modifier(Modifier::BOLD)
     }
 
+    /// A column's frame: the accent when it is the current column, otherwise
+    /// the same muted line an unselected card has.
     pub fn column_border(&self, selected: bool) -> Style {
         if selected {
-            Self::style(self.palette.accent, self.palette.screen_bg).add_modifier(Modifier::BOLD)
+            Self::style(self.palette.outline, self.palette.screen_bg).add_modifier(Modifier::BOLD)
         } else {
-            Self::style(self.palette.screen_fg, self.palette.screen_bg)
+            Self::style(self.palette.surface_muted, self.palette.screen_bg)
         }
     }
 
@@ -488,6 +531,15 @@ impl Theme {
             return Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM);
         }
         Self::style(self.palette.button_fg, self.palette.button_bg)
+    }
+
+    /// The frame of a resting big button: a muted line, like an unselected
+    /// card's. Focus and hover frame it in the selection colours instead.
+    pub fn button_border(&self) -> Style {
+        if self.mono() {
+            return self.button();
+        }
+        Self::style(self.palette.surface_muted, self.palette.button_bg)
     }
 
     pub fn button_focus(&self) -> Style {
@@ -597,6 +649,7 @@ mod tests {
             t.selected(),
             t.button(),
             t.button_focus(),
+            t.button_border(),
             t.field(),
             t.error(),
             t.severity(taskologic_proto::Severity::Error),
@@ -625,6 +678,7 @@ mod tests {
             ThemePreset::DarkOrange,
             ThemePreset::DarkYellow,
             ThemePreset::DarkGreen,
+            ThemePreset::Blood,
         ] {
             let t = Theme::preset(preset, &CustomColors::default(), ColorMode::Ansi16, false);
             for s in styles(&t) {
@@ -672,6 +726,32 @@ mod tests {
     }
 
     #[test]
+    fn blood_is_red_all_the_way_down_and_keeps_its_colours() {
+        let t = Theme::preset(ThemePreset::Blood, &CustomColors::default(), ColorMode::Full, false);
+        let p = t.palette;
+        assert_eq!(p.screen_bg, Some(Color::Rgb(0x26, 0x00, 0x00)));
+        assert_eq!(p.surface_bg, Some(Color::Rgb(0x31, 0x00, 0x00)));
+        assert_eq!(p.button_bg, Some(Color::Rgb(0x45, 0x00, 0x00)));
+        assert_eq!(p.accent, Some(Color::Rgb(0x61, 0x00, 0x01)));
+        assert_eq!(p.bar_bg, Some(Color::Rgb(0x4A, 0x00, 0x00)));
+        assert_eq!(p.select_bg, p.accent);
+        assert_eq!(p.select_fg, Some(Color::Rgb(0xFF, 0xFF, 0xFF)));
+        // The accent is too dark to frame the selected card or column.
+        assert_eq!(p.outline, Some(Color::Rgb(0xFF, 0xFF, 0xFF)));
+        assert_eq!(t.column_border(true).fg, p.outline);
+        assert_eq!(t.card_border(true).fg, p.outline);
+        assert_eq!(p.surface_muted, Some(Color::Rgb(0xA4, 0x31, 0x36)));
+        assert_eq!(p.screen_fg, p.surface_fg);
+        // Not a grey theme: the darkness level has nothing to move.
+        assert!(!ThemePreset::Blood.is_dark());
+        assert_eq!(t.with_darkness(Darkness::Black).palette, p);
+        assert_eq!(
+            serde_json::from_str::<ThemePreset>("\"blood\"").unwrap(),
+            ThemePreset::Blood
+        );
+    }
+
+    #[test]
     fn the_dark_themes_differ_in_their_accent_and_nothing_else() {
         let blue = Theme::preset(ThemePreset::DarkBlue, &CustomColors::default(), ColorMode::Full, false).palette;
         for (preset, accent) in [
@@ -682,6 +762,7 @@ mod tests {
         ] {
             let p = Theme::preset(preset, &CustomColors::default(), ColorMode::Full, false).palette;
             assert_eq!(p.accent, Some(accent), "{preset:?}");
+            assert_eq!(p.outline, Some(accent), "{preset:?}");
             assert_eq!(p.select_bg, Some(accent), "{preset:?}");
             assert_eq!(p.screen_bg, blue.screen_bg, "{preset:?}");
             assert_eq!(p.surface_bg, blue.surface_bg, "{preset:?}");

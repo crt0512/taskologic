@@ -58,13 +58,14 @@ const DARKNESS_ITEMS: [(Darkness, &str); 4] = [
     (Darkness::Default, "default"),
     (Darkness::Lighter, "lighter"),
 ];
-const THEME_ITEMS: [(ThemePreset, &str); 7] = [
+const THEME_ITEMS: [(ThemePreset, &str); 8] = [
     (ThemePreset::Default, "default"),
     (ThemePreset::DarkBlue, "dark blue"),
     (ThemePreset::DarkRed, "dark red"),
     (ThemePreset::DarkOrange, "dark orange"),
     (ThemePreset::DarkYellow, "dark yellow"),
     (ThemePreset::DarkGreen, "dark green"),
+    (ThemePreset::Blood, "blood"),
     (ThemePreset::Custom, "custom"),
 ];
 

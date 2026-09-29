@@ -436,9 +436,15 @@ fn draw_menu_button(f: &mut Frame, rect: Rect, text: &str, key: char, t: &Theme)
     let base = t.hover_if(t.button(), rect);
     let keys = t.hover_if(t.button_key(), rect);
     if rect.height >= 3 {
+        let frame = if t.hovered(rect) {
+            base
+        } else {
+            t.button_border()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_set(t.border_set())
+            .border_style(frame)
             .style(base);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
@@ -981,7 +987,7 @@ fn overlay(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_set(t.border_set())
-                .border_style(t.button())
+                .border_style(t.button_border())
                 .style(t.button());
             let inner = block.inner(popup);
             f.render_widget(block, popup);

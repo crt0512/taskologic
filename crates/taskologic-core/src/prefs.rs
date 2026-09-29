@@ -24,6 +24,9 @@ pub enum ThemePreset {
     DarkYellow,
     /// With green accents.
     DarkGreen,
+    /// Deep reds throughout, light grey text. Fixed colours, no darkness
+    /// level.
+    Blood,
     /// Whatever the user put in [`CustomColors`], dark blue to start with.
     Custom,
 }
@@ -57,13 +60,14 @@ impl Darkness {
 }
 
 impl ThemePreset {
-    pub const ALL: [ThemePreset; 7] = [
+    pub const ALL: [ThemePreset; 8] = [
         ThemePreset::Default,
         ThemePreset::DarkBlue,
         ThemePreset::DarkRed,
         ThemePreset::DarkOrange,
         ThemePreset::DarkYellow,
         ThemePreset::DarkGreen,
+        ThemePreset::Blood,
         ThemePreset::Custom,
     ];
 
@@ -88,6 +92,7 @@ impl ThemePreset {
             ThemePreset::DarkOrange => "dark orange",
             ThemePreset::DarkYellow => "dark yellow",
             ThemePreset::DarkGreen => "dark green",
+            ThemePreset::Blood => "blood",
             ThemePreset::Custom => "custom",
         }
     }

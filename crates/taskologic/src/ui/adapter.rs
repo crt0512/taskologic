@@ -178,18 +178,31 @@ where
 }
 
 /// Render a button, bordered when the area is tall enough for one. Forms
-/// hand out taller areas when "bigger buttons" is on.
+/// hand out taller areas when "bigger buttons" is on. Keyboard focus and
+/// the pointer light the whole button up, frame included; at rest the
+/// frame is a muted line.
 pub fn render_button(f: &mut Frame, area: Rect, label: &str, state: &mut ButtonState, t: &Theme) {
-    let base = t.hover_if(t.button(), area);
+    let focused = state.is_focused();
+    let base = if focused {
+        t.button_focus()
+    } else {
+        t.hover_if(t.button(), area)
+    };
     let b = Button::new(label)
         .style(base)
         .focus_style(t.button_focus())
         .armed_style(t.button_armed());
     let b = if area.height >= 3 {
+        let frame = if focused || t.hovered(area) {
+            base
+        } else {
+            t.button_border()
+        };
         b.block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_set(t.border_set())
+                .border_style(frame)
                 .style(base),
         )
     } else {
@@ -227,4 +240,34 @@ where
         .style(base)
         .select_style(t.selected())
         .focus_style(t.selected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::theme::ColorMode;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+    use taskologic_core::prefs::{CustomColors, ThemePreset};
+
+    /// The colour of the top left corner of a big button drawn in `t`.
+    fn frame_colour(t: &Theme, state: &mut ButtonState) -> Option<Color> {
+        let mut term = Terminal::new(TestBackend::new(12, 3)).unwrap();
+        term.draw(|f| render_button(f, Rect::new(0, 0, 12, 3), " Save ", state, t))
+            .unwrap();
+        term.backend().buffer()[(0, 0)].style().fg
+    }
+
+    #[test]
+    fn a_big_button_frames_itself_muted_at_rest_and_lit_with_focus_or_pointer() {
+        let t = Theme::preset(ThemePreset::DarkBlue, &CustomColors::default(), ColorMode::Full, false);
+        let mut state = ButtonState::named("save");
+        assert_eq!(frame_colour(&t, &mut state), t.palette.surface_muted, "at rest");
+        state.focus().set(true);
+        assert_eq!(frame_colour(&t, &mut state), t.palette.select_fg, "keyboard focus");
+        state.focus().set(false);
+        let hovered = t.with_mouse(Some((5, 1)));
+        assert_eq!(frame_colour(&hovered, &mut state), t.palette.select_fg, "pointer");
+    }
 }
