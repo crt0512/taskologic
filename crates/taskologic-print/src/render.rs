@@ -303,6 +303,16 @@ mod tests {
             .collect();
         assert_eq!(labels, vec!["move left", "press t"]);
         assert!(matches!(&ops[0], crate::layout::Op::Line(l) if l.text == "Navigation and keys" && l.bold));
+        // One code printed on its own: the label is the heading, said once.
+        let one = build_codes_job(
+            "Move left",
+            vec![CodeLine { label: "Move left".into(), payload: "--1ML--".into(), symbology: Symbology::Code39, narrow: false }],
+            &user,
+            DateTime::from_timestamp(0, 0).unwrap(),
+        );
+        let ops = crate::layout::plan(&one, 32, &crate::slip::SlipLayout::task());
+        assert!(matches!(&ops[0], crate::layout::Op::Barcode { .. }), "no heading line: {ops:?}");
+        assert_eq!(ops.iter().filter(|o| matches!(o, crate::layout::Op::Line(_))).count(), 0);
         // Every output mode takes it: the bitmap is a picture, ESC/POS and
         // text carry the payloads as characters.
         for output in [OutputMode::EscPos, OutputMode::Bitmap, OutputMode::Text] {

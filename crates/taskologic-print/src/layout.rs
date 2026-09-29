@@ -193,14 +193,23 @@ fn section(out: &mut Vec<Op>, row: &SlipRow, job: &PrintJob, cols: usize) {
 /// every code with its label above and its payload below, which is what
 /// the barcode op draws anyway. Nothing on it depends on a task.
 fn codes_card(job: &PrintJob, cols: usize) -> Vec<Op> {
-    let mut ops = vec![Op::Line(TextLine {
-        text: fit(&job.title, cols),
-        align: Align::Center,
-        bold: true,
-        scale: 1,
-    })];
-    for line in &job.codes {
-        ops.push(Op::Blank);
+    let mut ops = Vec::new();
+    // A card with one code whose label is the heading would say it twice;
+    // the label above the code is enough then. A strip keeps its heading.
+    let heading_says_it_all = job.codes.len() == 1
+        && job.codes[0].label.trim().eq_ignore_ascii_case(job.title.trim());
+    if !heading_says_it_all {
+        ops.push(Op::Line(TextLine {
+            text: fit(&job.title, cols),
+            align: Align::Center,
+            bold: true,
+            scale: 1,
+        }));
+    }
+    for (i, line) in job.codes.iter().enumerate() {
+        if i > 0 || !ops.is_empty() {
+            ops.push(Op::Blank);
+        }
         ops.push(Op::Barcode {
             code: line.barcode(),
             label: line.label.clone(),
