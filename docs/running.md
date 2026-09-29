@@ -21,7 +21,7 @@ Note : If you are deving stuff and make changes to the ui and now have all the u
 
 ## Deploying
 
-On a Linux host with systemd, `make setup` does the whole first install: the `taskologic` group, the daemon's system user, the unit, the first login. `make update` upgrades it later; that, the database backup it takes and what each version changed are in [upgrading.md](upgrading.md). By hand, the pieces are the two configs below, a group your users are in, and the daemon as a service that owns the database and the socket directory.
+On a Linux host with systemd, `make setup` does the whole first install: the `taskologic` group, the daemon's system user, the unit, the first login. `make upgrade` upgrades it later; that, the database backup it takes and what each version changed are in [upgrading.md](upgrading.md). By hand, the pieces are the two configs below, a group your users are in, and the daemon as a service that owns the database and the socket directory.
 
 ### Installing as a login shell
 

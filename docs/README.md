@@ -6,7 +6,7 @@
 | Page                                       | What it covers                                                                                                       |
 |--------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
 | [running.md](running.md)                   | Building, deploying and the basic setup: daemon and client config, the one-minute versions of printers and barcodes. |
-| [upgrading.md](upgrading.md)               | `make update`, the database backup and migrations, and what each version changed on disk.                            |
+| [upgrading.md](upgrading.md)               | `make upgrade`, the database backup and migrations, and what each version changed on disk.                            |
 | [printers.md](printers.md)                 | The printer profile, output modes, raw printing and why a printer might print nothing, what a slip shows.            |
 | [barcodes.md](barcodes.md)                 | Scanner settings, the codes on task slips and what a scan does.                                                      |
 | [barcode-commands.md](barcode-commands.md) | Control codes that drive the client: examples, printing them, the grammar and every code.                            |

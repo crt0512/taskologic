@@ -2,7 +2,8 @@
 
 How a host that went through `make setup` moves to a new version, what happens to the database, and what each version changed on disk.
 
-`make update` is the whole upgrade: it rebuilds, installs both binaries and
+`make update` fetches and pulls the latest source; `make upgrade` is then
+the whole upgrade: it rebuilds, installs both binaries and
 the unit, stops the daemon, backs the database up beside itself, applies
 whatever migrations are pending and starts the daemon again. `make db-status`
 says where a database stands without touching it.
@@ -27,12 +28,18 @@ codes is gone from Settings; task codes are `..`. The protocol went to 5,
 since an older client cannot read a board that carries a short id; the same
 log out and back in applies.
 
-## What `make update` does
+0.2.1 - various bug fixes
+
+0.2.2 - further bug fixes, addition of further default themes that now look
+more sexy in my opionion, better touch controlls here and there.
+
+## What `make upgrade` does
 
 Once a host has been through `make setup`, new versions go on with:
 
 ```bash
-make update
+make update    # git fetch and git pull
+make upgrade   # build, install, migrate, restart
 ```
 
 Run it as yourself, **not** with `sudo`. All of these targets ask for root
@@ -71,7 +78,7 @@ onwards knows.
 ### About the database
 
 New versions sometimes add columns. The daemon has always migrated on start,
-so this is not new; what `make update` adds is doing it **deliberately**, with
+so this is not new; what `make upgrade` adds is doing it **deliberately**, with
 the daemon stopped and a copy taken first, instead of as a side effect of the
 next restart. The copy lands beside the database as
 `taskologic.db.bak-<date>-<time>`, owned by the same account as the database,
@@ -100,7 +107,7 @@ The restart drops client sessions that are open at that moment. To install
 now and restart later:
 
 ```bash
-make update RESTART=no
+make upgrade RESTART=no
 ```
 
 `RESTART=no` leaves the database alone as well, because migrating out from

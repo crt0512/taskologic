@@ -1,5 +1,5 @@
 #!/bin/sh
-# Upgrade an existing Taskologic install. Called by `make update`.
+# Upgrade an existing Taskologic install. Called by `make upgrade`.
 #
 # Reads the version that is installed right now, rebuilds, replaces the two
 # binaries and the unit file, brings the database up to the schema the new
@@ -51,7 +51,7 @@ if [ "$(id -u)" = "0" ]; then
     if [ -n "${SUDO_USER:-}" ]; then
         echo "note: you ran this under sudo, which is no longer needed. It makes cargo"
         echo "      rebuild everything as root and leaves root owned files in target/."
-        echo "      Next time just: make update"
+        echo "      Next time just: make upgrade"
         echo
     fi
 elif command -v sudo >/dev/null 2>&1; then

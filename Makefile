@@ -13,7 +13,7 @@ else
 SUDO :=
 endif
 
-.PHONY: all help build test install setup update db-status migrate uninstall
+.PHONY: all help build test install setup update upgrade db-status migrate uninstall
 
 # Bare `make` builds, as it does everywhere else.
 all: build
@@ -25,7 +25,8 @@ help:
 	@echo "  make test       run the test suite"
 	@echo "  make install    install binaries and the systemd unit (asks for sudo)"
 	@echo "  make setup      interactive first time setup: group, daemon user, service, first user (asks for sudo)"
-	@echo "  make update     upgrade an existing install in place, keeps config and data (asks for sudo)"
+	@echo "  make update     fetch and pull the latest source from git"
+	@echo "  make upgrade    upgrade an existing install in place from that source, keeps config and data (asks for sudo)"
 	@echo "  make db-status  show the database schema version and any pending migrations"
 	@echo "  make migrate    back up the database and apply pending migrations (asks for sudo)"
 	@echo "  make uninstall  remove binaries and the service, keeps config and data (asks for sudo)"
@@ -55,7 +56,15 @@ setup:
 	@BINDIR=$(BINDIR) UNITDIR=$(UNITDIR) ./scripts/setup.sh
 
 
+# Pull the latest source. What is checked out is what `make upgrade` builds.
 update:
+	git fetch
+	git pull
+
+# Upgrade a host that `make setup` already set up, from the checked out
+# source: new binaries, new unit, migrations with a backup first, daemon
+# restarted. Config, database, users and groups are left as they are.
+upgrade:
 	@BINDIR=$(BINDIR) UNITDIR=$(UNITDIR) RESTART=$(RESTART) ./scripts/update.sh
 
 db-status:

@@ -107,7 +107,7 @@ if [ -n "$CFG" ]; then
     set -- --config "$CFG" "$@"
 fi
 
-# Root only when the database is not ours to write, the way make update does.
+# Root only when the database is not ours to write, the way make upgrade does.
 # taskologicd still checks who asked: sudo passes that through as SUDO_UID.
 DB=""
 if [ -n "$CFG" ] && [ -r "$CFG" ]; then
