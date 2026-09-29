@@ -20,3 +20,15 @@ Other things it can do:
 | `scripts/dev.sh reset`   | Clear it all mhm                     |
 
 Of note : If you are developing stuff that changes the views check out the other `running.md` file as the tests could fail if you dont update the snapshots
+
+## Talking to the daemon by hand
+
+The protocol is in beloved JSON DERULO! so using socat is enough:
+
+```
+socat - UNIX-CONNECT:/tmp/taskologicd.sock
+{"id":1,"request":{"type":"hello","protocol_version":1,"client_version":"socat","has_printer":false,"print_priority":0}}
+{"id":2,"request":{"type":"list_boards"}}
+```
+
+The DEMON identifies you by the uid on the socket, there is nothing to log in with because I didnt want to make a log in system lol and this is good enough for me rn.

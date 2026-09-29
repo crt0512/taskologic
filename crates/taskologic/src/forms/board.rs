@@ -36,6 +36,8 @@ pub enum BoardOutcome {
     Update(Box<UpdateBoard>),
     OpenMembers,
     OpenColumns,
+    /// Print the board's own control codes.
+    PrintCode,
 }
 
 enum Mode {
@@ -73,6 +75,7 @@ pub struct BoardForm {
     users: Vec<(Uid, String, CheckboxState)>,
     members_btn: ButtonState,
     columns_btn: ButtonState,
+    code_btn: ButtonState,
     save: ButtonState,
     cancel: ButtonState,
     pub error: Option<String>,
@@ -105,6 +108,7 @@ impl BoardForm {
             users: Vec::new(),
             members_btn: ButtonState::new(),
             columns_btn: ButtonState::new(),
+            code_btn: ButtonState::new(),
             save: ButtonState::new(),
             cancel: ButtonState::new(),
             error: None,
@@ -216,7 +220,7 @@ impl BoardForm {
             }
         }
         if self.is_edit() {
-            b.widget(&self.members_btn).widget(&self.columns_btn);
+            b.widget(&self.members_btn).widget(&self.columns_btn).widget(&self.code_btn);
         }
         b.widget(&self.save).widget(&self.cancel);
         b.build()
@@ -251,6 +255,9 @@ impl BoardForm {
             }
             if self.columns_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
                 return BoardOutcome::OpenColumns;
+            }
+            if self.code_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
+                return BoardOutcome::PrintCode;
             }
         }
         self.name.handle(ev, Regular);
@@ -606,6 +613,8 @@ impl BoardForm {
             render_button(f, m, " Members ", &mut self.members_btn, t);
             let c = r.take(super::button_w(" Columns ") + pad);
             render_button(f, c, " Columns ", &mut self.columns_btn, t);
+            let k = r.take(super::button_w(" Print code ") + pad);
+            render_button(f, k, " Print code ", &mut self.code_btn, t);
         } else if self.is_private.checked() {
             label(f, l, "Members", t);
             if self.users.is_empty() {

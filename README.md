@@ -21,7 +21,7 @@ Print the task, scan to start, scan to finish, be less depresso expresso.
   - Note : Debian 13 ships 1.85 via apt, use rustup.rs
 - Optionally :
   - Receipt Printer
-  - Barcode Scanner
+  - Barcode Scanner, including control codes that drive the client itself: keys and screens, typing, the next scanned task, a task's fields, boards, templates and programs by code
 
 ## how to install this stuff
 This assumes you are on debian 13 and are currently logged into an user with sudo rights.
@@ -41,6 +41,8 @@ make setup
 ```
 3. Sign in with the user created during make setup or add your user to the taskologic group before running `taskologic`
    1. If you get an error about not being able to access to the socket sign out and back in.
+
+Everything past that first install is in [docs/](docs/README.md): deploying by hand, upgrading, printers, barcodes and the codes that drive the client, and moving boards between servers.
 
 
 ## How it is put together

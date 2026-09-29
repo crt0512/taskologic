@@ -383,6 +383,7 @@ mod tests {
 
     fn program() -> Program {
         Program {
+            short_id: taskologic_core::ids::ShortId::from_index(0),
             min_samples: 3,
             id: ProgramId(3),
             board_id: BoardId(1),

@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod control;
 mod forms;
 mod net;
 mod printing;

@@ -1,19 +1,22 @@
 //! One function per request. Permission checks all go through
 //! `taskologic_core::permission`, nothing in here decides on its own.
 
+/// If you ever have to work on this file ... Pray and prepare yourself to read 4K+ lines of code.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
 use taskologic_core::barcode::{ScanAction, ScanParseError, ScanPayload};
 use taskologic_core::board::{Board, plan_column_removal};
+use taskologic_core::control::SlipChoice;
 use taskologic_core::event::EventKind;
 use taskologic_core::ids::{ColumnId, ProgramId, RunId, TaskId, TemplateId, Uid};
 use taskologic_core::permission::{
     Actor, BoardAction, TaskAction, check_board, check_program_manage, check_run_cancel,
     check_task, check_template_manage,
 };
-use taskologic_core::print::{AutoprintTrigger, Recipients, build_task_job, wants_autoprint};
+use taskologic_core::print::{AutoprintTrigger, Recipients, build_task_job, wants_autoprint, CodeLine, build_codes_job, PrintJob, build_reminder_job};
 use taskologic_core::program::{self, Assign, Program, ProgramDraft, Run};
 use taskologic_core::task::{Task, TaskDraft};
 use taskologic_core::template::{
@@ -21,10 +24,7 @@ use taskologic_core::template::{
 };
 use taskologic_core::transition::{self, plan_move};
 use taskologic_core::user::UserSummary;
-use taskologic_proto::{
-    AnalyticsFilter, AnalyticsRow, BoardChange, BoardDetail, Event, HistoryEntry, RepeatEntry,
-    Request, Response, RunEntry, ScanOutcome, Severity, TaskChange, TaskState,
-};
+use taskologic_proto::{AnalyticsFilter, AnalyticsRow, BoardChange, BoardDetail, Event, HistoryEntry, RepeatEntry, Request, Response, RunEntry, ScanOutcome, Severity, TaskChange, TaskState, Found, LookupKind};
 
 use crate::auth;
 use crate::db::repo::{self, PrintAck};
@@ -1039,6 +1039,39 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             Ok(Response::Task { task })
         }
         Request::Scan { payload } => Ok(Response::Scan(scan(state, s, &payload)?)),
+        Request::Lookup { kind, short_id } => {
+            let gone = || AppError::NotFound("nothing has that code".into());
+            let found = match kind {
+                LookupKind::Board => {
+                    let board = state.db.with(|c| repo::board_by_short_id(c, short_id))?.ok_or_else(gone)?;
+                    check_board(BoardAction::View, &s.actor(), &board).map_err(|_| gone())?;
+                    Found::Board { board: Box::new(board) }
+                }
+                LookupKind::Template => {
+                    let template = state.db.with(|c| repo::template_by_short_id(c, short_id))?.ok_or_else(gone)?;
+                    let board = state.db.with(|c| repo::require_board(c, template.board_id))?;
+                    check_board(BoardAction::View, &s.actor(), &board).map_err(|_| gone())?;
+                    Found::Template { template: Box::new(template), board: Box::new(board) }
+                }
+                LookupKind::Program => {
+                    let program = state.db.with(|c| repo::program_by_short_id(c, short_id))?.ok_or_else(gone)?;
+                    let board = state.db.with(|c| repo::require_board(c, program.board_id))?;
+                    check_board(BoardAction::View, &s.actor(), &board).map_err(|_| gone())?;
+                    Found::Program { program: Box::new(program), board: Box::new(board) }
+                }
+            };
+            Ok(Response::Found(found))
+        }
+        Request::Resolve { short_id } => {
+            let Some(task) = state.db.with(|c| repo::task_by_short_id(c, short_id))? else {
+                return Err(AppError::NotFound("no task has that code".into()));
+            };
+            let (board, task) = load_task(state, s, task.id)?;
+            Ok(Response::Resolved {
+                task: Box::new(task),
+                board: Box::new(board),
+            })
+        }
         Request::Search {
             query,
             include_archived,
@@ -1048,26 +1081,46 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                 .with(|c| repo::search(c, s.uid, &query, include_archived))?;
             Ok(Response::SearchResults { hits })
         }
-        Request::PrintTask { task_id } => {
+        Request::PrintTask { task_id, slip } => {
             let (board, task) = load_task(state, s, task_id)?;
-            let job = state.db.with(|c| {
+            let now = Utc::now();
+            let jobs = state.db.with(|c| {
                 let user = repo::require_user(c, s.uid)?;
                 let names = repo::username_map(c)?;
                 let deps = repo::dep_lines(c, &task)?;
-                // Asking for the slip counts as having it. A reminder that
-                // would hand over the same paper an hour later then knows
-                // better, and autoprint already worked this way.
-                repo::mark_autoprinted(c, task.id, s.uid, Utc::now())?;
-                Ok(build_task_job(
-                    &task,
-                    &board,
-                    &deps,
-                    &|u| name_of(&names, u),
-                    &user,
-                    Utc::now(),
-                ))
+                let task_slip = |c: &rusqlite::Connection| -> Result<PrintJob, AppError> {
+                    // Asking for the slip counts as having it. A reminder that
+                    // would hand over the same paper an hour later then knows
+                    // better, and autoprint already worked this way.
+                    repo::mark_autoprinted(c, task.id, s.uid, now)?;
+                    Ok(build_task_job(&task, &board, &deps, &|u| name_of(&names, u), &user, now))
+                };
+                Ok(match slip.unwrap_or(SlipChoice::Finish) {
+                    SlipChoice::Finish => vec![task_slip(c)?],
+                    SlipChoice::Reminder => vec![build_reminder_job(&task, &board, &user, now)],
+                    SlipChoice::Combo => vec![build_reminder_job(&task, &board, &user, now), task_slip(c)?],
+                    // The pause card: the start/pause code alone, on a fixed
+                    // card rather than a layout of its own.
+                    SlipChoice::Pause => {
+                        let payload = ScanPayload {
+                            action: ScanAction::StartPause,
+                            short_id: task.short_id,
+                        }
+                        .encode();
+                        let line = CodeLine {
+                            label: "scan to start / pause".into(),
+                            payload,
+                            symbology: user.prefs.scanner.format,
+                            narrow: false,
+                        };
+                        let heading = format!("{} {}", task.title, task.short_id);
+                        vec![build_codes_job(&heading, vec![line], &user, now)]
+                    }
+                })
             })?;
-            state.enqueue_print(s.uid, &job)?;
+            for job in &jobs {
+                state.enqueue_print(s.uid, job)?;
+            }
             Ok(Response::Done)
         }
         Request::AckPrintJob { job_id, error } => {
@@ -2979,7 +3032,7 @@ mod tests {
             action,
             short_id: task.short_id,
         }
-        .encode(taskologic_core::barcode::Magic::Dots);
+        .encode();
         match handle(st, &session(uid), Request::Scan { payload }).unwrap() {
             Response::Scan(outcome) => outcome,
             other => panic!("{other:?}"),
@@ -3128,7 +3181,7 @@ mod tests {
         let program = make_program(&st, 1, &board, laundry());
         start_program(&st, 1, &program);
         let one = by_title(&live_tasks(&st, &board), "Step 1").id;
-        handle(&st, &session(1), Request::PrintTask { task_id: one }).unwrap();
+        handle(&st, &session(1), Request::PrintTask { task_id: one, slip: None }).unwrap();
         let jobs = st
             .db
             .with(|c| repo::pending_print_jobs(c, 1, Utc::now()))
@@ -3356,6 +3409,100 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("at least one finished task"), "{err}");
+    }
+
+    #[test]
+    fn resolve_names_a_task_by_its_code_without_touching_it() {
+        let st = state();
+        let board = make_board(&st, 1, true, &[1]);
+        let task = make_task(&st, 1, &board, "Wash");
+        match handle(&st, &session(1), Request::Resolve { short_id: task.short_id }).unwrap() {
+            Response::Resolved { task: t, board: b } => {
+                assert_eq!(t.id, task.id);
+                assert_eq!(b.id, board.id);
+                assert_eq!(t.column_id, task.column_id, "nothing moved");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A private board's task reads as not found to a non member, and an
+        // unknown code says so.
+        let err = handle(&st, &session(2), Request::Resolve { short_id: task.short_id }).unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+        let err = handle(&st, &session(1), Request::Resolve { short_id: taskologic_core::ids::ShortId::parse("ZZZZZZ").unwrap() }).unwrap_err();
+        assert!(err.to_string().contains("no task has that code"), "{err}");
+    }
+
+    #[test]
+    fn lookup_finds_a_board_template_or_program_by_its_short_id() {
+        let st = state();
+        let board = make_board(&st, 1, true, &[1]);
+        let tpl = match handle(
+            &st,
+            &session(1),
+            Request::CreateTemplate {
+                board_id: board.id,
+                name: "Wash".into(),
+                draft: TaskDraft { title: "Wash".into(), ..Default::default() },
+                options: Default::default(),
+            },
+        )
+        .unwrap()
+        {
+            Response::Template { template } => template,
+            other => panic!("{other:?}"),
+        };
+        match handle(&st, &session(1), Request::Lookup { kind: LookupKind::Board, short_id: board.short_id }).unwrap() {
+            Response::Found(Found::Board { board: b }) => assert_eq!(b.id, board.id),
+            other => panic!("{other:?}"),
+        }
+        match handle(&st, &session(1), Request::Lookup { kind: LookupKind::Template, short_id: tpl.short_id }).unwrap() {
+            Response::Found(Found::Template { template, board: b }) => {
+                assert_eq!(template.id, tpl.id);
+                assert_eq!(b.id, board.id);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Not a member of the private board: nothing found, by design.
+        let err = handle(&st, &session(2), Request::Lookup { kind: LookupKind::Template, short_id: tpl.short_id }).unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+        // The wrong kind for a code finds nothing either.
+        let err = handle(&st, &session(1), Request::Lookup { kind: LookupKind::Program, short_id: tpl.short_id }).unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn a_print_request_can_ask_for_each_slip() {
+        use taskologic_core::control::SlipChoice;
+        use taskologic_core::print::PrintJobKind;
+        let st = state();
+        let board = make_board(&st, 1, false, &[1]);
+        let task = make_task(&st, 1, &board, "Wash");
+        let kinds = |st: &Arc<AppState>| -> Vec<PrintJobKind> {
+            st.db
+                .with(|c| repo::pending_print_jobs(c, 1, Utc::now()))
+                .unwrap()
+                .into_iter()
+                .map(|(_, j)| j.kind)
+                .collect()
+        };
+        for (slip, want) in [
+            (None, vec![PrintJobKind::Task]),
+            (Some(SlipChoice::Reminder), vec![PrintJobKind::Task, PrintJobKind::Reminder]),
+            (Some(SlipChoice::Pause), vec![PrintJobKind::Task, PrintJobKind::Reminder, PrintJobKind::Codes]),
+            (
+                Some(SlipChoice::Combo),
+                vec![PrintJobKind::Task, PrintJobKind::Reminder, PrintJobKind::Codes, PrintJobKind::Reminder, PrintJobKind::Task],
+            ),
+        ] {
+            handle(&st, &session(1), Request::PrintTask { task_id: task.id, slip }).unwrap();
+            assert_eq!(kinds(&st), want, "{slip:?}");
+        }
+        // The pause card carries the start/pause code and nothing else.
+        let jobs = st.db.with(|c| repo::pending_print_jobs(c, 1, Utc::now())).unwrap();
+        let card = jobs.iter().map(|(_, j)| j).find(|j| j.kind == PrintJobKind::Codes).unwrap();
+        assert_eq!(card.codes.len(), 1);
+        assert!(card.codes[0].payload.starts_with("..1S"));
+        assert!(card.title.contains("Wash"));
     }
 
     #[test]
@@ -4319,12 +4466,12 @@ mod tests {
             action: taskologic_core::barcode::ScanAction::StartPause,
             short_id: task.short_id,
         }
-        .encode(taskologic_core::barcode::Magic::Dots);
+        .encode();
         let finish = ScanPayload {
             action: taskologic_core::barcode::ScanAction::Finish,
             short_id: task.short_id,
         }
-        .encode(taskologic_core::barcode::Magic::Dots);
+        .encode();
 
         let out = scan(&st, &session(2), &start).unwrap();
         assert!(
@@ -4659,3 +4806,5 @@ fn analytics_rows(
     }
     Ok(out)
 }
+
+// Jesus Christ, this has gotten way too huge, TODO : break this into smaller functions and possibly separate modules.

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BoardId, TemplateId, Uid};
+use crate::ids::{BoardId, ShortId, TemplateId, Uid};
 use crate::offset::Offset;
 use crate::task::TaskDraft;
 
@@ -90,6 +90,8 @@ impl TemplateOptions {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Template {
     pub id: TemplateId,
+    /// Six characters a barcode can name the template by.
+    pub short_id: ShortId,
     pub board_id: BoardId,
     /// Whoever saved it. Managing the template follows the task rules:
     /// this user, the board owner or an admin.

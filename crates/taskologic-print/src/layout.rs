@@ -11,7 +11,7 @@
 
 use chrono::{DateTime, Utc};
 use taskologic_core::barcode::ScanAction;
-use taskologic_core::print::{Barcode, PrintJob};
+use taskologic_core::print::{Barcode, PrintJob, PrintJobKind};
 
 use crate::slip::{SlipLayout, SlipRow, SlipSection};
 
@@ -79,6 +79,9 @@ impl SlipRow {
 /// that suits the kind of slip; by here the choice is already made.
 pub fn plan(job: &PrintJob, cols: usize, layout: &SlipLayout) -> Vec<Op> {
     let cols = cols.max(1);
+    if job.kind == PrintJobKind::Codes {
+        return codes_card(job, cols);
+    }
     let mut ops: Vec<Op> = Vec::new();
     for row in &layout.rows {
         if !row.enabled {
@@ -186,6 +189,27 @@ fn section(out: &mut Vec<Op>, row: &SlipRow, job: &PrintJob, cols: usize) {
     }
 }
 
+/// A codes card is not shaped by the printer's layout: a heading, then
+/// every code with its label above and its payload below, which is what
+/// the barcode op draws anyway. Nothing on it depends on a task.
+fn codes_card(job: &PrintJob, cols: usize) -> Vec<Op> {
+    let mut ops = vec![Op::Line(TextLine {
+        text: fit(&job.title, cols),
+        align: Align::Center,
+        bold: true,
+        scale: 1,
+    })];
+    for line in &job.codes {
+        ops.push(Op::Blank);
+        ops.push(Op::Barcode {
+            code: line.barcode(),
+            label: line.label.clone(),
+        });
+    }
+    ops.push(Op::End);
+    ops
+}
+
 fn barcodes(out: &mut Vec<Op>, job: &PrintJob, finishing: bool) {
     for code in job.barcodes.iter().filter(|b| b.action.finishes() == finishing) {
         let label = code.label.clone().unwrap_or_else(|| {
@@ -286,15 +310,18 @@ mod tests {
                     payload: "..1S".into(),
                     symbology: taskologic_core::print::Symbology::Code39,
                     label: None,
+                    narrow: false,
                 },
                 Barcode {
                     action: ScanAction::Finish,
                     payload: "..1F".into(),
                     symbology: taskologic_core::print::Symbology::Code39,
                     label: None,
+                    narrow: false,
                 },
             ],
             sheet: Vec::new(),
+            codes: Vec::new(),
             timezone: chrono_tz::UTC,
             created_at: DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
         }

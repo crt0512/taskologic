@@ -156,7 +156,7 @@ pub fn get_board(c: &Connection, id: BoardId) -> R<Option<Board>> {
     let row = c
         .query_row(
             "SELECT id, name, owner_uid, is_locked, is_private, archive_after_secs, started_col, paused_col, \
-             finished_col, created_at, purge_deleted_after_secs, card_fields_json, description FROM boards WHERE id = ?1",
+             finished_col, created_at, purge_deleted_after_secs, card_fields_json, description, short_id FROM boards WHERE id = ?1",
             params![id.0],
             |r| {
                 Ok((
@@ -173,6 +173,7 @@ pub fn get_board(c: &Connection, id: BoardId) -> R<Option<Board>> {
                     r.get::<_, i64>(10)?,
                     r.get::<_, String>(11)?,
                     r.get::<_, String>(12)?,
+                    r.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -191,6 +192,7 @@ pub fn get_board(c: &Connection, id: BoardId) -> R<Option<Board>> {
         purge,
         cards,
         description,
+        short,
     )) = row
     else {
         return Ok(None);
@@ -200,6 +202,7 @@ pub fn get_board(c: &Connection, id: BoardId) -> R<Option<Board>> {
     };
     Ok(Some(Board {
         id,
+        short_id: short_of(short),
         name,
         description,
         owner_uid: owner as Uid,
@@ -251,8 +254,8 @@ pub fn create_board(c: &Connection, owner: Uid, req: &CreateBoard, now: DateTime
         }
     }
     c.execute(
-        "INSERT INTO boards (name, owner_uid, is_locked, is_private, archive_after_secs, created_at, purge_deleted_after_secs, card_fields_json, description) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO boards (name, owner_uid, is_locked, is_private, archive_after_secs, created_at, purge_deleted_after_secs, card_fields_json, description, short_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             req.name.trim(),
             i64::from(owner),
@@ -262,7 +265,8 @@ pub fn create_board(c: &Connection, owner: Uid, req: &CreateBoard, now: DateTime
             ts(now),
             req.purge_deleted_after_secs,
             serde_json::to_string(&req.card_fields)?,
-            req.description.trim()
+            req.description.trim(),
+            fresh_short_id_in(c, "boards")?.as_str()
         ],
     )?;
     let board_id = BoardId(c.last_insert_rowid());
@@ -671,11 +675,19 @@ fn next_position(c: &Connection, column_id: ColumnId) -> R<i64> {
 }
 
 pub fn fresh_short_id(c: &Connection) -> R<ShortId> {
+    fresh_short_id_in(c, "tasks")
+}
+
+/// A short id no row of `table` has. Boards, templates and programs each
+/// have their own space; a task and a board may share a short id, since a
+/// code says which kind it names.
+pub fn fresh_short_id_in(c: &Connection, table: &str) -> R<ShortId> {
+    debug_assert!(matches!(table, "tasks" | "boards" | "templates" | "programs"));
     for _ in 0..32 {
         let n: i64 = c.query_row("SELECT abs(random())", [], |r| r.get(0))?;
         let id = ShortId::from_index(n as u64);
         let taken: i64 = c.query_row(
-            "SELECT count(*) FROM tasks WHERE short_id = ?1",
+            &format!("SELECT count(*) FROM {table} WHERE short_id = ?1"),
             params![id.as_str()],
             |r| r.get(0),
         )?;
@@ -684,6 +696,78 @@ pub fn fresh_short_id(c: &Connection) -> R<ShortId> {
         }
     }
     Err(anyhow::anyhow!("could not find a free short id after 32 tries").into())
+}
+
+/// Give every board, template and program without a short id one. Run
+/// once after the migrations, for rows from before there were any.
+pub fn backfill_short_ids(c: &Connection) -> R<()> {
+    for table in ["boards", "templates", "programs"] {
+        let mut st = c.prepare(&format!("SELECT id FROM {table} WHERE short_id IS NULL"))?;
+        let ids: Vec<i64> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for id in ids {
+            let short = fresh_short_id_in(c, table)?;
+            c.execute(
+                &format!("UPDATE {table} SET short_id = ?2 WHERE id = ?1"),
+                params![id, short.as_str()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn short_of(s: Option<String>) -> ShortId {
+    s.and_then(|s| ShortId::parse(&s).ok()).unwrap_or(ShortId::from_index(0))
+}
+
+pub fn board_by_short_id(c: &Connection, short: ShortId) -> R<Option<Board>> {
+    let id: Option<i64> = c
+        .query_row("SELECT id FROM boards WHERE short_id = ?1", params![short.as_str()], |r| r.get(0))
+        .optional()?;
+    match id {
+        Some(id) => get_board(c, BoardId(id)),
+        None => Ok(None),
+    }
+}
+
+pub fn template_by_short_id(c: &Connection, short: ShortId) -> R<Option<Template>> {
+    let id: Option<i64> = c
+        .query_row("SELECT id FROM templates WHERE short_id = ?1", params![short.as_str()], |r| r.get(0))
+        .optional()?;
+    match id {
+        Some(id) => get_template(c, TemplateId(id)),
+        None => Ok(None),
+    }
+}
+
+pub fn program_by_short_id(c: &Connection, short: ShortId) -> R<Option<Program>> {
+    let id: Option<i64> = c
+        .query_row("SELECT id FROM programs WHERE short_id = ?1", params![short.as_str()], |r| r.get(0))
+        .optional()?;
+    match id {
+        Some(id) => get_program(c, ProgramId(id)),
+        None => Ok(None),
+    }
+}
+
+/// Give a board, template or program the short id a file carried.
+pub fn set_short_id(c: &Connection, table: &str, id: i64, short: ShortId) -> R<()> {
+    debug_assert!(matches!(table, "boards" | "templates" | "programs"));
+    c.execute(
+        &format!("UPDATE {table} SET short_id = ?2 WHERE id = ?1"),
+        params![id, short.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Whether a board, template or program already has this short id.
+pub fn short_id_taken(c: &Connection, table: &str, short: ShortId) -> R<bool> {
+    debug_assert!(matches!(table, "boards" | "templates" | "programs"));
+    let n: i64 = c.query_row(
+        &format!("SELECT count(*) FROM {table} WHERE short_id = ?1"),
+        params![short.as_str()],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 fn write_relations(
@@ -1142,6 +1226,7 @@ fn template_from_row(r: &Row) -> rusqlite::Result<Template> {
     let options: String = r.get("options_json")?;
     Ok(Template {
         id: TemplateId(r.get("id")?),
+        short_id: short_of(r.get("short_id")?),
         board_id: BoardId(r.get("board_id")?),
         owner_uid: r.get::<_, i64>("owner_uid")? as Uid,
         name: r.get("name")?,
@@ -1181,13 +1266,14 @@ pub fn create_template(
     options: &TemplateOptions,
 ) -> R<Template> {
     c.execute(
-        "INSERT INTO templates (board_id, owner_uid, name, payload_json, options_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO templates (board_id, owner_uid, name, payload_json, options_json, short_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             board_id.0,
             i64::from(owner),
             name,
             serde_json::to_string(draft)?,
-            serde_json::to_string(options)?
+            serde_json::to_string(options)?,
+            fresh_short_id_in(c, "templates")?.as_str()
         ],
     )?;
     require_template(c, TemplateId(c.last_insert_rowid()))
@@ -1237,6 +1323,7 @@ fn program_from_row(r: &Row) -> rusqlite::Result<Program> {
     let steps: String = r.get("steps_json")?;
     Ok(Program {
         id: ProgramId(r.get("id")?),
+        short_id: short_of(r.get("short_id")?),
         board_id: BoardId(r.get("board_id")?),
         owner_uid: r.get::<_, i64>("owner_uid")? as Uid,
         name: r.get("name")?,
@@ -1275,15 +1362,16 @@ pub fn create_program(
     draft: &ProgramDraft,
 ) -> R<Program> {
     c.execute(
-        "INSERT INTO programs (board_id, owner_uid, name, description, steps_json, min_samples) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO programs (board_id, owner_uid, name, description, steps_json, min_samples, short_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             board_id.0,
             i64::from(owner),
             draft.name.trim(),
             draft.description.trim(),
             serde_json::to_string(&draft.steps)?,
-            i64::from(draft.min_samples)
+            i64::from(draft.min_samples),
+            fresh_short_id_in(c, "programs")?.as_str()
         ],
     )?;
     require_program(c, ProgramId(c.last_insert_rowid()))

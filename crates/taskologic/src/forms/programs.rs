@@ -26,6 +26,8 @@ pub enum ProgramsOutcome {
     Edit(Box<Program>),
     Delete(Box<Program>),
     Runs,
+    /// Print the program's own control codes.
+    PrintCode(Box<Program>),
 }
 
 pub struct ProgramsPanel {
@@ -40,6 +42,7 @@ pub struct ProgramsPanel {
     new_btn: ButtonState,
     edit_btn: ButtonState,
     runs_btn: ButtonState,
+    code_btn: ButtonState,
     delete_btn: ButtonState,
     close_btn: ButtonState,
     pub error: Option<String>,
@@ -60,6 +63,7 @@ impl ProgramsPanel {
             new_btn: ButtonState::new(),
             edit_btn: ButtonState::new(),
             runs_btn: ButtonState::new(),
+            code_btn: ButtonState::new(),
             delete_btn: ButtonState::new(),
             close_btn: ButtonState::new(),
             error: None,
@@ -109,6 +113,7 @@ impl ProgramsPanel {
             .widget(&self.new_btn)
             .widget(&self.edit_btn)
             .widget(&self.runs_btn)
+            .widget(&self.code_btn)
             .widget(&self.delete_btn)
             .widget(&self.close_btn);
         b.build()
@@ -138,6 +143,14 @@ impl ProgramsPanel {
             || key == Some(KeyCode::Char('r'))
         {
             return ProgramsOutcome::Runs;
+        }
+        if self.code_btn.handle(ev, Regular) == ButtonOutcome::Pressed
+            || key == Some(KeyCode::Char('c'))
+        {
+            return match self.selected() {
+                Some(p) => ProgramsOutcome::PrintCode(Box::new(p.clone())),
+                None => ProgramsOutcome::Changed,
+            };
         }
         let start = self.start_btn.handle(ev, Regular) == ButtonOutcome::Pressed
             || (key == Some(KeyCode::Enter) && self.list.is_focused());
@@ -214,13 +227,14 @@ impl ProgramsPanel {
         if let Some(e) = &self.error {
             f.render_widget(Paragraph::new(e.clone()).style(t.error()), err);
         }
-        let labels = [" Start ", " New ", " Edit ", " Runs ", " Delete ", " Close "];
+        let labels = [" Start ", " New ", " Edit ", " Runs ", " Code ", " Delete ", " Close "];
         let rects = button_bar(buttons, &labels, t);
         let states = [
             &mut self.start_btn,
             &mut self.new_btn,
             &mut self.edit_btn,
             &mut self.runs_btn,
+            &mut self.code_btn,
             &mut self.delete_btn,
             &mut self.close_btn,
         ];

@@ -7,7 +7,6 @@ use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Clear, Paragraph};
-use taskologic_core::barcode::Magic;
 use taskologic_core::prefs::{
     AutoprintFilter, CardFields, CustomColors, PrintMode, PrintPrefs, ScannerPrefs, ThemePreset,
     UiPrefs, UserPrefs, parse_reminder_hours, reminder_hours_text,
@@ -36,6 +35,8 @@ pub enum SettingsOutcome {
     },
     /// Open the printer setup subwindow.
     Printer,
+    /// Open the Print codes panel.
+    PrintCodes,
     /// Open the custom colour editor with these colours.
     EditColors(Box<CustomColors>),
 }
@@ -51,7 +52,6 @@ const FORMAT_ITEMS: [(Symbology, &str); 4] = [
     (Symbology::Qr, "QR"),
     (Symbology::DataMatrix, "DataMatrix"),
 ];
-const MAGIC_ITEMS: [(Magic, &str); 2] = [(Magic::Dots, ".. dots"), (Magic::Dashes, "-- dashes")];
 const THEME_ITEMS: [(ThemePreset, &str); 3] = [
     (ThemePreset::Default, "default"),
     (ThemePreset::Dark, "dark"),
@@ -96,9 +96,11 @@ pub struct SettingsForm {
     manual_only: CheckboxState,
     prefix: TextInputState,
     format: ChoiceState<Symbology>,
-    magic: ChoiceState<Magic>,
+    /// Seconds a control code waits for what comes next; 0 is forever.
+    control_timeout: TextInputState,
     printer_summary: String,
     printer_btn: ButtonState,
+    codes_btn: ButtonState,
     save: ButtonState,
     cancel: ButtonState,
     mouse_seen: bool,
@@ -128,8 +130,8 @@ impl SettingsForm {
         prefix.set_text(p.scanner.prefix.clone());
         let mut format = ChoiceState::named("format");
         format.set_value(p.scanner.format);
-        let mut magic = ChoiceState::named("magic");
-        magic.set_value(p.scanner.magic);
+        let mut control_timeout = TextInputState::named("control_timeout");
+        control_timeout.set_text(p.scanner.control_timeout_secs.to_string());
         let cards = p.ui.card_fields.unwrap_or_default();
         let mut theme = ChoiceState::named("theme");
         theme.set_value(p.ui.theme);
@@ -164,9 +166,10 @@ impl SettingsForm {
             manual_only: check("manual_only", p.scanner.manual_only),
             prefix,
             format,
-            magic,
+            control_timeout,
             printer_summary: profile_summary(printer),
             printer_btn: ButtonState::new(),
+            codes_btn: ButtonState::new(),
             save: ButtonState::new(),
             cancel: ButtonState::new(),
             mouse_seen,
@@ -211,8 +214,9 @@ impl SettingsForm {
             .widget(&self.manual_only)
             .widget(&self.prefix)
             .widget(&self.format)
-            .widget(&self.magic)
+            .widget(&self.control_timeout)
             .widget(&self.printer_btn)
+            .widget(&self.codes_btn)
             .widget(&self.save)
             .widget(&self.cancel);
         b.build()
@@ -229,7 +233,6 @@ impl SettingsForm {
         // An open dropdown eats Esc to close itself.
         let popup_open = self.mode.is_popup_active()
             || self.format.is_popup_active()
-            || self.magic.is_popup_active()
             || self.theme.is_popup_active();
         match key {
             Some(KeyCode::Esc) if !popup_open => return SettingsOutcome::Cancel,
@@ -248,6 +251,9 @@ impl SettingsForm {
         }
         if self.printer_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
             return SettingsOutcome::Printer;
+        }
+        if self.codes_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
+            return SettingsOutcome::PrintCodes;
         }
         if self.edit_colors.handle(ev, Regular) == ButtonOutcome::Pressed {
             return SettingsOutcome::EditColors(Box::new(self.colors.clone()));
@@ -282,7 +288,7 @@ impl SettingsForm {
         self.prefix.handle(ev, Regular);
         self.mode.handle(ev, Regular);
         self.format.handle(ev, Regular);
-        self.magic.handle(ev, Regular);
+        self.control_timeout.handle(ev, Regular);
         self.theme.handle(ev, Regular);
         SettingsOutcome::Changed
     }
@@ -358,7 +364,12 @@ impl SettingsForm {
                 manual_only: self.manual_only.checked(),
                 format: self.format.value(),
                 prefix: self.prefix.text().to_string(),
-                magic: self.magic.value(),
+                control_timeout_secs: self
+                    .control_timeout
+                    .text()
+                    .trim()
+                    .parse()
+                    .map_err(|_| "the control code timeout is whole seconds, 0 for never".to_string())?,
             },
         };
         Ok((prefs, (tz != self.original_tz).then_some(tz)))
@@ -608,19 +619,22 @@ impl SettingsForm {
         f.render_stateful_widget(format_w, format_area, &mut self.format);
         dropdown_marker(f, &self.format, t);
         f.render_widget(
-            Paragraph::new("magic").style(t.surface_dim()),
-            r.text("magic"),
+            Paragraph::new("control codes wait").style(t.surface_dim()),
+            r.text("control codes wait"),
         );
-        let magic_area = r.take(12);
-        let (magic_w, magic_popup) = dropdown(MAGIC_ITEMS, magic_area, t);
-        f.render_stateful_widget(magic_w, magic_area, &mut self.magic);
-        dropdown_marker(f, &self.magic, t);
+        f.render_stateful_widget(field(t), r.take(5), &mut self.control_timeout);
+        f.render_widget(
+            Paragraph::new("s, 0 = forever").style(t.surface_dim()),
+            r.text("s, 0 = forever"),
+        );
 
         let (l, w) = split_label(rows[15], lw);
         label(f, l, "Printer", t);
         let mut r = Row::new(w);
         let pb = r.take(super::button_w(" Printer setup ") + pad);
         render_button(f, pb, " Printer setup ", &mut self.printer_btn, t);
+        let cb = r.take(super::button_w(" Print codes ") + pad);
+        render_button(f, cb, " Print codes ", &mut self.codes_btn, t);
         f.render_widget(
             Paragraph::new(self.printer_summary.clone()).style(t.surface_dim()),
             r.rest(),
@@ -640,14 +654,13 @@ impl SettingsForm {
         dropdown_popup_hover(f, &self.mode, t);
         f.render_stateful_widget(format_popup, format_area, &mut self.format);
         dropdown_popup_hover(f, &self.format, t);
-        f.render_stateful_widget(magic_popup, magic_area, &mut self.magic);
-        dropdown_popup_hover(f, &self.magic, t);
 
         if let Some(p) = [
             self.timezone.screen_cursor(),
             self.reminder_start_hours.screen_cursor(),
             self.reminder_hours.screen_cursor(),
             self.prefix.screen_cursor(),
+            self.control_timeout.screen_cursor(),
         ]
         .into_iter()
         .flatten()

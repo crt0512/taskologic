@@ -11,6 +11,7 @@
 
 pub mod barcode;
 pub mod board;
+pub mod control;
 pub mod deps;
 pub mod event;
 pub mod ids;

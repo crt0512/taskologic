@@ -17,6 +17,7 @@ pub mod repeats;
 pub mod runs;
 pub mod settings;
 pub mod start_program;
+pub mod codes;
 pub mod step;
 pub mod task;
 pub mod templates;

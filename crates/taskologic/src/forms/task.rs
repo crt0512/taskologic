@@ -528,6 +528,37 @@ impl TaskForm {
 
     /// After a conflict the user chose to overwrite: save against the
     /// version that is current now.
+    /// Put the cursor in the field a control code named. Fields the form
+    /// has no single widget for (assignees, checklist ticks) land on the
+    /// nearest thing.
+    pub fn focus_field(&mut self, field: taskologic_core::control::Field) {
+        use taskologic_core::control::Field;
+        let focus = self.focus();
+        match field {
+            Field::Title => focus.focus(&self.title),
+            Field::Description => focus.focus(&self.description),
+            Field::Start => focus.focus(&self.start),
+            Field::Due => focus.focus(&self.due),
+            Field::RemindStart => {
+                self.remind_start_override.set_checked(true);
+                let focus = self.focus();
+                focus.focus(&self.remind_start_hours);
+            }
+            Field::RemindDue => {
+                self.remind_override.set_checked(true);
+                let focus = self.focus();
+                focus.focus(&self.remind_hours);
+            }
+            Field::Checklist | Field::ChecklistItem(_) => focus.focus(&self.checklist),
+            Field::Assign => {
+                if let Some(m) = self.members.first() {
+                    focus.focus(&m.check);
+                }
+            }
+            Field::ExcludeFromStats => focus.focus(&self.title),
+        }
+    }
+
     pub fn set_version(&mut self, version: u64) {
         if let FormMode::Edit { task, .. } = self.mode {
             self.mode = FormMode::Edit { task, version };
@@ -1678,6 +1709,7 @@ mod tests {
     fn template(id: i64, name: &str, options: TemplateOptions) -> Template {
         Template {
             id: TemplateId(id),
+            short_id: taskologic_core::ids::ShortId::from_index(0),
             board_id: BoardId(1),
             owner_uid: 1,
             name: name.into(),
@@ -1835,6 +1867,7 @@ mod tests {
     #[test]
     fn template_mode_prefills_and_never_emits_due_or_deps() {
         let tpl = Template {
+            short_id: taskologic_core::ids::ShortId::from_index(0),
             id: TemplateId(5),
             board_id: BoardId(1),
             owner_uid: 1,

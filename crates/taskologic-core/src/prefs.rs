@@ -4,7 +4,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::barcode::Magic;
 use crate::print::Symbology;
 
 /// Which colour scheme the client draws with.
@@ -302,6 +301,9 @@ pub fn reminder_hours_text(minutes: u32) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// What a control code waits, unless the user says otherwise.
+pub const DEFAULT_CONTROL_TIMEOUT_SECS: u32 = 20;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScannerPrefs {
@@ -313,7 +315,10 @@ pub struct ScannerPrefs {
     pub format: Symbology,
     /// Characters the scanner is programmed to emit before the contents.
     pub prefix: String,
-    pub magic: Magic,
+    /// Seconds a control code waits for its next piece, for a task scan to
+    /// complete an armed override, or for an answer on screen. 0 waits
+    /// forever.
+    pub control_timeout_secs: u32,
 }
 
 impl Default for ScannerPrefs {
@@ -323,7 +328,7 @@ impl Default for ScannerPrefs {
             manual_only: false,
             format: Symbology::Code39,
             prefix: String::new(),
-            magic: Magic::Dots,
+            control_timeout_secs: DEFAULT_CONTROL_TIMEOUT_SECS,
         }
     }
 }
@@ -342,7 +347,7 @@ mod tests {
         assert_eq!(p.print.reminder_due_minutes, None);
         assert_eq!(p.print.mode, PrintMode::Manual);
         assert_eq!(p.scanner.format, Symbology::Code39);
-        assert_eq!(p.scanner.magic, Magic::Dots);
+        assert_eq!(p.scanner.control_timeout_secs, 20);
         assert_eq!(p.ui.card_fields, None);
         assert_eq!(p.ui.theme, ThemePreset::Default);
         let c = CardFields::default();

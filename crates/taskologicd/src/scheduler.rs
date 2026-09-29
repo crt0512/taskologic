@@ -227,9 +227,10 @@ fn print_reminders(state: &Arc<AppState>) -> Result<(), AppError> {
                     continue;
                 }
                 let job = match planned.job {
-                    // A reminder never plans a sheet; the arm keeps the
-                    // match honest if a kind is ever added to the planner.
-                    PrintJobKind::Reminder | PrintJobKind::Sheet => {
+                    // A reminder never plans a sheet or a codes card; the
+                    // arm keeps the match honest if a kind is ever added to
+                    // the planner.
+                    PrintJobKind::Reminder | PrintJobKind::Sheet | PrintJobKind::Codes => {
                         build_reminder_job(&task, &board, &user, now)
                     }
                     // The slip you work from, so nobody gets two of them:
@@ -508,7 +509,7 @@ mod tests {
                 uid: 1,
                 is_admin: true,
             },
-            Request::PrintTask { task_id: task.id },
+            Request::PrintTask { task_id: task.id, slip: None },
         )
         .unwrap();
         assert_eq!(slips(&st), vec![PrintJobKind::Task]);

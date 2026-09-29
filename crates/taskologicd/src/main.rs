@@ -47,6 +47,7 @@ fn usage() -> ! {
          \x20 --migrate     back the database up, then apply pending migrations\n\
          \x20 --export-program  BOARD NAME [FILE]   write a program as JSON, to stdout without FILE\n\
          \x20 --import-program  BOARD FILE          create the program in FILE on BOARD (- reads stdin)\n\
+         \x20                   [--on-clash refuse|new|replace]  when the server has the file's short id\n\
          \x20 --export-template BOARD NAME [FILE]   the same for a template and what it depends on\n\
          \x20 --import-template BOARD FILE\n\
          \x20 --export-board    NAME|all [FILE]     a board with its tasks, history, programs, repeats\n\
@@ -112,10 +113,11 @@ fn parse_args() -> (Mode, PathBuf) {
                     "--import-program" | "--import-template" => {
                         let mut w = need(2);
                         let (board, file) = (w.remove(0), PathBuf::from(w.remove(0)));
+                        let clash = on_clash(&args, &mut i);
                         if a == "--import-program" {
-                            Command::ImportProgram { board, file }
+                            Command::ImportProgram { board, file, clash }
                         } else {
-                            Command::ImportTemplate { board, file }
+                            Command::ImportTemplate { board, file, clash }
                         }
                     }
                     "--export-board" => {
@@ -125,15 +127,17 @@ fn parse_args() -> (Mode, PathBuf) {
                             file: extra(&mut i),
                         }
                     }
-                    "--import-board" => Command::ImportBoard {
-                        file: PathBuf::from(need(1).remove(0)),
-                    },
+                    "--import-board" => {
+                        let file = PathBuf::from(need(1).remove(0));
+                        Command::ImportBoard { file, clash: on_clash(&args, &mut i) }
+                    }
                     "--export-all" => Command::ExportAll {
                         file: extra(&mut i),
                     },
-                    "--import-all" => Command::ImportAll {
-                        file: PathBuf::from(need(1).remove(0)),
-                    },
+                    "--import-all" => {
+                        let file = PathBuf::from(need(1).remove(0));
+                        Command::ImportAll { file, clash: on_clash(&args, &mut i) }
+                    }
                     "--users" => Command::Users,
                     _ => {
                         let file = PathBuf::from(need(1).remove(0));
@@ -152,6 +156,17 @@ fn parse_args() -> (Mode, PathBuf) {
         .or_else(|| std::env::var_os("TASKOLOGICD_CONFIG").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
     (mode, path)
+}
+
+/// An optional `--on-clash refuse|new|replace` after an import's arguments:
+/// what to do when the server already has a short id the file carries.
+fn on_clash(args: &[String], i: &mut usize) -> transfer::Clash {
+    if args.get(*i).map(String::as_str) == Some("--on-clash") {
+        let value = args.get(*i + 1).cloned().unwrap_or_else(|| usage());
+        *i += 2;
+        return transfer::Clash::parse(&value).unwrap_or_else(|| usage());
+    }
+    transfer::Clash::default()
 }
 
 /// Who an import belongs to: whoever ran it, seen through sudo when the

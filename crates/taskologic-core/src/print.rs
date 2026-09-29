@@ -53,6 +53,10 @@ pub struct Barcode {
     /// would be a lie. A sample on a test slip does not start anything.
     #[serde(default)]
     pub label: Option<String>,
+    /// Draw a 1D code at one dot per module whatever the profile says: the
+    /// thin half of a test strip, to learn what a scanner still reads.
+    #[serde(default)]
+    pub narrow: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +67,10 @@ pub enum PrintJobKind {
     /// One slip for a whole group of tasks a program made at once: each with
     /// its start code, and the root's code that finishes whatever is running.
     Sheet,
+    /// A card of control codes, or one task code on its own: a heading and
+    /// a list of labelled barcodes, laid out fixed rather than by the
+    /// printer's slip layout. See `crate::control`.
+    Codes,
 }
 
 /// When one of a task's own print rules fires.
@@ -224,6 +232,9 @@ pub struct PrintJob {
     /// on every other kind of slip.
     #[serde(default)]
     pub sheet: Vec<SheetEntry>,
+    /// The codes a codes card carries, in order. Empty on every other kind.
+    #[serde(default)]
+    pub codes: Vec<CodeLine>,
     /// For rendering timestamps. The job follows the user, so does the zone.
     pub timezone: Tz,
     pub created_at: DateTime<Utc>,
@@ -237,17 +248,67 @@ pub struct SheetEntry {
     pub barcode: Barcode,
 }
 
+/// One code on a codes card: what the line above it says, and the code.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeLine {
+    pub label: String,
+    pub payload: String,
+    pub symbology: Symbology,
+    /// One dot per module, for the thin half of a test strip.
+    #[serde(default)]
+    pub narrow: bool,
+}
+
+impl CodeLine {
+    /// The barcode the layout draws for this line. Codes cards carry no
+    /// task action; the label is the whole story.
+    pub fn barcode(&self) -> Barcode {
+        Barcode {
+            action: ScanAction::StartPause,
+            payload: self.payload.clone(),
+            symbology: self.symbology,
+            label: Some(self.label.clone()),
+            narrow: self.narrow,
+        }
+    }
+}
+
+/// A codes card: `heading` at the top, then every code with its label.
+/// Built and printed by the client on its own, no task behind it.
+pub fn build_codes_job(heading: &str, codes: Vec<CodeLine>, user: &User, now: DateTime<Utc>) -> PrintJob {
+    PrintJob {
+        kind: PrintJobKind::Codes,
+        task_id: TaskId(0),
+        short_id: ShortId::from_index(0),
+        board_name: heading.to_string(),
+        title: heading.to_string(),
+        description: None,
+        start_at: None,
+        due_at: None,
+        dependencies: None,
+        created_by: None,
+        assignees: None,
+        checklist: Vec::new(),
+        barcodes: Vec::new(),
+        sheet: Vec::new(),
+        codes,
+        timezone: user.timezone,
+        created_at: now,
+    }
+}
+
 fn barcode(user: &User, task: &Task, action: ScanAction) -> Barcode {
     let payload = ScanPayload {
         action,
         short_id: task.short_id,
     }
-    .encode(user.prefs.scanner.magic);
+    .encode();
     Barcode {
         action,
         payload,
         symbology: user.prefs.scanner.format,
         label: None,
+        narrow: false,
     }
 }
 
@@ -261,6 +322,7 @@ pub fn sample_barcode(symbology: Symbology, action: ScanAction) -> Barcode {
         payload: SAMPLE_BARCODE_PAYLOAD.to_string(),
         symbology,
         label: Some("sample barcode".to_string()),
+        narrow: false,
     }
 }
 
@@ -313,6 +375,7 @@ pub fn build_task_job(
         checklist: task.checklist.clone(),
         barcodes,
         sheet: Vec::new(),
+        codes: Vec::new(),
         timezone: user.timezone,
         created_at: now,
     }
@@ -356,6 +419,7 @@ pub fn build_sheet_job(
                 }
             })
             .collect(),
+        codes: Vec::new(),
         timezone: user.timezone,
         created_at: now,
     }
@@ -381,6 +445,7 @@ pub fn build_reminder_job(task: &Task, board: &Board, user: &User, now: DateTime
         checklist: task.checklist.clone(),
         barcodes,
         sheet: Vec::new(),
+        codes: Vec::new(),
         timezone: user.timezone,
         created_at: now,
     }
@@ -622,7 +687,6 @@ mod tests {
         let task = task_on(&board, 1);
         let mut prefs = UserPrefs::default();
         prefs.ui.scanner_enabled = true;
-        prefs.scanner.magic = crate::barcode::Magic::Dashes;
         let job = build_reminder_job(
             &task,
             &board,
@@ -637,7 +701,7 @@ mod tests {
             2,
             "start and finish, as a task slip has"
         );
-        assert!(job.barcodes[0].payload.starts_with("--1S"));
+        assert!(job.barcodes[0].payload.starts_with("..1S"));
         assert_eq!(job.due_at, task.due_at);
         assert_eq!(job.checklist, task.checklist);
     }

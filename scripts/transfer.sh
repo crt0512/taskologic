@@ -12,6 +12,10 @@
 #   scripts/transfer.sh users
 #   scripts/transfer.sh users remap     server.json [remapped.json]
 #
+# An import may end in --new-id or --replace: what to do when this server
+# already has a board, template or program with the file's short id (the
+# six characters barcodes name it by). Without either, it refuses and says
+# which board has it. --replace overwrites a template or program in place.
 # Without a file an export prints to stdout; an import reads "-" as stdin.
 
 set -eu
@@ -19,7 +23,7 @@ set -eu
 fail() { echo "error: $1" >&2; exit 1; }
 
 usage() {
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 }
 
@@ -43,6 +47,23 @@ case "$verb" in
         [ $# -ge 1 ] || usage
         kind=$1
         shift
+        # --new-id or --replace anywhere among an import's arguments, handed
+        # to the daemon as --on-clash.
+        clash=""
+        if [ "$verb" = import ]; then
+            n=$#
+            i=0
+            while [ $i -lt $n ]; do
+                arg=$1
+                shift
+                i=$((i + 1))
+                case "$arg" in
+                    --new-id) clash="new" ;;
+                    --replace) clash="replace" ;;
+                    *) set -- "$@" "$arg" ;;
+                esac
+            done
+        fi
         case "$verb/$kind" in
             export/program|export/template) { [ $# -eq 2 ] || [ $# -eq 3 ]; } || usage; outfile="${3:-}" ;;
             import/program|import/template) [ $# -eq 2 ] || usage ;;
@@ -52,6 +73,9 @@ case "$verb" in
             *) usage ;;
         esac
         set -- "--$verb-$kind" "$@"
+        if [ -n "$clash" ]; then
+            set -- "$@" --on-clash "$clash"
+        fi
         ;;
     *) usage ;;
 esac

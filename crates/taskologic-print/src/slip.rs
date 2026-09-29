@@ -241,6 +241,8 @@ impl SlipSet {
             // A sheet is the root's task slip with its group listed in the
             // sheet section, so it is shaped by the same layout.
             PrintJobKind::Sheet => &self.task,
+            // A codes card is laid out fixed; the layout is never consulted.
+            PrintJobKind::Codes => &self.task,
         }
     }
 }

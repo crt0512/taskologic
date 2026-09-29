@@ -8,6 +8,7 @@ pub fn detector_for(prefs: &ScannerPrefs) -> ScanDetector {
     ScanDetector::new()
         .with_prefix(&prefs.prefix)
         .with_enter_terminates(prefs.presses_enter)
+        .with_frame_timeout_ms(u64::from(prefs.control_timeout_secs) * 1000)
 }
 
 /// Keys the detector cares about. Anything with Ctrl or Alt is never part

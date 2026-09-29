@@ -25,7 +25,7 @@ usage: scripts/dev.sh <command>
   daemon    build and run the daemon in the foreground (debug logging)
   client    build and run the client against the dev daemon
   stop      stop a background daemon
-  socat     open a raw protocol session, type JSON lines (see docs/running.md)
+  socat     open a raw protocol session, type JSON lines (see docs/running-dev.md)
   sql       open the dev database in sqlite3
   barcode   print a scannable payload: scripts/dev.sh barcode K4M9Q2 [S|F|Y|N|1-8]
   reset     stop the daemon and delete the database, socket and log

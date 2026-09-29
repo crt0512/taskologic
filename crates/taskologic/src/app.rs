@@ -13,7 +13,10 @@ use crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use taskologic_core::barcode::{Feed, ScanAction, ScanDetector};
+use taskologic_core::barcode::{Expired, Feed, ScanAction, ScanDetector, ScanPayload};
+use taskologic_core::control::{self, Control, Value};
+
+use crate::control::{Armed, ControlState, Waiting, named_key_event, values_date, values_minutes, values_text};
 use taskologic_core::board::{Board, ColumnRole};
 use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, TaskId, Uid};
 use taskologic_core::prefs::{CardFields, CustomColors, ThemePreset};
@@ -22,14 +25,12 @@ use taskologic_core::program::Question;
 use taskologic_core::task::Task;
 use taskologic_core::user::User;
 use taskologic_print::DeviceProfile;
-use taskologic_proto::{
-    BoardChange, BoardDetail, BoardSummary, ClientMessage, ErrorBody, ErrorCode, Event, Hello,
-    Request, RequestId, Response, ScanOutcome, SearchHit, ServerMessage, Severity, TaskChange,
-};
+use taskologic_proto::{BoardChange, BoardDetail, BoardSummary, ClientMessage, ErrorBody, ErrorCode, Event, Hello, Request, RequestId, Response, ScanOutcome, SearchHit, ServerMessage, Severity, TaskChange, Found, LookupKind};
 
 use crate::forms::analytics::{AnalyticsOutcome, AnalyticsPanel};
 use crate::forms::archive::{ArchiveOutcome, ArchivePanel};
 use crate::forms::board::{BoardForm, BoardOutcome};
+use crate::forms::codes::{CodesOutcome, CodesPanel};
 use crate::forms::colors::{ColorsForm, ColorsOutcome};
 use crate::forms::columns::{ColumnsOutcome, ColumnsPanel};
 use crate::forms::confirm::{Confirm, ConfirmOutcome};
@@ -146,6 +147,13 @@ pub(crate) enum Pending {
     Restore,
     Archived,
     Scan,
+    /// A task scan while a control code is armed: the task and its board
+    /// come back and the code acts on them.
+    Resolve,
+    /// A change made by a control code; the task comes back changed.
+    ControlOp,
+    /// A targeted control code: what it names comes back, then it acts.
+    Lookup(Box<Control>),
     Search,
     Print,
     Ack,
@@ -213,6 +221,19 @@ pub enum Overlay {
     Printer {
         form: Box<PrinterForm>,
         back: Box<SettingsForm>,
+    },
+    /// The Print codes panel, opened from settings and returning to it.
+    Codes {
+        panel: Box<CodesPanel>,
+        back: Box<SettingsForm>,
+    },
+    /// A "move to" scanned without a column asks which, for this task.
+    ColumnPick {
+        task: Box<Task>,
+        options: Vec<(ColumnId, String)>,
+        sel: usize,
+        /// When it opened, for the control timeout.
+        since_ms: u64,
     },
     BoardForm(Box<BoardForm>),
     Members(Box<MembersPanel>),
@@ -519,8 +540,13 @@ pub struct App {
     pub toast: Option<Toast>,
     pub menu_areas: Vec<(Rect, char)>,
     pub printer: Option<DeviceProfile>,
+    /// What the last local print was, for its toast: a test print or a
+    /// codes card.
+    local_print: &'static str,
     pub color_mode: ColorMode,
     pub manual_scan: bool,
+    /// What control codes are waiting for between scans.
+    pub control: ControlState,
     /// Screen inverts until this instant, the visual half of the scan bell.
     pub flash_until_ms: u64,
     pub mouse_seen: bool,
@@ -567,6 +593,8 @@ impl App {
             pending: HashMap::new(),
             next_id: 1,
             scan: ScanDetector::new(),
+            control: ControlState::default(),
+            local_print: "test print",
         }
     }
 
@@ -581,6 +609,7 @@ impl App {
             Some(Overlay::Settings(form)) => form.preview(),
             Some(Overlay::Colors { back, .. }) => back.preview(),
             Some(Overlay::Printer { back, .. }) => back.preview(),
+            Some(Overlay::Codes { back, .. }) => back.preview(),
             _ => match &self.user {
                 Some(u) => (u.prefs.ui.theme, u.prefs.ui.custom_colors.clone()),
                 None => (ThemePreset::default(), CustomColors::default()),
@@ -682,6 +711,7 @@ impl App {
                     | Overlay::Settings(_)
                     | Overlay::Colors { .. }
                     | Overlay::Printer { .. }
+                    | Overlay::Codes { .. }
                     | Overlay::BoardForm(_)
                     | Overlay::Members(_)
                     | Overlay::Columns(_)
@@ -757,8 +787,32 @@ impl App {
                 if self.toast.as_ref().is_some_and(|t| t.until_ms <= now) {
                     self.toast = None;
                 }
-                self.scan.expire(now);
-                Vec::new()
+                let mut out = Vec::new();
+                match self.scan.expire(now) {
+                    Expired::Nothing | Expired::Scan => {}
+                    Expired::Keys(keys) => {
+                        // Typing that looked like the start of a code and was not.
+                        for key in keys {
+                            out.extend(self.route_key(scan::key_event(key)));
+                        }
+                    }
+                    Expired::Frame => {
+                        self.toast(Severity::Warning, "control code timed out before it was closed");
+                    }
+                }
+                let timeout = self.control_timeout_ms();
+                if timeout > 0
+                    && let Some(Overlay::ColumnPick { since_ms, .. }) = &self.overlay
+                    && now.saturating_sub(*since_ms) > timeout
+                {
+                    self.overlay = None;
+                    self.toast(Severity::Info, "no column picked in time, move cancelled");
+                }
+                if self.control.stale(now, self.control_timeout_ms()) {
+                    let w = self.control.clear().unwrap_or_else(|| "it".into());
+                    self.toast(Severity::Info, format!("nothing came for {w}, cancelled"));
+                }
+                out
             }
             Msg::Disconnected(reason) => {
                 self.conn = Conn::Lost;
@@ -777,9 +831,10 @@ impl App {
                 ServerMessage::Event { event } => self.on_event(event),
             },
             Msg::TestPrinted { error } => {
+                let what = self.local_print;
                 match error {
-                    Some(e) => self.toast(Severity::Error, format!("test print failed: {e}")),
-                    None => self.toast(Severity::Success, "test print sent to the printer"),
+                    Some(e) => self.toast(Severity::Error, format!("{what} failed: {e}")),
+                    None => self.toast(Severity::Success, format!("{what} sent to the printer")),
                 }
                 Vec::new()
             }
@@ -1250,6 +1305,21 @@ impl App {
                 Vec::new()
             }
             (Some(Pending::Scan), Response::Scan(outcome)) => self.on_scan(outcome),
+            (Some(Pending::Resolve), Response::Resolved { task, board }) => self.on_resolved(*task, *board),
+            (Some(Pending::ControlOp), Response::Task { task }) => {
+                self.toast(Severity::Success, format!("{}: done", task.title));
+                if let Some(b) = &mut self.board
+                    && b.detail.board.id == task.board_id
+                {
+                    b.upsert(task);
+                }
+                Vec::new()
+            }
+            (Some(Pending::ControlOp), Response::Done) => {
+                self.toast(Severity::Success, "done");
+                Vec::new()
+            }
+            (Some(Pending::Lookup(cmd)), Response::Found(found)) => self.on_found(*cmd, found),
             (Some(Pending::Print), Response::Done) => {
                 self.toast(Severity::Info, "print job queued");
                 Vec::new()
@@ -1583,12 +1653,45 @@ impl App {
             );
             return Vec::new();
         }
+        // Esc ends a control code in progress before anything else sees it.
+        if k.code == KeyCode::Esc && (self.scan.frame_open() || self.control.busy()) {
+            self.scan.cancel();
+            self.control.clear();
+            self.toast(Severity::Info, "control code cancelled");
+            return Vec::new();
+        }
+        // The detector sees every character on every screen, so control
+        // codes work wherever the cursor is. A partial match is handed back
+        // as typing the moment it stops looking like a code.
+        if self.scanner_feeding()
+            && let Some(sk) = scan::scan_key(&k)
+        {
+            return match self.scan.push(sk, self.now_ms) {
+                Feed::Held => Vec::new(),
+                Feed::Scan(Ok(p)) => self.system_scan(p),
+                Feed::Scan(Err(e)) => {
+                    self.toast(Severity::Error, format!("bad scan: {e}"));
+                    vec![self.bell()]
+                }
+                Feed::Frame(body) => self.control_frame(&body),
+                Feed::Pass(keys) => keys
+                    .into_iter()
+                    .flat_map(|key| self.route_key(scan::key_event(key)))
+                    .collect(),
+            };
+        }
+        self.route_key(k)
+    }
+
+    /// A key that is not part of a barcode, to whatever is showing.
+    fn route_key(&mut self, k: KeyEvent) -> Vec<Cmd> {
         if self.is_widget_overlay() {
             return self.widget_overlay_event(TermEvent::Key(k));
         }
         match &self.overlay {
             Some(Overlay::Conflict { .. }) => return self.conflict_key(k),
             Some(Overlay::PickColumn { .. }) => return self.pick_column_key(k),
+            Some(Overlay::ColumnPick { .. }) => return self.column_pick_key(k),
             Some(Overlay::TaskDetail { .. }) => return self.task_detail_key(k),
             Some(Overlay::Question { .. }) => return self.question_key(k),
             Some(_) => return self.overlay_key(k),
@@ -1600,34 +1703,651 @@ impl App {
         if self.search.is_focused() {
             return self.search_key(k);
         }
-        if self.scanner_listening()
-            && let Some(sk) = scan::scan_key(&k)
-        {
-            return match self.scan.push(sk, self.now_ms) {
-                Feed::Held => Vec::new(),
-                Feed::Scan(Ok(p)) => {
-                    if let Some(ms) = self.scan.last_scan_duration_ms() {
-                        tracing::debug!(duration_ms = ms, "scan captured");
-                    }
-                    let magic = self
-                        .user
-                        .as_ref()
-                        .map(|u| u.prefs.scanner.magic)
-                        .unwrap_or_default();
-                    let payload = p.encode(magic);
-                    vec![self.send(Request::Scan { payload }, Pending::Scan)]
-                }
-                Feed::Scan(Err(e)) => {
-                    self.toast(Severity::Error, format!("bad scan: {e}"));
-                    vec![self.bell()]
-                }
-                Feed::Pass(keys) => keys
-                    .into_iter()
-                    .flat_map(|key| self.normal_key(scan::key_event(key)))
-                    .collect(),
-            };
-        }
         self.normal_key(k)
+    }
+
+    /// Whether keystrokes go through the scan detector at all: the scanner
+    /// is on, and in manual mode the button was pressed.
+    fn scanner_feeding(&self) -> bool {
+        self.scanner_enabled() && (!self.scanner_manual_only() || self.manual_scan)
+    }
+
+    /// Milliseconds a control code waits for what comes next; 0 is forever.
+    fn control_timeout_ms(&self) -> u64 {
+        self.user
+            .as_ref()
+            .map(|u| u64::from(u.prefs.scanner.control_timeout_secs) * 1000)
+            .unwrap_or(20_000)
+    }
+
+    /// A task's code arrived. On the board it does what it says; under a
+    /// window it would act on something the screen is not showing.
+    fn system_scan(&mut self, p: ScanPayload) -> Vec<Cmd> {
+        if let Some(ms) = self.scan.last_scan_duration_ms() {
+            tracing::debug!(duration_ms = ms, "scan captured");
+        }
+        if self.control.armed.is_some() {
+            return vec![self.send(Request::Resolve { short_id: p.short_id }, Pending::Resolve)];
+        }
+        if !self.scanner_listening() {
+            if self.text_focused() {
+                // A code where text goes is text, the way it always was:
+                // somebody may well search for a short id.
+                return p
+                    .encode()
+                    .chars()
+                    .flat_map(|c| self.route_key(scan::key_event(taskologic_core::barcode::ScanKey::Char(c))))
+                    .collect();
+            }
+            self.toast(Severity::Warning, "close what is open, then scan the task again");
+            return vec![self.bell()];
+        }
+        let payload = p.encode();
+        vec![self.send(Request::Scan { payload }, Pending::Scan)]
+    }
+
+    /// The body of a control frame, between `--1` and `--`.
+    fn control_frame(&mut self, body: &str) -> Vec<Cmd> {
+        match control::parse(body) {
+            Ok(commands) => self.run_controls(commands),
+            Err(e) => {
+                self.toast(Severity::Error, format!("bad control code: {e}"));
+                vec![self.bell()]
+            }
+        }
+    }
+
+    /// Commands in order, each taking the values that follow it. A value on
+    /// its own goes to whatever is waiting for one.
+    fn run_controls(&mut self, commands: Vec<Control>) -> Vec<Cmd> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < commands.len() {
+            let mut values = Vec::new();
+            let mut j = i + 1;
+            while let Some(Control::Value(v)) = commands.get(j) {
+                values.push(v.clone());
+                j += 1;
+            }
+            match &commands[i] {
+                Control::Value(v) => {
+                    values.insert(0, v.clone());
+                    out.extend(self.control_values(values));
+                }
+                other => out.extend(self.control_command(other.clone(), values)),
+            }
+            i = j;
+        }
+        out
+    }
+
+    /// Values for whatever was left waiting.
+    fn control_values(&mut self, values: Vec<Value>) -> Vec<Cmd> {
+        match self.control.take_waiting() {
+            Some(Waiting::Insert) => self.control_insert(&values),
+            Some(Waiting::Replace) => self.control_replace(&values),
+            Some(Waiting::Search { archive }) => self.control_search(archive, &values),
+            None => {
+                self.toast(Severity::Warning, "nothing is waiting for a value; scan a command first");
+                vec![self.bell()]
+            }
+        }
+    }
+
+    fn control_command(&mut self, cmd: Control, values: Vec<Value>) -> Vec<Cmd> {
+        use Control::*;
+        let busy = |app: &mut Self| {
+            app.toast(Severity::Warning, "close what is open first");
+            vec![app.bell()]
+        };
+        match cmd {
+            Key(c) => self.route_key(scan::key_event(taskologic_core::barcode::ScanKey::Char(c))),
+            Named(k) => {
+                if k == taskologic_core::control::NamedKey::Esc && self.control.clear().is_some() {
+                    self.toast(Severity::Info, "control code cancelled");
+                    return Vec::new();
+                }
+                self.route_key(named_key_event(k))
+            }
+            Dashboard => {
+                if self.overlay.is_some() {
+                    return busy(self);
+                }
+                self.route_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            }
+            NextBoard | PrevBoard => {
+                if self.overlay.is_some() {
+                    return busy(self);
+                }
+                self.control_step_board(matches!(cmd, NextBoard))
+            }
+            Search { archive } => {
+                if values.is_empty() {
+                    self.control.wait_for(Waiting::Search { archive }, self.now_ms);
+                    return Vec::new();
+                }
+                self.control_search(archive, &values)
+            }
+            Ping => {
+                self.toast(Severity::Info, "scanner ok");
+                Vec::new()
+            }
+            Insert => {
+                if values.is_empty() {
+                    self.control.wait_for(Waiting::Insert, self.now_ms);
+                    return Vec::new();
+                }
+                self.control_insert(&values)
+            }
+            Replace => {
+                if values.is_empty() {
+                    self.control.wait_for(Waiting::Replace, self.now_ms);
+                    return Vec::new();
+                }
+                self.control_replace(&values)
+            }
+            Value(_) => unreachable!("values are gathered by run_controls"),
+            Sticky => {
+                let label = self.control.armed.as_mut().map(|a| {
+                    a.sticky = true;
+                    a.label()
+                });
+                match label {
+                    Some(l) => self.toast(Severity::Info, format!("every scan: {l}")),
+                    None => self.toast(Severity::Warning, "sticky goes after a command: scan the command first"),
+                }
+                Vec::new()
+            }
+            Selected => self.control_selected(),
+            Show(Some(id)) => {
+                self.control.arm(Armed { command: Show(None), values: Vec::new(), sticky: false }, self.now_ms);
+                vec![self.send(Request::Resolve { short_id: id }, Pending::Resolve)]
+            }
+            MoveLeft | MoveRight | MoveUp | MoveDown | MoveTop | MoveBottom | MoveTo(_) | Delete
+            | Print(_) | AssignMe | UnassignMe | ToggleAssign | Set(_) | Show(None) => {
+                let armed = Armed { command: cmd, values, sticky: false };
+                let label = armed.label();
+                self.control.arm(armed, self.now_ms);
+                self.toast(Severity::Info, format!("next scan: {label}"));
+                Vec::new()
+            }
+            ShowBoard(id) | Analytics(id) => {
+                vec![self.send(
+                    Request::Lookup { kind: LookupKind::Board, short_id: id },
+                    Pending::Lookup(Box::new(cmd)),
+                )]
+            }
+            StartProgram(id) | StartProgramNow(id) => {
+                vec![self.send(
+                    Request::Lookup { kind: LookupKind::Program, short_id: id },
+                    Pending::Lookup(Box::new(cmd)),
+                )]
+            }
+            NewFromTemplate(id, _) | NewFromTemplateAsk(id, _) => {
+                vec![self.send(
+                    Request::Lookup { kind: LookupKind::Template, short_id: id },
+                    Pending::Lookup(Box::new(cmd)),
+                )]
+            }
+        }
+    }
+
+    /// What a targeted code named came back; do what the code says with it.
+    fn on_found(&mut self, cmd: Control, found: Found) -> Vec<Cmd> {
+        use Control::*;
+        let tz = self.timezone();
+        match (cmd, found) {
+            (ShowBoard(_), Found::Board { board }) => {
+                if self.overlay.is_some() {
+                    self.toast(Severity::Warning, "close what is open first");
+                    return vec![self.bell()];
+                }
+                vec![self.send(
+                    Request::GetBoard { board_id: board.id },
+                    Pending::OpenBoard { focus_task: None },
+                )]
+            }
+            (Analytics(_), Found::Board { board }) => {
+                if self.overlay.is_some() {
+                    self.toast(Severity::Warning, "close what is open first");
+                    return vec![self.bell()];
+                }
+                self.open_analytics(Some(board.id))
+            }
+            (StartProgram(_), Found::Program { program, board }) => {
+                if self.overlay.is_some() {
+                    self.toast(Severity::Warning, "close what is open first");
+                    return vec![self.bell()];
+                }
+                let Some(col) = Self::column_for(&board, control::ColumnRef::Todo) else {
+                    return Vec::new();
+                };
+                let name = board.columns.iter().find(|c| c.id == col).map(|c| c.name.clone()).unwrap_or_default();
+                let form = StartProgramForm::new(*program, col, name, tz);
+                self.overlay = Some(Overlay::StartProgram(Box::new(form)));
+                Vec::new()
+            }
+            (StartProgramNow(_), Found::Program { program, board }) => {
+                let column_id = Self::column_for(&board, control::ColumnRef::Todo);
+                self.toast(Severity::Info, format!("starting {}", program.name));
+                vec![self.send(
+                    Request::StartProgram {
+                        program_id: program.id,
+                        column_id,
+                        start_at: None,
+                        fan_out: Vec::new(),
+                    },
+                    Pending::StartProgram,
+                )]
+            }
+            (NewFromTemplate(_, col), Found::Template { template, board }) => {
+                let Some(column) = Self::column_for(&board, col) else {
+                    self.toast(Severity::Warning, "that board has no such column");
+                    return vec![self.bell()];
+                };
+                // The form knows how a template prefills a task; it is
+                // filled and saved without being shown.
+                let form = TaskForm::create_from_template(board.id, column, tz, &template);
+                match form.values() {
+                    Ok(save) => self.save_task(form.mode.clone(), save),
+                    Err(e) => {
+                        self.toast(Severity::Warning, e);
+                        vec![self.bell()]
+                    }
+                }
+            }
+            (NewFromTemplateAsk(_, col), Found::Template { template, board }) => {
+                if self.overlay.is_some() {
+                    self.toast(Severity::Warning, "close what is open first");
+                    return vec![self.bell()];
+                }
+                let Some(column) = Self::column_for(&board, col) else {
+                    self.toast(Severity::Warning, "that board has no such column");
+                    return vec![self.bell()];
+                };
+                let form = TaskForm::create_from_template(board.id, column, tz, &template);
+                self.overlay = Some(Overlay::TaskForm(Box::new(form)));
+                vec![self.send(
+                    Request::ListMembers { board_id: board.id },
+                    Pending::FormMembers,
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The card with a board's, template's or program's own codes.
+    fn print_codes_for(&mut self, heading: &str, codes: Vec<(String, Control)>) -> Vec<Cmd> {
+        let codes = codes.into_iter().map(|(l, c)| (l, vec![c])).collect();
+        self.print_codes(heading, codes)
+    }
+
+    /// The selected task stands in for a scan.
+    fn control_selected(&mut self) -> Vec<Cmd> {
+        let Some(armed) = self.control.use_armed(self.now_ms) else {
+            self.toast(Severity::Warning, "nothing is armed; scan a command first");
+            return vec![self.bell()];
+        };
+        let Some((task, board)) = self
+            .board
+            .as_ref()
+            .and_then(|b| b.selected_task().cloned().map(|t| (t, b.detail.board.clone())))
+        else {
+            self.toast(Severity::Warning, "no task is selected on screen");
+            return vec![self.bell()];
+        };
+        self.apply_armed(armed, task, board)
+    }
+
+    /// The task a code named came back; the armed command acts on it.
+    fn on_resolved(&mut self, task: Task, board: Board) -> Vec<Cmd> {
+        let Some(armed) = self.control.use_armed(self.now_ms) else {
+            // Cancelled while the answer was on its way.
+            return Vec::new();
+        };
+        self.apply_armed(armed, task, board)
+    }
+
+    /// Which column a code means on this board. Todo is the first column
+    /// without a role; numbers count from the left.
+    fn column_for(board: &Board, col: control::ColumnRef) -> Option<ColumnId> {
+        use control::ColumnRef::*;
+        let roles = [board.started_col, board.paused_col, board.finished_col];
+        match col {
+            Todo => board
+                .columns
+                .iter()
+                .find(|c| !roles.contains(&c.id))
+                .or(board.columns.first())
+                .map(|c| c.id),
+            Paused => Some(board.paused_col),
+            Doing => Some(board.started_col),
+            Finished => Some(board.finished_col),
+            Index(n) => board.columns.get(usize::from(n).saturating_sub(1)).map(|c| c.id),
+            Last => board.columns.last().map(|c| c.id),
+        }
+    }
+
+    /// Do to `task` what the armed command says, through the same requests
+    /// the keyboard sends. The board came with the task, so this works for
+    /// a task on a board that is not the one open.
+    fn apply_armed(&mut self, armed: Armed, task: Task, board: Board) -> Vec<Cmd> {
+        use Control::*;
+        let task_id = task.id;
+        let col_idx = board.columns.iter().position(|c| c.id == task.column_id).unwrap_or(0);
+        let refuse = |app: &mut Self, why: &str| {
+            app.toast(Severity::Warning, why.to_string());
+            vec![app.bell()]
+        };
+        match armed.command {
+            MoveLeft | MoveRight => {
+                let to = if armed.command == MoveLeft { col_idx.checked_sub(1) } else { Some(col_idx + 1) };
+                match to.and_then(|i| board.columns.get(i)) {
+                    Some(c) => vec![self.send_move(task_id, c.id, None, false, None)],
+                    None => refuse(self, "already in the outermost column"),
+                }
+            }
+            MoveUp | MoveDown | MoveTop | MoveBottom => {
+                // Positions come from the board on screen; another board's
+                // order is not known here.
+                let siblings: Vec<(TaskId, i64)> = match &self.board {
+                    Some(b) if b.detail.board.id == board.id => {
+                        b.tasks_in(col_idx).iter().map(|t| (t.id, t.position)).collect()
+                    }
+                    _ => return refuse(self, "open that board to move a task within its column"),
+                };
+                let idx = siblings.iter().position(|(id, _)| *id == task_id).unwrap_or(0);
+                let position = match armed.command {
+                    MoveUp if idx > 0 => Some(siblings[idx - 1].1 - 1),
+                    MoveDown if idx + 1 < siblings.len() => Some(siblings[idx + 1].1 + 1),
+                    MoveTop if idx > 0 => Some(siblings[0].1 - 1),
+                    MoveBottom if idx + 1 < siblings.len() => Some(siblings[siblings.len() - 1].1 + 1),
+                    _ => return refuse(self, "it is there already"),
+                };
+                vec![self.send_move(task_id, task.column_id, position, false, None)]
+            }
+            MoveTo(None) => {
+                let roles = [
+                    (board.started_col, "doing"),
+                    (board.paused_col, "paused"),
+                    (board.finished_col, "done"),
+                ];
+                let options = board
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let role = roles.iter().find(|(id, _)| *id == c.id).map(|(_, r)| format!(", {r}")).unwrap_or_default();
+                        (c.id, format!("{}  {}{role}", i + 1, c.name))
+                    })
+                    .collect();
+                self.overlay = Some(Overlay::ColumnPick {
+                    task: Box::new(task),
+                    options,
+                    sel: col_idx,
+                    since_ms: self.now_ms,
+                });
+                Vec::new()
+            }
+            MoveTo(Some(col)) => match Self::column_for(&board, col) {
+                Some(c) => vec![self.send_move(task_id, c, None, false, None)],
+                None => refuse(self, "this board has no such column"),
+            },
+            Delete => vec![self.send(Request::DeleteTask { task_id }, Pending::DeleteTask)],
+            Print(slip) => vec![self.send(Request::PrintTask { task_id, slip: Some(slip) }, Pending::Print)],
+            AssignMe | UnassignMe | ToggleAssign => {
+                let Some(me) = self.user.as_ref().map(|u| u.uid) else {
+                    return Vec::new();
+                };
+                let mut draft = task.draft();
+                let has = draft.assignees.contains(&me);
+                match armed.command {
+                    AssignMe if !has => draft.assignees.push(me),
+                    UnassignMe if has => draft.assignees.retain(|u| *u != me),
+                    ToggleAssign if has => draft.assignees.retain(|u| *u != me),
+                    ToggleAssign => draft.assignees.push(me),
+                    _ => return refuse(self, "nothing to change"),
+                }
+                vec![self.send(
+                    Request::UpdateTask { task_id, version: task.version, draft },
+                    Pending::ControlOp,
+                )]
+            }
+            Set(field) if armed.values.is_empty() => {
+                let cmds = self.open_task_form(
+                    FormMode::Edit { task: task.id, version: task.version },
+                    Some(&task),
+                );
+                if let Some(Overlay::TaskForm(form)) = &mut self.overlay {
+                    form.focus_field(field);
+                }
+                cmds
+            }
+            Set(field) => self.set_field(task, field, &armed.values),
+            Show(_) => {
+                self.open_detail(task);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Keys of the column pick a bare "move to" opened.
+    fn column_pick_key(&mut self, k: KeyEvent) -> Vec<Cmd> {
+        let Some(Overlay::ColumnPick { task, options, mut sel, since_ms }) = self.overlay.take() else {
+            return Vec::new();
+        };
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(options.len().saturating_sub(1)),
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = usize::from(c as u8 - b'1');
+                if let Some((col, _)) = options.get(i) {
+                    return vec![self.send_move(task.id, *col, None, false, None)];
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.toast(Severity::Info, "move cancelled");
+                return Vec::new();
+            }
+            KeyCode::Enter => {
+                if let Some((col, _)) = options.get(sel) {
+                    return vec![self.send_move(task.id, *col, None, false, None)];
+                }
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::ColumnPick { task, options, sel, since_ms });
+        Vec::new()
+    }
+
+    /// One field of a task set by scan, the rest untouched.
+    fn set_field(&mut self, task: Task, field: control::Field, values: &[Value]) -> Vec<Cmd> {
+        use control::Field::*;
+        let task_id = task.id;
+        let (tz, me) = self
+            .user
+            .as_ref()
+            .map(|u| (u.timezone, u.uid))
+            .unwrap_or((chrono_tz::UTC, 0));
+        let now = chrono::Utc::now();
+        let mut draft = task.draft();
+        let text = self.control_text(values);
+        let fail = |app: &mut Self, why: String| {
+            app.toast(Severity::Warning, why);
+            vec![app.bell()]
+        };
+        match field {
+            Title => {
+                if text.trim().is_empty() {
+                    return fail(self, "a title cannot be empty".into());
+                }
+                draft.title = text;
+            }
+            Description => draft.description = text,
+            Start => match values_date(values, task.start_at, now, tz) {
+                Ok(d) => draft.start_at = d,
+                Err(e) => return fail(self, e),
+            },
+            Due => match values_date(values, task.due_at, now, tz) {
+                Ok(d) => draft.due_at = d,
+                Err(e) => return fail(self, e),
+            },
+            RemindStart => match values_minutes(values) {
+                Ok(m) => draft.reminder_start_minutes = m,
+                Err(e) => return fail(self, e),
+            },
+            RemindDue => match values_minutes(values) {
+                Ok(m) => draft.reminder_due_minutes = m,
+                Err(e) => return fail(self, e),
+            },
+            Assign => {
+                for v in values {
+                    match v {
+                        Value::Clear => draft.assignees.clear(),
+                        Value::Me => {
+                            if !draft.assignees.contains(&me) {
+                                draft.assignees.push(me);
+                            }
+                        }
+                        Value::Text(name) => {
+                            let found = self
+                                .users
+                                .iter()
+                                .find(|(_, n)| n.eq_ignore_ascii_case(name.trim()))
+                                .map(|(uid, _)| *uid);
+                            match found {
+                                Some(uid) if !draft.assignees.contains(&uid) => draft.assignees.push(uid),
+                                Some(_) => {}
+                                None => return fail(self, format!("nobody called {name:?} here")),
+                            }
+                        }
+                        _ => return fail(self, "an assignee is a name, my name, or clear".into()),
+                    }
+                }
+            }
+            Checklist => {
+                if text.trim().is_empty() {
+                    return fail(self, "a checklist item needs text".into());
+                }
+                draft.checklist.push(taskologic_core::task::ChecklistItem {
+                    text: text.trim().to_string(),
+                    done: false,
+                });
+            }
+            ChecklistItem(n) => {
+                let index = usize::from(n).saturating_sub(1);
+                let Some(item) = task.checklist.get(index) else {
+                    return fail(self, format!("the task has no checklist item {n}"));
+                };
+                return vec![self.send(
+                    Request::SetChecklistItem { task_id, index, done: !item.done },
+                    Pending::ChecklistOp,
+                )];
+            }
+            ExcludeFromStats => {
+                return vec![self.send(
+                    Request::SetExcludeFromStats { task_id, excluded: !task.exclude_from_stats },
+                    Pending::ExcludeFromStats,
+                )];
+            }
+        }
+        vec![self.send(
+            Request::UpdateTask { task_id, version: task.version, draft },
+            Pending::ControlOp,
+        )]
+    }
+
+    /// What a run of values spells, in the user's zone.
+    fn control_text(&self, values: &[Value]) -> String {
+        let (tz, name) = self
+            .user
+            .as_ref()
+            .map(|u| (u.timezone, u.username.as_str()))
+            .unwrap_or((chrono_tz::UTC, ""));
+        values_text(values, chrono::Utc::now(), tz, name)
+    }
+
+    /// Type into whatever has the focus, one key at a time, the way a wedge
+    /// scanner would.
+    fn control_insert(&mut self, values: &[Value]) -> Vec<Cmd> {
+        let text = self.control_text(values);
+        if !self.text_focused() {
+            self.toast(Severity::Warning, "nothing to type into: put the cursor in a field first");
+            return vec![self.bell()];
+        }
+        let mut out = Vec::new();
+        for c in text.chars() {
+            out.extend(self.route_key(scan::key_event(taskologic_core::barcode::ScanKey::Char(c))));
+        }
+        out
+    }
+
+    /// Replace what the focused field holds: select it all, as Ctrl+A does
+    /// in every text widget, then type. An empty value deletes it.
+    fn control_replace(&mut self, values: &[Value]) -> Vec<Cmd> {
+        if !self.text_focused() {
+            self.toast(Severity::Warning, "nothing to replace: put the cursor in a field first");
+            return vec![self.bell()];
+        }
+        let text = self.control_text(values);
+        let mut out = self.route_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        if text.is_empty() {
+            out.extend(self.route_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
+            return out;
+        }
+        for c in text.chars() {
+            out.extend(self.route_key(scan::key_event(taskologic_core::barcode::ScanKey::Char(c))));
+        }
+        out
+    }
+
+    fn control_search(&mut self, archive: bool, values: &[Value]) -> Vec<Cmd> {
+        if self.overlay.is_some() {
+            self.toast(Severity::Warning, "close what is open first");
+            return vec![self.bell()];
+        }
+        let text = self.control_text(values);
+        self.board = None;
+        self.analytics = None;
+        self.search.set_text(text);
+        self.include_archived.set_checked(archive);
+        self.search.focus().set(true);
+        self.search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    /// The next or previous board in dashboard order, of the ones the user
+    /// is a member of; from the dashboard, the first or the last.
+    fn control_step_board(&mut self, forward: bool) -> Vec<Cmd> {
+        let ids: Vec<taskologic_core::ids::BoardId> =
+            self.boards.iter().filter(|b| b.is_member).map(|b| b.id).collect();
+        if ids.is_empty() {
+            self.toast(Severity::Warning, "no boards to go to");
+            return vec![self.bell()];
+        }
+        let current = self
+            .board
+            .as_ref()
+            .and_then(|b| ids.iter().position(|id| *id == b.detail.board.id));
+        let next = match (current, forward) {
+            (Some(i), true) => (i + 1) % ids.len(),
+            (Some(i), false) => (i + ids.len() - 1) % ids.len(),
+            (None, true) => 0,
+            (None, false) => ids.len() - 1,
+        };
+        let board_id = ids[next];
+        vec![self.send(
+            Request::GetBoard { board_id },
+            Pending::OpenBoard { focus_task: None },
+        )]
+    }
+
+    /// What the status line says about control codes, if anything.
+    pub fn control_status(&self) -> Option<String> {
+        if self.scan.frame_open() {
+            return Some("reading a long code, scan its next piece (Esc cancels)".into());
+        }
+        self.control.status()
     }
 
     fn normal_key(&mut self, k: KeyEvent) -> Vec<Cmd> {
@@ -1931,7 +2651,7 @@ impl App {
                     self.toast(Severity::Info, "no printer configured on this client");
                 } else if let Some(t) = b.selected_task() {
                     let task_id = t.id;
-                    return vec![self.send(Request::PrintTask { task_id }, Pending::Print)];
+                    return vec![self.send(Request::PrintTask { task_id, slip: None }, Pending::Print)];
                 }
             }
             _ => {}
@@ -2348,6 +3068,16 @@ impl App {
                     StartProgramForm::new(*program, column.id, column.name.clone(), self.timezone());
                 self.overlay = Some(Overlay::StartProgram(Box::new(form)));
                 Vec::new()
+            }
+            ProgramsOutcome::PrintCode(program) => {
+                let sid = program.short_id;
+                self.print_codes_for(
+                    &format!("Program {}", program.name),
+                    vec![
+                        (format!("start {}", program.name), Control::StartProgram(sid)),
+                        (format!("start {} now", program.name), Control::StartProgramNow(sid)),
+                    ],
+                )
             }
             ProgramsOutcome::Delete(program) => {
                 let Some(Overlay::Programs(panel)) = self.overlay.take() else {
@@ -2835,6 +3565,16 @@ impl App {
                     Pending::FormMembers,
                 )]
             }
+            TemplatesOutcome::PrintCode(tpl) => {
+                let sid = tpl.short_id;
+                self.print_codes_for(
+                    &format!("Template {}", tpl.name),
+                    vec![
+                        (format!("new task from {}, in todo", tpl.name), Control::NewFromTemplate(sid, control::ColumnRef::Todo)),
+                        (format!("new task from {}, ask first", tpl.name), Control::NewFromTemplateAsk(sid, control::ColumnRef::Todo)),
+                    ],
+                )
+            }
             TemplatesOutcome::Delete(tpl) => {
                 let Some(Overlay::Templates(panel)) = self.overlay.take() else {
                     return Vec::new();
@@ -2982,6 +3722,7 @@ impl App {
             Some(Overlay::Settings(_)) => self.settings_event(ev),
             Some(Overlay::Colors { .. }) => self.colors_event(ev),
             Some(Overlay::Printer { .. }) => self.printer_event(ev),
+            Some(Overlay::Codes { .. }) => self.codes_event(ev),
             Some(Overlay::BoardForm(_)) => self.board_form_event(ev),
             Some(Overlay::Members(_)) => self.members_event(ev),
             Some(Overlay::Columns(_)) => self.columns_event(ev),
@@ -3017,6 +3758,16 @@ impl App {
                 };
                 self.overlay = Some(Overlay::Colors {
                     form: Box::new(ColorsForm::new(&colors)),
+                    back,
+                });
+                Vec::new()
+            }
+            SettingsOutcome::PrintCodes => {
+                let Some(Overlay::Settings(back)) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                self.overlay = Some(Overlay::Codes {
+                    panel: Box::new(CodesPanel::new()),
                     back,
                 });
                 Vec::new()
@@ -3078,6 +3829,71 @@ impl App {
         }
     }
 
+    fn codes_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
+        let Some(Overlay::Codes { panel, .. }) = &mut self.overlay else {
+            return Vec::new();
+        };
+        match panel.handle(&ev) {
+            CodesOutcome::Changed => Vec::new(),
+            CodesOutcome::Cancel => {
+                let Some(Overlay::Codes { back, .. }) = self.overlay.take() else {
+                    return Vec::new();
+                };
+                self.overlay = Some(Overlay::Settings(back));
+                Vec::new()
+            }
+            CodesOutcome::Print { heading, codes } => self.print_codes(&heading, codes),
+        }
+    }
+
+    /// A codes card to this client's printer, built here: no task, no
+    /// daemon. Each code picks CODE39 or CODE128 for the paper it goes on,
+    /// and one too long for the paper even so is split over several.
+    fn print_codes(&mut self, heading: &str, codes: Vec<(String, Vec<Control>)>) -> Vec<Cmd> {
+        let Some(profile) = self.printer.clone() else {
+            self.toast(Severity::Warning, "no printer on this client; set one up first");
+            return vec![self.bell()];
+        };
+        let Some(user) = self.user.clone() else {
+            return Vec::new();
+        };
+        let dots = profile.dots();
+        let mut lines = Vec::new();
+        for (label, commands) in codes {
+            let symbology = control::symbology_for(&commands, dots);
+            let payload = control::encode(&commands);
+            let pieces = control::chunks(&payload, dots);
+            let n = pieces.len();
+            let is_ping = commands == [Control::Ping];
+            for (i, piece) in pieces.into_iter().enumerate() {
+                let label = if n == 1 {
+                    label.clone()
+                } else {
+                    format!("{label} ({} of {n})", i + 1)
+                };
+                lines.push(taskologic_core::print::CodeLine {
+                    label: label.clone(),
+                    payload: piece.clone(),
+                    symbology,
+                    narrow: false,
+                });
+                // The scanner check is a test strip: the same code with
+                // thin bars under it says what the scanner still reads.
+                if is_ping {
+                    lines.push(taskologic_core::print::CodeLine {
+                        label: format!("{label}, thin bars"),
+                        payload: piece,
+                        symbology,
+                        narrow: true,
+                    });
+                }
+            }
+        }
+        let job = taskologic_core::print::build_codes_job(heading, lines, &user, chrono::Utc::now());
+        self.local_print = "codes card";
+        vec![Cmd::TestPrint { job, profile }]
+    }
+
     fn printer_event(&mut self, ev: TermEvent) -> Vec<Cmd> {
         let Some(Overlay::Printer { form, .. }) = &mut self.overlay else {
             return Vec::new();
@@ -3087,10 +3903,13 @@ impl App {
             PrinterOutcome::QueueChanged(queue) => vec![Cmd::DetectMedia(queue)],
             PrinterOutcome::Refresh => vec![Cmd::DetectPrinters],
             PrinterOutcome::TestPrint(profile) => match self.test_print_job() {
-                Some(job) => vec![Cmd::TestPrint {
-                    job,
-                    profile: *profile,
-                }],
+                Some(job) => {
+                    self.local_print = "test print";
+                    vec![Cmd::TestPrint {
+                        job,
+                        profile: *profile,
+                    }]
+                }
                 None => Vec::new(),
             },
             PrinterOutcome::Cancel => {
@@ -3123,6 +3942,7 @@ impl App {
         let now = chrono::Utc::now();
         let board = Board {
             id: taskologic_core::ids::BoardId(0),
+            short_id: taskologic_core::ids::ShortId::from_index(0),
             name: "Taskologic".into(),
             description: String::new(),
             owner_uid: user.uid,
@@ -3225,6 +4045,19 @@ impl App {
             }
             BoardOutcome::OpenMembers => self.open_members(),
             BoardOutcome::OpenColumns => self.open_columns(),
+            BoardOutcome::PrintCode => {
+                let Some(board) = self.board.as_ref().map(|b| b.detail.board.clone()) else {
+                    return Vec::new();
+                };
+                let sid = board.short_id;
+                self.print_codes_for(
+                    &format!("Board {}", board.name),
+                    vec![
+                        (format!("show board {}", board.name), Control::ShowBoard(sid)),
+                        (format!("analytics of {}", board.name), Control::Analytics(sid)),
+                    ],
+                )
+            }
             BoardOutcome::Create(req) => {
                 form.saving = true;
                 vec![self.send(Request::CreateBoard(*req), Pending::CreateBoardForm)]
@@ -3924,7 +4757,7 @@ pub mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use taskologic_core::barcode::{Magic, ScanAction, ScanPayload};
+    use taskologic_core::barcode::{ScanAction, ScanPayload};
     use taskologic_core::board::test_support::board_with_members;
     use taskologic_core::ids::{BoardId, ShortId};
     use taskologic_core::task::test_support::task_on;
@@ -3993,7 +4826,7 @@ mod tests {
             action: ScanAction::StartPause,
             short_id: ShortId::parse("K4M9Q2").unwrap(),
         }
-        .encode(Magic::Dots)
+        .encode()
     }
 
     #[test]
@@ -4097,6 +4930,295 @@ mod tests {
             app.toast
                 .as_ref()
                 .is_some_and(|t| t.text.contains("off in your settings"))
+        );
+    }
+
+    fn inject_all(app: &mut App, text: &str) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        for ev in scan::inject(text, false) {
+            cmds.extend(app.update(Msg::Term(ev)));
+        }
+        cmds
+    }
+
+    #[test]
+    fn a_control_code_is_read_on_any_screen_and_two_dashes_from_a_person_are_typing() {
+        let mut app = ready_app(true);
+        // From the dashboard, with nothing open.
+        let cmds = inject_all(&mut app, "--1PING--");
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(app.toast.as_ref().map(|t| t.text.as_str()), Some("scanner ok"));
+        // Under the help overlay just the same.
+        press(&mut app, KeyCode::Char('?'));
+        app.toast = None;
+        inject_all(&mut app, "--1PING--");
+        assert_eq!(app.toast.as_ref().map(|t| t.text.as_str()), Some("scanner ok"));
+        press(&mut app, KeyCode::Esc);
+        // Two dashes and a letter in the search box are what was typed.
+        press(&mut app, KeyCode::Char('/'));
+        inject_all(&mut app, "--x");
+        assert_eq!(app.search.text(), "--x");
+    }
+
+    #[test]
+    fn insert_and_search_codes_type_and_search() {
+        let mut app = ready_app(true);
+        press(&mut app, KeyCode::Char('/'));
+        inject_all(&mut app, "--1I/V.hi there--");
+        assert_eq!(app.search.text(), "hi there");
+        press(&mut app, KeyCode::Esc);
+        // Insert with nothing to type into says so.
+        let cmds = inject_all(&mut app, "--1I/V.x--");
+        assert!(matches!(cmds.as_slice(), [Cmd::Bell]), "{cmds:?}");
+        // Insert alone waits, and the value comes on its own scan.
+        press(&mut app, KeyCode::Char('/'));
+        app.search.set_text(String::new());
+        inject_all(&mut app, "--1I--");
+        assert!(app.control_status().unwrap().contains("insert"));
+        inject_all(&mut app, "--1ME--");
+        assert_eq!(app.search.text(), "alice");
+        assert!(app.control_status().is_none());
+        press(&mut app, KeyCode::Esc);
+        // A search code runs the search straight away.
+        let cmds = inject_all(&mut app, "--1QA/V.soap--");
+        assert!(
+            matches!(
+                cmds.last(),
+                Some(Cmd::Send(ClientMessage {
+                    request: Request::Search { query, include_archived: true },
+                    ..
+                })) if query == "soap"
+            ),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn next_board_by_code_and_esc_cancels_an_open_frame() {
+        let mut app = ready_app(true);
+        let cmds = inject_all(&mut app, "--1GN--");
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Send(ClientMessage {
+                    request: Request::GetBoard { board_id: BoardId(1) },
+                    ..
+                })]
+            ),
+            "the first board from the dashboard: {cmds:?}"
+        );
+        let cmds = inject_all(&mut app, "--1GP--");
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Send(ClientMessage {
+                    request: Request::GetBoard { board_id: BoardId(2) },
+                    ..
+                })]
+            ),
+            "the last one backwards: {cmds:?}"
+        );
+        // A frame left half read is cancelled by Esc, with a word.
+        inject_all(&mut app, "--1ML");
+        assert!(app.scan.frame_open());
+        assert!(app.control_status().unwrap().contains("long code"));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.scan.frame_open());
+        assert_eq!(app.toast.as_ref().map(|t| t.text.as_str()), Some("control code cancelled"));
+        // A task code under a window beeps instead of acting or typing.
+        press(&mut app, KeyCode::Char('?'));
+        let cmds = inject_all(&mut app, &payload());
+        assert!(matches!(cmds.as_slice(), [Cmd::Bell]), "{cmds:?}");
+    }
+
+    fn task_and_board() -> (Task, Board) {
+        let board = taskologic_core::board::test_support::board_with_members(1, &[1]);
+        let task = taskologic_core::task::test_support::task_on(&board, 1);
+        (task, board)
+    }
+
+    /// Answer the Resolve the app just sent with this task and board.
+    fn answer_resolve(app: &mut App, cmds: &[Cmd], task: &Task, board: &Board) -> Vec<Cmd> {
+        let id = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::Send(ClientMessage { id, request: Request::Resolve { .. } }) => Some(*id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no Resolve among {cmds:?}"));
+        app.update(server(ServerMessage::Ok {
+            id,
+            response: Response::Resolved {
+                task: Box::new(task.clone()),
+                board: Box::new(board.clone()),
+            },
+        }))
+    }
+
+    #[test]
+    fn an_armed_move_acts_on_the_next_scanned_task_and_sticky_stays() {
+        let mut app = ready_app(true);
+        let (task, board) = task_and_board();
+        let here = board.columns.iter().position(|c| c.id == task.column_id).unwrap();
+        let right = board.columns[here + 1].id;
+        inject_all(&mut app, "--1MR--");
+        assert!(app.control_status().unwrap().starts_with("next scan: move right"));
+        let cmds = inject_all(&mut app, &payload());
+        let cmds = answer_resolve(&mut app, &cmds, &task, &board);
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Send(ClientMessage { request: Request::MoveTask { task_id, to_column, .. }, .. })]
+                    if *task_id == task.id && *to_column == right
+            ),
+            "{cmds:?}"
+        );
+        assert!(app.control.armed.is_none(), "one shot");
+        // Sticky stays armed after a use, and Esc ends it.
+        inject_all(&mut app, "--1MR/STK--");
+        assert!(app.control_status().unwrap().starts_with("every scan"));
+        let cmds = inject_all(&mut app, &payload());
+        answer_resolve(&mut app, &cmds, &task, &board);
+        assert!(app.control.armed.is_some(), "sticky");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.control.armed.is_none());
+        // A task scan under a window still completes an armed code.
+        press(&mut app, KeyCode::Char('?'));
+        inject_all(&mut app, "--1SH--");
+        let cmds = inject_all(&mut app, &payload());
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Send(ClientMessage { request: Request::Resolve { .. }, .. }))), "{cmds:?}");
+        press(&mut app, KeyCode::Esc);
+    }
+
+    #[test]
+    fn delete_print_set_and_assign_by_scan_send_the_ordinary_requests() {
+        use taskologic_core::control::SlipChoice;
+        let mut app = ready_app(true);
+        let (task, board) = task_and_board();
+        let run = |app: &mut App, code: &str| {
+            inject_all(app, code);
+            let cmds = inject_all(app, &payload());
+            answer_resolve(app, &cmds, &task, &board)
+        };
+        let cmds = run(&mut app, "--1DEL--");
+        assert!(matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::DeleteTask { task_id }, .. })] if *task_id == task.id), "{cmds:?}");
+        let cmds = run(&mut app, "--1PP--");
+        assert!(matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::PrintTask { slip: Some(SlipChoice::Pause), .. }, .. })]), "{cmds:?}");
+        let cmds = run(&mut app, "--1SU/N/P2H--");
+        match cmds.as_slice() {
+            [Cmd::Send(ClientMessage { request: Request::UpdateTask { draft, version, .. }, .. })] => {
+                let due = draft.due_at.expect("a due date");
+                let want = chrono::Utc::now() + chrono::TimeDelta::hours(2);
+                assert!((due - want).num_seconds().abs() < 60, "{due} vs {want}");
+                assert_eq!(*version, task.version);
+                assert_eq!(draft.title, task.title, "the rest untouched");
+            }
+            other => panic!("{other:?}"),
+        }
+        let cmds = run(&mut app, "--1AM--");
+        assert!(matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::UpdateTask { draft, .. }, .. })] if draft.assignees.contains(&1)), "{cmds:?}");
+        let cmds = run(&mut app, "--1SC/V.Buy soap--");
+        assert!(matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::UpdateTask { draft, .. }, .. })] if draft.checklist.last().is_some_and(|i| i.text == "Buy soap")), "{cmds:?}");
+        // Set without a value opens the form on the field.
+        run(&mut app, "--1ST--");
+        assert!(matches!(app.overlay, Some(Overlay::TaskForm(_))), "the task form");
+    }
+
+    #[test]
+    fn a_bare_move_to_asks_for_the_column_and_replace_swaps_the_field() {
+        let mut app = ready_app(true);
+        let (task, board) = task_and_board();
+        inject_all(&mut app, "--1MC--");
+        let cmds = inject_all(&mut app, &payload());
+        let cmds = answer_resolve(&mut app, &cmds, &task, &board);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(matches!(app.overlay, Some(Overlay::ColumnPick { .. })), "asks on screen");
+        let cmds = press(&mut app, KeyCode::Char('3'));
+        let third = board.columns[2].id;
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Send(ClientMessage { request: Request::MoveTask { to_column, .. }, .. })] if *to_column == third
+            ),
+            "{cmds:?}"
+        );
+        assert!(app.overlay.is_none());
+        // Replace selects the field's text and types over it.
+        press(&mut app, KeyCode::Char('/'));
+        inject_all(&mut app, "--1I/V.abc--");
+        assert_eq!(app.search.text(), "abc");
+        inject_all(&mut app, "--1R/V.xyz--");
+        assert_eq!(app.search.text(), "xyz");
+        inject_all(&mut app, "--1R/X--");
+        assert_eq!(app.search.text(), "", "replace with clear empties it");
+    }
+
+    /// Answer the Lookup the app just sent.
+    fn answer_lookup(app: &mut App, cmds: &[Cmd], found: Found) -> Vec<Cmd> {
+        let id = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::Send(ClientMessage { id, request: Request::Lookup { .. }, .. }) => Some(*id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no Lookup among {cmds:?}"));
+        app.update(server(ServerMessage::Ok { id, response: Response::Found(found) }))
+    }
+
+    #[test]
+    fn targeted_codes_look_the_thing_up_then_act() {
+        let mut app = ready_app(true);
+        let (_, board) = task_and_board();
+        let sid = board.short_id;
+        // Show board: a lookup, then the board is opened.
+        let cmds = inject_all(&mut app, &format!("--1GB{sid}--"));
+        assert!(matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::Lookup { kind: LookupKind::Board, .. }, .. })]), "{cmds:?}");
+        let cmds = answer_lookup(&mut app, &cmds, Found::Board { board: Box::new(board.clone()) });
+        assert!(matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::GetBoard { board_id }, .. })] if *board_id == board.id), "{cmds:?}");
+        // Start a program now: the request goes out with the todo column.
+        let program = taskologic_core::program::Program {
+            id: taskologic_core::ids::ProgramId(7),
+            short_id: taskologic_core::ids::ShortId::parse("PRG000").unwrap(),
+            board_id: board.id,
+            owner_uid: 1,
+            name: "Clean up".into(),
+            description: String::new(),
+            steps: vec![taskologic_core::program::Step {
+                key: taskologic_core::program::ROOT_KEY.into(),
+                title: "Clean".into(),
+                ..Default::default()
+            }],
+            min_samples: 3,
+        };
+        let cmds = inject_all(&mut app, "--1RNPRG000--");
+        let cmds = answer_lookup(&mut app, &cmds, Found::Program { program: Box::new(program.clone()), board: Box::new(board.clone()) });
+        let todo = App::column_for(&board, taskologic_core::control::ColumnRef::Todo);
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::StartProgram { program_id, column_id, start_at: None, .. }, .. })] if *program_id == program.id && *column_id == todo),
+            "{cmds:?}"
+        );
+        // Start with the dialog: the start form opens instead.
+        let cmds = inject_all(&mut app, "--1RPPRG000--");
+        answer_lookup(&mut app, &cmds, Found::Program { program: Box::new(program), board: Box::new(board.clone()) });
+        assert!(matches!(app.overlay, Some(Overlay::StartProgram(_))));
+        press(&mut app, KeyCode::Esc);
+        // New task from a template, straight into column 1.
+        let tpl = taskologic_core::template::Template {
+            id: taskologic_core::ids::TemplateId(3),
+            short_id: taskologic_core::ids::ShortId::parse("TPL000").unwrap(),
+            board_id: board.id,
+            owner_uid: 1,
+            name: "Wash up".into(),
+            draft: taskologic_core::task::TaskDraft { title: "Wash up".into(), ..Default::default() },
+            options: Default::default(),
+        };
+        let cmds = inject_all(&mut app, "--1NTTPL0001--");
+        let cmds = answer_lookup(&mut app, &cmds, Found::Template { template: Box::new(tpl), board: Box::new(board.clone()) });
+        // Stamped the way the templates panel does it, so dependency
+        // templates come along.
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::CreateFromTemplate { template_id, column_id: Some(col), draft }, .. })] if *template_id == taskologic_core::ids::TemplateId(3) && *col == board.columns[0].id && draft.title == "Wash up"),
+            "{cmds:?}"
         );
     }
 

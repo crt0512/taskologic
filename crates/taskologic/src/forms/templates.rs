@@ -25,6 +25,8 @@ pub enum TemplatesOutcome {
     Use(Box<Template>),
     Edit(Box<Template>),
     Delete(Box<Template>),
+    /// Print the template's own control codes.
+    PrintCode(Box<Template>),
 }
 
 pub struct TemplatesPanel {
@@ -41,6 +43,7 @@ pub struct TemplatesPanel {
     new_btn: ButtonState,
     edit_btn: ButtonState,
     delete_btn: ButtonState,
+    code_btn: ButtonState,
     close_btn: ButtonState,
     pub error: Option<String>,
 }
@@ -60,6 +63,7 @@ impl TemplatesPanel {
             new_btn: ButtonState::new(),
             edit_btn: ButtonState::new(),
             delete_btn: ButtonState::new(),
+            code_btn: ButtonState::new(),
             close_btn: ButtonState::new(),
             error: None,
         }
@@ -105,6 +109,7 @@ impl TemplatesPanel {
             .widget(&self.new_btn)
             .widget(&self.edit_btn)
             .widget(&self.delete_btn)
+            .widget(&self.code_btn)
             .widget(&self.close_btn);
         b.build()
     }
@@ -160,6 +165,14 @@ impl TemplatesPanel {
                 None => TemplatesOutcome::Changed,
             };
         }
+        if self.code_btn.handle(ev, Regular) == ButtonOutcome::Pressed
+            || key == Some(KeyCode::Char('c'))
+        {
+            return match self.selected() {
+                Some(t) => TemplatesOutcome::PrintCode(Box::new(t.clone())),
+                None => TemplatesOutcome::Changed,
+            };
+        }
         self.list.handle(ev, Regular);
         TemplatesOutcome::Changed
     }
@@ -197,13 +210,14 @@ impl TemplatesPanel {
         if let Some(e) = &self.error {
             f.render_widget(Paragraph::new(e.clone()).style(t.error()), err);
         }
-        let labels = [" Use ", " New ", " Edit ", " Delete ", " Close "];
+        let labels = [" Use ", " New ", " Edit ", " Delete ", " Code ", " Close "];
         let rects = button_bar(buttons, &labels, t);
         let states = [
             &mut self.use_btn,
             &mut self.new_btn,
             &mut self.edit_btn,
             &mut self.delete_btn,
+            &mut self.code_btn,
             &mut self.close_btn,
         ];
         for ((r, label), state) in rects.iter().zip(labels).zip(states) {
@@ -221,6 +235,7 @@ mod tests {
     fn tpl(id: i64, owner: Uid) -> Template {
         Template {
             id: TemplateId(id),
+            short_id: taskologic_core::ids::ShortId::from_index(0),
             board_id: BoardId(1),
             owner_uid: owner,
             name: format!("t{id}"),

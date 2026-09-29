@@ -839,6 +839,10 @@ fn status_bar(app: &App, f: &mut Frame, area: Rect, t: &Theme) {
         );
         return;
     }
+    if let Some(text) = app.control_status() {
+        f.render_widget(Paragraph::new(format!(" {text}")).style(t.selected()), area);
+        return;
+    }
     let mut parts: Vec<&str> = Vec::new();
     if app.analytics.is_some() {
         // The panel's own footer says what the keys do; this says what the
@@ -976,6 +980,32 @@ fn overlay(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         }
         Overlay::Colors { form, .. } => form.render(f, area, t),
         Overlay::Printer { form, .. } => form.render(f, area, t),
+        Overlay::Codes { panel, .. } => panel.render(f, area, t),
+        Overlay::ColumnPick { task, options, sel, .. } => {
+            let mut lines: Vec<Line> = vec![
+                Line::from(Span::styled(format!("Move \"{}\" to which column?", task.title), t.surface())),
+                Line::from(""),
+            ];
+            for (i, (_, name)) in options.iter().enumerate() {
+                let marker = if i == *sel { "> " } else { "  " };
+                let style = if i == *sel { t.selected() } else { t.surface() };
+                lines.push(Line::from(Span::styled(format!("{marker}{name}"), style)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter or a number picks   Esc cancels",
+                t.surface_dim(),
+            )));
+            let popup = centered(area, 60, lines.len() as u16 + 2);
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(surface_block("Move to", t))
+                    .style(t.surface()),
+                popup,
+            );
+        }
         Overlay::TaskForm(form) => form.render(f, area, t),
         Overlay::PrintRules { form, .. } => form.render(f, area, t),
         Overlay::Programs(panel) => panel.render(f, area, t),

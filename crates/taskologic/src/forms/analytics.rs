@@ -76,6 +76,9 @@ pub struct AnalyticsPanel {
     scope: String,
     tz: Tz,
     rows: Vec<AnalyticsRow>,
+    /// Titles that occur on more than one board in the rows, which get the
+    /// board after them so two "Wash up" templates can be told apart.
+    shared_titles: std::collections::HashSet<String>,
     list: ListState,
     view: View,
     /// The task whose history is showing, and the history itself.
@@ -126,6 +129,7 @@ impl AnalyticsPanel {
             scope: scope.into(),
             tz,
             rows: Vec::new(),
+            shared_titles: std::collections::HashSet::new(),
             list,
             view: View::Table,
             detail_of: None,
@@ -191,6 +195,16 @@ impl AnalyticsPanel {
     }
 
     pub fn set_rows(&mut self, rows: Vec<AnalyticsRow>) {
+        let mut boards_of: std::collections::HashMap<&str, std::collections::HashSet<_>> =
+            std::collections::HashMap::new();
+        for r in &rows {
+            boards_of.entry(r.title.as_str()).or_default().insert(r.board_id);
+        }
+        self.shared_titles = boards_of
+            .into_iter()
+            .filter(|(_, b)| b.len() > 1)
+            .map(|(t, _)| t.to_string())
+            .collect();
         self.rows = rows;
         self.loading = false;
         self.error = None;
@@ -483,6 +497,9 @@ impl AnalyticsPanel {
         let l = Self::columns(width);
         let full = width >= FULL_DATES_FROM;
         let mut title = r.title.clone();
+        if self.shared_titles.contains(&r.title) {
+            title = format!("{title} ({})", r.board_name);
+        }
         if r.excluded {
             // The row is still shown, it just says it is not counted.
             title = format!("({title})");
@@ -815,6 +832,19 @@ mod tests {
     use super::*;
     use taskologic_core::ids::ShortId;
     use taskologic_proto::TaskState;
+
+    #[test]
+    fn a_title_two_boards_share_says_which_board() {
+        let mut panel = AnalyticsPanel::new(None, "all boards", chrono_tz::UTC);
+        let mut other = row("Wash up");
+        other.board_id = BoardId(2);
+        other.board_name = "Garage".into();
+        panel.set_rows(vec![row("Wash up"), other, row("Trash run")]);
+        let lines: Vec<String> = panel.rows.iter().map(|r| panel.row_line(r, 120)).collect();
+        assert!(lines[0].starts_with("Wash up (Kitchen)"), "{}", lines[0]);
+        assert!(lines[1].starts_with("Wash up (Garage)"), "{}", lines[1]);
+        assert!(lines[2].starts_with("Trash run "), "alone on its board: {}", lines[2]);
+    }
 
     fn row(title: &str) -> AnalyticsRow {
         AnalyticsRow {

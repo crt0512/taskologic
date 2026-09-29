@@ -15,9 +15,9 @@
 //! ```
 //!
 //! Only uppercase alphanumerics plus the magic are used because CODE39 cannot
-//! carry anything else. The magic is `..` (or `--` if a user prefers) because
-//! hyphen and period are the only CODE39 extras that survive both plain and
-//! Full ASCII scanner modes unchanged.
+//! carry anything else. The magic is `..` because period and hyphen are the
+//! only CODE39 extras that survive both plain and Full ASCII scanner modes
+//! unchanged; the hyphen is taken by control codes, see below.
 //!
 //! The fixed length is the whole trick. Scan detection does not rely on
 //! keystroke timing, which SSH jitter destroys. It watches for the magic,
@@ -27,45 +27,23 @@
 //! The check character is ISO 7064 MOD 37,36. It catches every single
 //! character substitution and every adjacent transposition with one base36
 //! character, which is what a slightly misread CODE39 bar produces.
+//!
+//! Control codes (`crate::control`) are framed instead of fixed: `--1` opens
+//! a frame, `--` closes it, and everything between is the body the detector
+//! hands over unread. Enter inside an open frame is dropped, so one command
+//! may arrive on several barcodes. A `--` that is not followed by `1` is
+//! released as typing, since a person may ... well ... type two dashes.
 
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ShortId, base36_char, base36_value};
 
-/// Which two character magic prefix a user's barcodes carry.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Magic {
-    #[default]
-    Dots,
-    Dashes,
-}
-
-impl Magic {
-    pub const ALL: [Magic; 2] = [Magic::Dots, Magic::Dashes];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Magic::Dots => "..",
-            Magic::Dashes => "--",
-        }
-    }
-
-    pub fn ch(self) -> char {
-        match self {
-            Magic::Dots => '.',
-            Magic::Dashes => '-',
-        }
-    }
-
-    pub fn from_char(c: char) -> Option<Magic> {
-        match c {
-            '.' => Some(Magic::Dots),
-            '-' => Some(Magic::Dashes),
-            _ => None,
-        }
-    }
-}
+/// The two characters in front of every system code.
+pub const MAGIC: &str = "..";
+/// The character the magic is made of.
+pub const MAGIC_CHAR: char = '.';
+/// The character a control frame is made of, twice to open, twice to close.
+pub const FRAME_CHAR: char = '-';
 
 /// What a scanned barcode asks for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,21 +147,16 @@ impl ScanPayload {
     }
 
     /// Render the full payload string that goes into a barcode.
-    pub fn encode(&self, magic: Magic) -> String {
+    pub fn encode(&self) -> String {
         let body = self.body();
         let check = check_char(&body).expect("body is base36 by construction");
-        format!("{}{}{}", magic.as_str(), body, check)
+        format!("{MAGIC}{body}{check}")
     }
 
-    /// Parse a complete payload. Any magic is accepted so that a slip printed
-    /// by a user with a different magic preference still scans.
+    /// Parse a complete payload.
     pub fn parse(raw: &str) -> Result<Self, ScanParseError> {
         let chars: Vec<char> = raw.trim().chars().map(|c| c.to_ascii_uppercase()).collect();
-        let magic = match (chars.first(), chars.get(1)) {
-            (Some(a), Some(b)) if a == b => Magic::from_char(*a),
-            _ => None,
-        };
-        if magic.is_none() {
+        if !(chars.len() >= MAGIC_LEN && chars[..MAGIC_LEN].iter().all(|c| *c == MAGIC_CHAR)) {
             return Err(ScanParseError::NoMagic);
         }
         let version = *chars.get(MAGIC_LEN).ok_or(ScanParseError::Truncated {
@@ -277,6 +250,22 @@ pub enum Feed {
     Held,
     /// A complete payload arrived. Dispatch it, or beep on the error.
     Scan(Result<ScanPayload, ScanParseError>),
+    /// A complete control frame arrived: its body, between `--1` and `--`,
+    /// as typed. `crate::control::parse` reads it.
+    Frame(String),
+}
+
+/// What [`ScanDetector::expire`] found to be stale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Expired {
+    Nothing,
+    /// A partial match that never went anywhere: the keys that were held,
+    /// to be handled as ordinary typing after all.
+    Keys(Vec<ScanKey>),
+    /// A system code body that stopped short of its length.
+    Scan,
+    /// A control frame that was never closed.
+    Frame,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,16 +273,24 @@ enum Phase {
     Idle,
     /// Matched this many characters of the configured scanner prefix.
     Prefix(usize),
-    /// Whole prefix matched, waiting for the first magic character.
+    /// Whole prefix matched, waiting for a magic or frame character.
     PrefixDone,
     /// Saw the first magic character, waiting for the second.
-    HalfMagic(Magic),
+    HalfMagic,
     /// Past the magic, waiting for the version character.
-    Version(Magic),
+    Version,
     /// Collecting the rest. `total` is the payload length including magic.
     Body {
-        magic: Magic,
         total: usize,
+    },
+    /// Saw one frame character.
+    HalfFrame,
+    /// Saw `--`, waiting for the version that makes it a frame.
+    FrameOpen,
+    /// Inside a frame. `dash` is whether the last character was `-`, which
+    /// closes the frame if another follows and is body otherwise.
+    Frame {
+        dash: bool,
     },
 }
 
@@ -308,6 +305,8 @@ pub struct ScanDetector {
     prefix: Vec<char>,
     enter_terminates: bool,
     timeout_ms: u64,
+    /// For an open control frame, which spans scans. 0 is never.
+    frame_timeout_ms: u64,
     phase: Phase,
     held: Vec<char>,
     body: String,
@@ -320,12 +319,16 @@ impl ScanDetector {
     /// A couple of seconds is long enough for the slowest wedge over the
     /// worst SSH link and short enough that a stray `..` cannot wedge input.
     pub const DEFAULT_TIMEOUT_MS: u64 = 2000;
+    /// A control frame may be several barcodes; twenty seconds between them
+    /// is comfortable and still lets a lost closing frame clear itself.
+    pub const DEFAULT_FRAME_TIMEOUT_MS: u64 = 20_000;
 
     pub fn new() -> Self {
         Self {
             prefix: Vec::new(),
             enter_terminates: false,
             timeout_ms: Self::DEFAULT_TIMEOUT_MS,
+            frame_timeout_ms: Self::DEFAULT_FRAME_TIMEOUT_MS,
             phase: Phase::Idle,
             held: Vec::new(),
             body: String::new(),
@@ -354,6 +357,20 @@ impl ScanDetector {
         self.timeout_ms = ms;
         self
     }
+    /// How long an open control frame waits for its next character or its
+    /// closing frame. 0 waits forever.
+    pub fn with_frame_timeout_ms(mut self, ms: u64) -> Self {
+        self.frame_timeout_ms = ms;
+        self
+    }
+    /// Whether a control frame is open, for the status line.
+    pub fn frame_open(&self) -> bool {
+        matches!(self.phase, Phase::Frame { .. })
+    }
+    /// Drop whatever is in progress: Esc on the keyboard.
+    pub fn cancel(&mut self) {
+        self.reset();
+    }
 
     pub fn is_idle(&self) -> bool {
         self.phase == Phase::Idle
@@ -372,26 +389,45 @@ impl ScanDetector {
         self.since = None;
     }
 
-    /// Drop a partial buffer that has gone stale. Call this from the UI tick.
-    /// Returns true if something was discarded.
-    pub fn expire(&mut self, now_ms: u64) -> bool {
-        match self.since {
-            Some(t) if self.phase != Phase::Idle && now_ms.saturating_sub(t) > self.timeout_ms => {
-                self.reset();
-                true
+    /// Drop a buffer that has gone stale. Call this from the UI tick. A
+    /// partial match hands its keys back, since they were typing after all.
+    pub fn expire(&mut self, now_ms: u64) -> Expired {
+        let Some(t) = self.since else {
+            return Expired::Nothing;
+        };
+        let age = now_ms.saturating_sub(t);
+        let out = match self.phase {
+            Phase::Idle => return Expired::Nothing,
+            Phase::Frame { .. } => {
+                if self.frame_timeout_ms == 0 || age <= self.frame_timeout_ms {
+                    return Expired::Nothing;
+                }
+                Expired::Frame
             }
-            _ => false,
-        }
+            _ if age <= self.timeout_ms => return Expired::Nothing,
+            Phase::Body { .. } | Phase::Version => Expired::Scan,
+            _ => Expired::Keys(self.held.iter().map(|c| ScanKey::Char(*c)).collect()),
+        };
+        self.reset();
+        out
     }
 
     pub fn push(&mut self, key: ScanKey, now_ms: u64) -> Feed {
-        self.expire(now_ms);
-        match key {
+        let stale = self.expire(now_ms);
+        let fed = match key {
             ScanKey::Char(c) => self.push_char(c, now_ms),
             ScanKey::Enter => self.push_enter(now_ms),
+        };
+        // Keys a stale partial match held go first, as typed.
+        match (stale, fed) {
+            (Expired::Keys(mut keys), Feed::Pass(mut more)) => {
+                keys.append(&mut more);
+                Feed::Pass(keys)
+            }
+            (Expired::Keys(keys), Feed::Held) => Feed::Pass(keys),
+            (_, fed) => fed,
         }
     }
-
     fn push_char(&mut self, c: char, now_ms: u64) -> Feed {
         self.swallow_enter = false;
         match self.phase.clone() {
@@ -409,27 +445,32 @@ impl ScanDetector {
                     self.release_with(c, now_ms)
                 }
             }
-            Phase::PrefixDone => match Magic::from_char(c) {
-                Some(m) => {
+            Phase::PrefixDone => match c {
+                MAGIC_CHAR => {
                     self.held.push(c);
-                    self.phase = Phase::HalfMagic(m);
+                    self.phase = Phase::HalfMagic;
                     Feed::Held
                 }
-                None => self.release_with(c, now_ms),
-            },
-            Phase::HalfMagic(m) => {
-                if c == m.ch() {
+                FRAME_CHAR => {
                     self.held.push(c);
-                    self.phase = Phase::Version(m);
+                    self.phase = Phase::HalfFrame;
+                    Feed::Held
+                }
+                _ => self.release_with(c, now_ms),
+            },
+            Phase::HalfMagic => {
+                if c == MAGIC_CHAR {
+                    self.held.push(c);
+                    self.phase = Phase::Version;
                     Feed::Held
                 } else {
                     self.release_with(c, now_ms)
                 }
             }
-            Phase::Version(m) => match payload_len(c) {
+            Phase::Version => match payload_len(c) {
                 Some(total) => {
                     self.body.push(c);
-                    self.phase = Phase::Body { magic: m, total };
+                    self.phase = Phase::Body { total };
                     Feed::Held
                 }
                 None => {
@@ -437,22 +478,62 @@ impl ScanDetector {
                     Feed::Scan(Err(ScanParseError::UnknownVersion(c)))
                 }
             },
-            Phase::Body { magic, total } => {
+            Phase::Body { total } => {
                 self.body.push(c.to_ascii_uppercase());
                 if MAGIC_LEN + self.body.chars().count() >= total {
-                    self.finish(magic, now_ms)
+                    self.finish(now_ms)
                 } else {
                     Feed::Held
                 }
             }
+            Phase::HalfFrame => {
+                if c == FRAME_CHAR {
+                    self.held.push(c);
+                    self.phase = Phase::FrameOpen;
+                    Feed::Held
+                } else {
+                    self.release_with(c, now_ms)
+                }
+            }
+            Phase::FrameOpen => {
+                if c == crate::control::VERSION_1 {
+                    self.held.push(c);
+                    self.body.clear();
+                    self.phase = Phase::Frame { dash: false };
+                    Feed::Held
+                } else {
+                    // Two dashes and something else: a person typing.
+                    self.release_with(c, now_ms)
+                }
+            }
+            Phase::Frame { dash } => {
+                self.since = Some(now_ms);
+                if c == FRAME_CHAR {
+                    if dash {
+                        return self.finish_frame(now_ms);
+                    }
+                    self.phase = Phase::Frame { dash: true };
+                } else {
+                    if dash {
+                        self.body.push(FRAME_CHAR);
+                    }
+                    self.body.push(c);
+                    self.phase = Phase::Frame { dash: false };
+                }
+                Feed::Held
+            }
         }
     }
-
     fn start(&mut self, c: char, now_ms: u64) -> Feed {
         if self.prefix.is_empty() {
-            if let Some(m) = Magic::from_char(c) {
+            let next = match c {
+                MAGIC_CHAR => Some(Phase::HalfMagic),
+                FRAME_CHAR => Some(Phase::HalfFrame),
+                _ => None,
+            };
+            if let Some(phase) = next {
                 self.held.push(c);
-                self.phase = Phase::HalfMagic(m);
+                self.phase = phase;
                 self.since = Some(now_ms);
                 return Feed::Held;
             }
@@ -468,7 +549,6 @@ impl ScanDetector {
         }
         Feed::Pass(vec![ScanKey::Char(c)])
     }
-
     /// A character broke a partial match. Everything held goes back to normal
     /// handling, unless the breaking character itself starts a new match.
     fn release_with(&mut self, c: char, now_ms: u64) -> Feed {
@@ -481,18 +561,23 @@ impl ScanDetector {
                 out.append(&mut keys);
                 Feed::Pass(out)
             }
-            scan @ Feed::Scan(_) => scan,
+            done @ (Feed::Scan(_) | Feed::Frame(_)) => done,
         }
     }
-
-    fn finish(&mut self, magic: Magic, now_ms: u64) -> Feed {
-        let raw = format!("{}{}", magic.as_str(), self.body);
+    fn finish(&mut self, now_ms: u64) -> Feed {
+        let raw = format!("{MAGIC}{}", self.body);
         self.last_scan_ms = self.since.map(|t| now_ms.saturating_sub(t));
         self.reset();
         self.swallow_enter = self.enter_terminates;
         Feed::Scan(ScanPayload::parse(&raw))
     }
-
+    fn finish_frame(&mut self, now_ms: u64) -> Feed {
+        let body = std::mem::take(&mut self.body);
+        self.last_scan_ms = self.since.map(|t| now_ms.saturating_sub(t));
+        self.reset();
+        self.swallow_enter = self.enter_terminates;
+        Feed::Frame(body)
+    }
     fn push_enter(&mut self, now_ms: u64) -> Feed {
         if self.swallow_enter {
             self.swallow_enter = false;
@@ -500,11 +585,16 @@ impl ScanDetector {
         }
         match self.phase.clone() {
             Phase::Idle => Feed::Pass(vec![ScanKey::Enter]),
-            Phase::Body { magic, .. } => {
+            Phase::Body { .. } => {
                 // With or without the enter_terminates setting, an Enter in the
                 // middle of a body means the scan is over. Parsing a short body
                 // reports Truncated, which is the right beep.
-                self.finish(magic, now_ms)
+                self.finish(now_ms)
+            }
+            // A scanner's Enter between the pieces of a long code.
+            Phase::Frame { .. } => {
+                self.since = Some(now_ms);
+                Feed::Held
             }
             _ => {
                 let mut out: Vec<ScanKey> = self.held.drain(..).map(ScanKey::Char).collect();
@@ -515,7 +605,6 @@ impl ScanDetector {
         }
     }
 }
-
 impl Default for ScanDetector {
     fn default() -> Self {
         Self::new()
@@ -536,24 +625,22 @@ mod tests {
     #[test]
     fn v1_length_matches_the_field_breakdown() {
         assert_eq!(V1_LEN, 11);
-        let s = payload(ScanAction::StartPause, "K4M9Q2").encode(Magic::Dots);
+        let s = payload(ScanAction::StartPause, "K4M9Q2").encode();
         assert_eq!(s.chars().count(), V1_LEN);
         assert!(s.starts_with("..1S"));
     }
 
     #[test]
-    fn encode_parse_round_trip_both_magics() {
-        for magic in Magic::ALL {
-            for action in [ScanAction::StartPause, ScanAction::Finish] {
-                for n in [0u64, 1, 999_999, 123_456_789, ShortId::SPACE - 1] {
-                    let p = ScanPayload {
-                        action,
-                        short_id: ShortId::from_index(n),
-                    };
-                    let s = p.encode(magic);
-                    assert_eq!(ScanPayload::parse(&s), Ok(p), "{s}");
-                    assert_eq!(ScanPayload::parse(&s.to_ascii_lowercase()), Ok(p), "{s}");
-                }
+    fn encode_parse_round_trip() {
+        for action in [ScanAction::StartPause, ScanAction::Finish] {
+            for n in [0u64, 1, 999_999, 123_456_789, ShortId::SPACE - 1] {
+                let p = ScanPayload {
+                    action,
+                    short_id: ShortId::from_index(n),
+                };
+                let s = p.encode();
+                assert_eq!(ScanPayload::parse(&s), Ok(p), "{s}");
+                assert_eq!(ScanPayload::parse(&s.to_ascii_lowercase()), Ok(p), "{s}");
             }
         }
     }
@@ -566,12 +653,14 @@ mod tests {
         assert!(verify_check("A12425GABC1234002MZ"));
         assert!(!verify_check("A12425GABC1234002MN"));
         assert_eq!(
-            payload(ScanAction::StartPause, "K4M9Q2").encode(Magic::Dots),
+            payload(ScanAction::StartPause, "K4M9Q2").encode(),
             "..1SK4M9Q2J"
         );
+        // Dashes stopped being a system magic when control codes took them;
+        // such a payload is not a system code any more.
         assert_eq!(
-            payload(ScanAction::Finish, "000001").encode(Magic::Dashes),
-            "--1F0000015"
+            ScanPayload::parse("--1F0000015"),
+            Err(ScanParseError::NoMagic)
         );
     }
 
@@ -597,7 +686,7 @@ mod tests {
                 },
                 short_id: ShortId::from_index(seed >> 8),
             };
-            let encoded = p.encode(Magic::Dots);
+            let encoded = p.encode();
             let body: Vec<char> = encoded[MAGIC_LEN..].chars().collect();
             assert!(verify_check(&body.iter().collect::<String>()));
 
@@ -663,7 +752,7 @@ mod tests {
                 got: 12
             })
         );
-        let good = payload(ScanAction::Finish, "K4M9Q2").encode(Magic::Dots);
+        let good = payload(ScanAction::Finish, "K4M9Q2").encode();
         let mut bad_check = good.clone();
         let last = bad_check.pop().unwrap();
         bad_check.push(if last == 'A' { 'B' } else { 'A' });
@@ -707,7 +796,7 @@ mod tests {
     #[test]
     fn detector_dispatches_a_complete_payload_without_enter() {
         let p = payload(ScanAction::StartPause, "K4M9Q2");
-        let s = p.encode(Magic::Dots);
+        let s = p.encode();
         let mut d = ScanDetector::new();
         let mut t = 0;
         let out = feed_str(&mut d, &s, &mut t);
@@ -721,13 +810,68 @@ mod tests {
     }
 
     #[test]
-    fn detector_accepts_the_other_magic_too() {
-        let p = payload(ScanAction::Finish, "000001");
-        let s = p.encode(Magic::Dashes);
+    fn a_frame_is_handed_over_as_its_body() {
         let mut d = ScanDetector::new();
         let mut t = 0;
-        let out = feed_str(&mut d, &s, &mut t);
-        assert_eq!(out.last(), Some(&Feed::Scan(Ok(p))));
+        let out = feed_str(&mut d, "--1ML--", &mut t);
+        assert!(out[..6].iter().all(|f| *f == Feed::Held), "{out:?}");
+        assert_eq!(out[6], Feed::Frame("ML".into()));
+        assert!(d.is_idle());
+        // A dash inside the body is body; lowercase stays lowercase.
+        let out = feed_str(&mut d, "--1I/V.a-b Ok--", &mut t);
+        assert_eq!(out.last(), Some(&Feed::Frame("I/V.a-b Ok".into())));
+    }
+
+    #[test]
+    fn enter_inside_a_frame_is_dropped_so_pieces_stitch() {
+        let mut d = ScanDetector::new().with_enter_terminates(true);
+        let mut t = 0;
+        feed_str(&mut d, "--1I/V.hel", &mut t);
+        assert!(d.frame_open());
+        assert_eq!(d.push(ScanKey::Enter, t), Feed::Held, "the scanner's Enter between pieces");
+        let out = feed_str(&mut d, "lo--", &mut t);
+        assert_eq!(out.last(), Some(&Feed::Frame("I/V.hello".into())));
+        // The Enter after the closing piece is swallowed like after a scan.
+        assert_eq!(d.push(ScanKey::Enter, t + 1), Feed::Held);
+        assert_eq!(d.push(ScanKey::Enter, t + 2), Feed::Pass(vec![ScanKey::Enter]));
+    }
+
+    #[test]
+    fn two_dashes_from_a_person_are_typing() {
+        let mut d = ScanDetector::new();
+        let mut t = 0;
+        // "--x": no version, so the dashes were typed.
+        let out = feed_str(&mut d, "--x", &mut t);
+        assert_eq!(
+            out[2],
+            Feed::Pass(vec![ScanKey::Char('-'), ScanKey::Char('-'), ScanKey::Char('x')])
+        );
+        // A lone dash then Enter goes through as typed.
+        assert_eq!(d.push(ScanKey::Char('-'), t), Feed::Held);
+        assert_eq!(d.push(ScanKey::Enter, t), Feed::Pass(vec![ScanKey::Char('-'), ScanKey::Enter]));
+    }
+
+    #[test]
+    fn a_frame_left_open_expires_on_its_own_clock_and_a_partial_gives_its_keys_back() {
+        let mut d = ScanDetector::new().with_frame_timeout_ms(1000);
+        let mut t = 0;
+        feed_str(&mut d, "--1ML", &mut t);
+        assert_eq!(d.expire(t + 500), Expired::Nothing);
+        assert_eq!(d.expire(t + 1500), Expired::Frame);
+        assert!(d.is_idle());
+        // Every character inside a frame resets its clock.
+        feed_str(&mut d, "--1M", &mut t);
+        d.push(ScanKey::Char('L'), t + 900);
+        assert_eq!(d.expire(t + 1500), Expired::Nothing);
+        assert_eq!(d.expire(t + 2000), Expired::Frame);
+        // 0 means a frame never expires.
+        let mut d = ScanDetector::new().with_frame_timeout_ms(0);
+        feed_str(&mut d, "--1ML", &mut t);
+        assert_eq!(d.expire(t + 1_000_000), Expired::Nothing);
+        // A period somebody typed and paused on comes back as typing.
+        let mut d = ScanDetector::new().with_timeout_ms(1000);
+        assert_eq!(d.push(ScanKey::Char('.'), 0), Feed::Held);
+        assert_eq!(d.expire(1500), Expired::Keys(vec![ScanKey::Char('.')]));
     }
 
     #[test]
@@ -756,7 +900,7 @@ mod tests {
     fn detector_beeps_on_bad_check_and_bad_version() {
         let mut d = ScanDetector::new();
         let mut t = 0;
-        let mut wrong = payload(ScanAction::StartPause, "K4M9Q2").encode(Magic::Dots);
+        let mut wrong = payload(ScanAction::StartPause, "K4M9Q2").encode();
         let last = wrong.pop().unwrap();
         wrong.push(if last == '0' { '1' } else { '0' });
         let out = feed_str(&mut d, &wrong, &mut t);
@@ -775,8 +919,8 @@ mod tests {
         let mut t = 0;
         feed_str(&mut d, "..1SK", &mut t);
         assert!(!d.is_idle());
-        assert!(!d.expire(t + 500));
-        assert!(d.expire(t + 1500));
+        assert_eq!(d.expire(t + 500), Expired::Nothing);
+        assert_eq!(d.expire(t + 1500), Expired::Scan);
         assert!(d.is_idle());
         // And the same via push, which checks expiry first.
         feed_str(&mut d, "..1SK", &mut t);
@@ -789,7 +933,7 @@ mod tests {
     #[test]
     fn detector_with_enter_terminates() {
         let p = payload(ScanAction::Finish, "ABCDEF");
-        let s = p.encode(Magic::Dots);
+        let s = p.encode();
         let mut d = ScanDetector::new().with_enter_terminates(true);
         let mut t = 0;
         let out = feed_str(&mut d, &s, &mut t);
@@ -811,7 +955,7 @@ mod tests {
     #[test]
     fn detector_strips_a_configured_prefix() {
         let p = payload(ScanAction::StartPause, "ZZZZZZ");
-        let s = format!("#!{}", p.encode(Magic::Dots));
+        let s = format!("#!{}", p.encode());
         let mut d = ScanDetector::new().with_prefix("#!");
         let mut t = 0;
         let out = feed_str(&mut d, &s, &mut t);

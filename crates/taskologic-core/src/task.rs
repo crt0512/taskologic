@@ -115,6 +115,27 @@ impl Task {
 
 /// What a client sends to create a task. Everything the daemon fills in
 /// itself (ids, creator, timestamps, version) is absent.
+impl Task {
+    /// The draft that saves this task as it is: what a change by scan starts
+    /// from, one field moved and the rest untouched.
+    pub fn draft(&self) -> TaskDraft {
+        TaskDraft {
+            title: self.title.clone(),
+            description: self.description.clone(),
+            start_at: self.start_at,
+            due_at: self.due_at,
+            reminder_start_minutes: self.reminder_start_minutes,
+            reminder_due_minutes: self.reminder_due_minutes,
+            assignees: self.assignees.clone(),
+            depends_on: self.depends_on.clone(),
+            checklist: self.checklist.clone(),
+            repeat: self.repeat.clone(),
+            print_rules: self.print_rules.clone(),
+            auto_start: self.auto_start,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TaskDraft {

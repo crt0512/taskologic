@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use taskologic_core::board::Board;
 use taskologic_core::event::EventKind;
-use taskologic_core::ids::{BoardId, ColumnId, ProgramId, RunId, TaskId, TemplateId, Uid};
+use taskologic_core::ids::{BoardId, ColumnId, ProgramId, RunId, ShortId, TaskId, TemplateId, Uid};
 use taskologic_core::offset::Offset;
 use taskologic_core::prefs::UserPrefs;
 use taskologic_core::print::{PrintRule, Recipients};
@@ -43,6 +43,31 @@ use crate::error::AppError;
 /// The file format. Bumped if a file written now could be misread later.
 pub const FORMAT: u32 = 1;
 
+/// What an import does when the server already has the short id a file
+/// carries: a board, template or program is one thing, and a code on the
+/// wall names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Clash {
+    /// Stop before writing anything, and say which board has it.
+    #[default]
+    Refuse,
+    /// Import it as a new thing with a fresh id.
+    NewId,
+    /// Overwrite the definition that has this id, where it is.
+    Replace,
+}
+
+impl Clash {
+    pub fn parse(s: &str) -> Option<Clash> {
+        match s {
+            "refuse" => Some(Clash::Refuse),
+            "new" | "new-id" => Some(Clash::NewId),
+            "replace" => Some(Clash::Replace),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     ExportProgram {
@@ -53,6 +78,7 @@ pub enum Command {
     ImportProgram {
         board: String,
         file: PathBuf,
+        clash: Clash,
     },
     ExportTemplate {
         board: String,
@@ -62,6 +88,7 @@ pub enum Command {
     ImportTemplate {
         board: String,
         file: PathBuf,
+        clash: Clash,
     },
     /// Every account and every board, for moving a whole server.
     ExportAll {
@@ -69,6 +96,7 @@ pub enum Command {
     },
     ImportAll {
         file: PathBuf,
+        clash: Clash,
     },
     /// One board by name, or every board with `all`, with the people it
     /// names but not their accounts.
@@ -78,6 +106,7 @@ pub enum Command {
     },
     ImportBoard {
         file: PathBuf,
+        clash: Clash,
     },
     /// Who this server knows, uid by uid.
     Users,
@@ -158,6 +187,9 @@ struct ProgramFile {
     #[serde(default)]
     users: Vec<Person>,
     program: ProgramDraft,
+    /// The program's identity, kept on import unless the server has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    short_id: Option<ShortId>,
 }
 
 /// One template, its dependencies named rather than numbered so they can
@@ -165,6 +197,9 @@ struct ProgramFile {
 #[derive(Serialize, Deserialize)]
 struct TemplateEntry {
     name: String,
+    /// The template's identity, kept on import unless the server has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    short_id: Option<ShortId>,
     draft: TaskDraft,
     #[serde(default)]
     start_prefill: Option<Offset>,
@@ -300,14 +335,14 @@ pub fn run(
             let json = db.with(|c| export_template(c, &board, &name, locals))?;
             emit(&json, file, out)
         }
-        Command::ImportProgram { board, file } => {
+        Command::ImportProgram { board, file, clash } => {
             let text = read(&file)?;
-            let notes = db.tx(|c| import_program(c, &board, &text, who))?;
+            let notes = db.tx(|c| import_program(c, &board, &text, who, clash))?;
             report(&notes, out)
         }
-        Command::ImportTemplate { board, file } => {
+        Command::ImportTemplate { board, file, clash } => {
             let text = read(&file)?;
-            let notes = db.tx(|c| import_template(c, &board, &text, who))?;
+            let notes = db.tx(|c| import_template(c, &board, &text, who, clash))?;
             report(&notes, out)
         }
         Command::ExportAll { file } => {
@@ -318,14 +353,14 @@ pub fn run(
             let json = db.with(|c| export_everything(c, Some(&name), locals))?;
             emit(&json, file, out)
         }
-        Command::ImportAll { file } => {
+        Command::ImportAll { file, clash } => {
             let text = read(&file)?;
-            let notes = db.tx(|c| import_everything(c, &text, true))?;
+            let notes = db.tx(|c| import_everything(c, &text, true, clash))?;
             report(&notes, out)
         }
-        Command::ImportBoard { file } => {
+        Command::ImportBoard { file, clash } => {
             let text = read(&file)?;
-            let notes = db.tx(|c| import_everything(c, &text, false))?;
+            let notes = db.tx(|c| import_everything(c, &text, false, clash))?;
             report(&notes, out)
         }
         Command::Users => {
@@ -436,6 +471,7 @@ fn export_program(
         header: Header::new("program", Some(&board)),
         users: Vec::new(),
         program: program.draft(),
+        short_id: Some(program.short_id),
     };
     with_people(c, locals, &file, People::Names)
 }
@@ -445,6 +481,7 @@ fn import_program(
     board: &str,
     text: &str,
     owner: Uid,
+    clash: Clash,
 ) -> Result<Vec<String>, AppError> {
     let board = board_named(c, board)?;
     let file: ProgramFile = serde_json::from_str(text)
@@ -452,6 +489,30 @@ fn import_program(
     file.header.check(&["program"])?;
     let mut draft = file.program;
     let mut notes = Vec::new();
+    // The identity the file carries: kept, unless the server has it, in
+    // which case the clash setting decides.
+    let existing = match file.short_id {
+        Some(sid) => repo::program_by_short_id(c, sid)?,
+        None => None,
+    };
+    let mut keep_id = file.short_id;
+    if let Some(have) = &existing {
+        let where_ = repo::require_board(c, have.board_id)?.name;
+        match clash {
+            Clash::Refuse => {
+                return Err(AppError::bad(format!(
+                    "a program with the id {} is here already: {:?} on board {:?}; import again with \
+                     --new-id for a fresh copy or --replace to overwrite it",
+                    have.short_id, have.name, where_
+                )));
+            }
+            Clash::NewId => {
+                notes.push(format!("the id {} is taken by {:?} on {:?}; this copy gets a new one", have.short_id, have.name, where_));
+                keep_id = None;
+            }
+            Clash::Replace => {}
+        }
+    }
     for step in &mut draft.steps {
         if let Assign::Users(uids) = &step.assign {
             let kept = known(c, &board, uids)?;
@@ -471,7 +532,20 @@ fn import_program(
         notes.extend(strip_print_users(c, &board, &mut step.print, &format!("step {}", step.key))?);
     }
     program::validate(&draft, &board).map_err(|e| AppError::bad(e.to_string()))?;
-    let p = repo::create_program(c, board.id, owner, &draft)?;
+    if let (Clash::Replace, Some(have)) = (clash, &existing) {
+        // Overwritten where it lives; its runs and history stay with it.
+        let target = repo::require_board(c, have.board_id)?;
+        program::validate(&draft, &target).map_err(|e| AppError::bad(e.to_string()))?;
+        let p = repo::update_program(c, have.id, &draft)?;
+        repo::record_event(c, target.id, None, Some(owner), &EventKind::ProgramChanged { program: p.id }, Utc::now())?;
+        notes.push(format!("replaced program {:?} ({}) on board {:?} with the file's version", p.name, p.short_id, target.name));
+        return Ok(notes);
+    }
+    let mut p = repo::create_program(c, board.id, owner, &draft)?;
+    if let Some(sid) = keep_id {
+        repo::set_short_id(c, "programs", p.id.0, sid)?;
+        p.short_id = sid;
+    }
     repo::record_event(
         c,
         board.id,
@@ -481,8 +555,9 @@ fn import_program(
         Utc::now(),
     )?;
     notes.push(format!(
-        "imported program {:?} onto board {:?} with {} step(s)",
+        "imported program {:?} ({}) onto board {:?} with {} step(s)",
         p.name,
+        p.short_id,
         board.name,
         p.steps.len()
     ));
@@ -563,6 +638,7 @@ fn export_template(
         .filter_map(|id| by_id.get(id))
         .map(|t| TemplateEntry {
             name: t.name.clone(),
+            short_id: Some(t.short_id),
             draft: t.draft.clone(),
             start_prefill: t.options.start_prefill,
             due_prefill: t.options.due_prefill,
@@ -589,6 +665,7 @@ fn import_template(
     board: &str,
     text: &str,
     owner: Uid,
+    clash: Clash,
 ) -> Result<Vec<String>, AppError> {
     let board = board_named(c, board)?;
     let file: TemplateFile = serde_json::from_str(text)
@@ -604,7 +681,33 @@ fn import_template(
         .collect();
     for entry in file.templates {
         let key = entry.name.trim().to_lowercase();
-        if let Some(id) = ids.get(&key) {
+        // The identity first: a template the server has by this short id
+        // is the same template, wherever it sits.
+        let existing = match entry.short_id {
+            Some(sid) => repo::template_by_short_id(c, sid)?,
+            None => None,
+        };
+        let mut keep_id = entry.short_id;
+        if let Some(have) = &existing {
+            let where_ = repo::require_board(c, have.board_id)?.name;
+            match clash {
+                Clash::Refuse => {
+                    return Err(AppError::bad(format!(
+                        "a template with the id {} is here already: {:?} on board {:?}; import again with \
+                         --new-id for a fresh copy or --replace to overwrite it",
+                        have.short_id, have.name, where_
+                    )));
+                }
+                Clash::NewId => {
+                    notes.push(format!("the id {} is taken by {:?} on {:?}; this copy gets a new one", have.short_id, have.name, where_));
+                    keep_id = None;
+                }
+                Clash::Replace => {}
+            }
+        }
+        if existing.is_none()
+            && let Some(id) = ids.get(&key)
+        {
             notes.push(format!(
                 "template {:?} is on this board already (id {id}), left as it is",
                 entry.name
@@ -656,7 +759,18 @@ fn import_template(
             due_from_average: entry.due_from_average,
             dep_templates,
         };
-        let t = repo::create_template(c, board.id, owner, entry.name.trim(), &draft, &options)?;
+        if let (Clash::Replace, Some(have)) = (clash, &existing) {
+            let t = repo::update_template(c, have.id, entry.name.trim(), &draft, &options)?;
+            repo::record_event(c, t.board_id, None, Some(owner), &EventKind::TemplateChanged { template: t.id }, Utc::now())?;
+            notes.push(format!("replaced template {:?} ({}) with the file's version", t.name, t.short_id));
+            ids.insert(key, t.id);
+            continue;
+        }
+        let mut t = repo::create_template(c, board.id, owner, entry.name.trim(), &draft, &options)?;
+        if let Some(sid) = keep_id {
+            repo::set_short_id(c, "templates", t.id.0, sid)?;
+            t.short_id = sid;
+        }
         repo::record_event(
             c,
             board.id,
@@ -665,7 +779,7 @@ fn import_template(
             &EventKind::TemplateCreated { template: t.id },
             Utc::now(),
         )?;
-        notes.push(format!("imported template {:?} (id {})", t.name, t.id));
+        notes.push(format!("imported template {:?} ({})", t.name, t.short_id));
         ids.insert(key, t.id);
     }
     if !ids.contains_key(&file.root.trim().to_lowercase()) {
@@ -1006,6 +1120,7 @@ fn import_everything(
     c: &Connection,
     text: &str,
     whole_server: bool,
+    clash: Clash,
 ) -> Result<Vec<String>, AppError> {
     let file: Everything = serde_json::from_str(text)
         .map_err(|e| AppError::bad(format!("this is not a board or server file: {e}")))?;
@@ -1018,7 +1133,7 @@ fn import_everything(
     let mut notes = import_people(c, &file.users, whole_server)?;
     let mut m = Maps::default();
     for b in &file.boards {
-        import_board_rows(c, b, &mut m, &mut notes)?;
+        import_board_rows(c, b, &mut m, &mut notes, clash)?;
     }
     import_links(c, &file.boards, &mut m, &mut notes)?;
     Ok(notes)
@@ -1071,11 +1186,37 @@ fn import_people(
 /// The board itself and the rows that hang off it alone: columns, members,
 /// templates, programs, tasks with their assignees. What ties tasks to each
 /// other and to runs comes in [`import_links`], once every task has an id.
+/// The short id a row keeps on import: the file's, unless the server has
+/// it, when the clash setting says whether to refuse or hand out a new one.
+/// Replace is not a thing for whole boards; it reads as a new id here.
+fn kept_short_id(
+    c: &Connection,
+    table: &str,
+    what: &str,
+    sid: ShortId,
+    clash: Clash,
+    notes: &mut Vec<String>,
+) -> Result<ShortId, AppError> {
+    if !repo::short_id_taken(c, table, sid)? {
+        return Ok(sid);
+    }
+    if clash == Clash::Refuse {
+        return Err(AppError::bad(format!(
+            "{what} carries the id {sid}, which this server has already; import again with \
+             --new-id to give the arriving ones fresh ids"
+        )));
+    }
+    let fresh = repo::fresh_short_id_in(c, table)?;
+    notes.push(format!("{what}: the id {sid} is taken here, it arrives as {fresh}"));
+    Ok(fresh)
+}
+
 fn import_board_rows(
     c: &Connection,
     b: &BoardBundle,
     m: &mut Maps,
     notes: &mut Vec<String>,
+    clash: Clash,
 ) -> Result<(), AppError> {
     let board = &b.board;
     if let Some(id) = repo::boards_named(c, &board.name)?.first() {
@@ -1085,10 +1226,11 @@ fn import_board_rows(
             board.name
         )));
     }
+    let short = kept_short_id(c, "boards", &format!("board {:?}", board.name), board.short_id, clash, notes)?;
     c.execute(
         "INSERT INTO boards (name, owner_uid, is_locked, is_private, archive_after_secs, created_at, \
-         purge_deleted_after_secs, card_fields_json, description) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         purge_deleted_after_secs, card_fields_json, description, short_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             board.name,
             i64::from(board.owner_uid),
@@ -1098,7 +1240,8 @@ fn import_board_rows(
             ts(board.created_at),
             board.purge_deleted_after_secs,
             serde_json::to_string(&board.card_fields)?,
-            board.description
+            board.description,
+            short.as_str()
         ],
     )?;
     let new_board = BoardId(c.last_insert_rowid());
@@ -1144,15 +1287,17 @@ fn import_board_rows(
             dep_templates: Vec::new(),
             ..t.options.clone()
         };
+        let short = kept_short_id(c, "templates", &format!("template {:?}", t.name), t.short_id, clash, notes)?;
         c.execute(
-            "INSERT INTO templates (board_id, owner_uid, name, payload_json, options_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO templates (board_id, owner_uid, name, payload_json, options_json, short_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 new_board.0,
                 i64::from(t.owner_uid),
                 t.name,
                 serde_json::to_string(&t.draft)?,
-                serde_json::to_string(&bare)?
+                serde_json::to_string(&bare)?,
+                short.as_str()
             ],
         )?;
         m.templates.insert(t.id, TemplateId(c.last_insert_rowid()));
@@ -1180,16 +1325,18 @@ fn import_board_rows(
     }
 
     for p in &b.programs {
+        let short = kept_short_id(c, "programs", &format!("program {:?}", p.name), p.short_id, clash, notes)?;
         c.execute(
-            "INSERT INTO programs (board_id, owner_uid, name, description, steps_json, min_samples) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO programs (board_id, owner_uid, name, description, steps_json, min_samples, short_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 new_board.0,
                 i64::from(p.owner_uid),
                 p.name,
                 p.description,
                 serde_json::to_string(&p.steps)?,
-                i64::from(p.min_samples)
+                i64::from(p.min_samples),
+                short.as_str()
             ],
         )?;
         m.programs.insert(p.id, ProgramId(c.last_insert_rowid()));
@@ -1548,7 +1695,7 @@ fn remap_users(
     if people.is_empty() {
         return Err(AppError::bad(
             "this file names nobody, so there are no usernames to match; only files written by \
-             Taskologic 0.1.13 or later carry them",
+             Taskologic 0.2.0 or later carry them",
         ));
     }
     let mut local: HashMap<String, Uid> = HashMap::new();
@@ -1666,7 +1813,12 @@ mod tests {
         let json = db.with(|c| export_program(c, "from", "clean up", &[])).unwrap();
         assert!(json.contains("\"kind\": \"program\""), "{json}");
 
-        let notes = db.tx(|c| import_program(c, "To", &json, 1)).unwrap();
+        // The file carries the program's identity, which this server has
+        // (it is the same server): refused by default, a fresh id on request.
+        let err = db.tx(|c| import_program(c, "To", &json, 1, Clash::Refuse)).unwrap_err();
+        assert!(err.to_string().contains("is here already"), "{err}");
+        let notes = db.tx(|c| import_program(c, "To", &json, 1, Clash::NewId)).unwrap();
+        assert!(notes.iter().any(|n| n.contains("gets a new one")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("dropped 1 assignee")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("imported program")), "{notes:?}");
         let imported = db.with(|c| repo::list_programs(c, to.id)).unwrap();
@@ -1676,8 +1828,17 @@ mod tests {
         assert_eq!(imported[0].owner_uid, 1);
 
         // The wrong kind of file, and a board that does not exist, say so.
-        let err = db.tx(|c| import_template(c, "To", &json, 1)).unwrap_err();
+        let err = db.tx(|c| import_template(c, "To", &json, 1, Clash::Refuse)).unwrap_err();
         assert!(err.to_string().contains("not a template"), "{err}");
+        // Replace overwrites the one that has the id, where it is.
+        let mut changed: ProgramFile = serde_json::from_str(&json).unwrap();
+        changed.program.description = "the whole flat".into();
+        let text = serde_json::to_string(&changed).unwrap();
+        let notes = db.tx(|c| import_program(c, "To", &text, 1, Clash::Replace)).unwrap();
+        assert!(notes.iter().any(|n| n.contains("replaced program")), "{notes:?}");
+        let on_from = db.with(|c| repo::list_programs(c, from.id)).unwrap();
+        assert_eq!(on_from[0].description, "the whole flat", "replaced on the board that had it");
+        assert_eq!(db.with(|c| repo::list_programs(c, to.id)).unwrap().len(), 1, "the copy stays a copy");
         let err = db.with(|c| export_program(c, "Nowhere", "x", &[])).unwrap_err();
         assert!(err.to_string().contains("no board called"), "{err}");
     }
@@ -1743,14 +1904,20 @@ mod tests {
         );
         assert_eq!(file.templates[2].depends_on, vec!["Buy soap", "Fill sink"]);
 
-        let notes = db.tx(|c| import_template(c, "To", &json, 2)).unwrap();
-        assert!(notes.iter().any(|n| n.contains("\"Fill sink\" is on this board already")), "{notes:?}");
+        // Same server, so every identity in the file is taken: refused as
+        // it is, fresh ids on request. The file's "Fill sink" is then a
+        // different template from the board's own one, name or no name.
+        let err = db.tx(|c| import_template(c, "To", &json, 2, Clash::Refuse)).unwrap_err();
+        assert!(err.to_string().contains("is here already"), "{err}");
+        let notes = db.tx(|c| import_template(c, "To", &json, 2, Clash::NewId)).unwrap();
+        assert!(notes.iter().any(|n| n.contains("gets a new one")), "{notes:?}");
         let on_to = db.with(|c| repo::list_templates(c, to.id)).unwrap();
-        assert_eq!(on_to.len(), 3, "soap and wash came, the sink was already there");
+        assert_eq!(on_to.len(), 4, "soap, wash and a second sink came; the board's own stays");
         let wash_to = on_to.iter().find(|t| t.name == "Wash up").unwrap();
         let soap_to = on_to.iter().find(|t| t.name == "Buy soap").unwrap();
-        let sink_to = on_to.iter().find(|t| t.name == "Fill sink").unwrap();
-        assert_eq!(sink_to.draft.title, "Fill the sink", "the board's own, untouched");
+        let sink_to = on_to.iter().find(|t| t.name == "Fill sink" && t.draft.title == "Fill sink").unwrap();
+        assert!(on_to.iter().any(|t| t.draft.title == "Fill the sink"), "the board's own, untouched");
+        assert!(on_to.iter().all(|t| t.short_id != soap.short_id && t.short_id != wash.short_id), "fresh ids");
         let mut deps = wash_to.options.dep_templates.clone();
         deps.sort();
         let mut want = vec![soap_to.id, sink_to.id];
@@ -1899,7 +2066,7 @@ mod tests {
         assert!(bundle.events.len() >= 4, "{}", bundle.events.len());
 
         // Importing onto a server that has these boards is refused whole.
-        let err = db.tx(|c| import_everything(c, &json, true)).unwrap_err();
+        let err = db.tx(|c| import_everything(c, &json, true, Clash::Refuse)).unwrap_err();
         assert!(err.to_string().contains("\"From\" is here already"), "{err}");
 
         // Out of the way, the same file comes back as new boards.
@@ -1908,7 +2075,12 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let notes = db.tx(|c| import_everything(c, &json, true)).unwrap();
+        // Renamed out of the way, the short ids still clash on this server:
+        // refused as it is, fresh ones on request.
+        let err = db.tx(|c| import_everything(c, &json, true, Clash::Refuse)).unwrap_err();
+        assert!(err.to_string().contains("carries the id"), "{err}");
+        let notes = db.tx(|c| import_everything(c, &json, true, Clash::NewId)).unwrap();
+        assert!(notes.iter().any(|n| n.contains("is taken here, it arrives as")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("0 account(s) made, 2 already here")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("2 tasks, 2 of them given new short ids")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("1 dependencies, 1 repetitions, 1 runs linking 1 tasks")), "{notes:?}");
@@ -2018,12 +2190,17 @@ mod tests {
 
         // A board file on a server nobody has logged in to makes no accounts.
         let fresh = Db::open_in_memory().unwrap();
-        let notes = fresh.tx(|c| import_everything(c, &json, false)).unwrap();
+        let notes = fresh.tx(|c| import_everything(c, &json, false, Clash::Refuse)).unwrap();
         assert!(notes.iter().any(|n| n.starts_with("no accounts made for the 2 people")), "{notes:?}");
         assert!(fresh.with(repo::list_users).unwrap().is_empty());
         assert_eq!(fresh.with(|c| repo::list_tasks(c, BoardId(1), false)).unwrap().len(), 2);
+        assert_eq!(
+            fresh.with(|c| repo::require_board(c, BoardId(1))).unwrap().short_id,
+            from.short_id,
+            "the board keeps its identity on a server that does not have it"
+        );
         // And a whole server file is what --import-all wants.
-        let err = fresh.tx(|c| import_everything(c, &json, true)).unwrap_err();
+        let err = fresh.tx(|c| import_everything(c, &json, true, Clash::Refuse)).unwrap_err();
         assert!(err.to_string().contains("holds a board, not a everything"), "{err}");
     }
 
@@ -2038,3 +2215,5 @@ mod tests {
         remap_uids(&mut v.clone(), &all)
     }
 }
+
+// Another borderline too large module, TODO : If this has to grow any larger start splitting it up into smaller modules.

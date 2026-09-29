@@ -87,7 +87,10 @@ fn emit_line(p: &mut EscPos, l: &TextLine) {
 }
 
 fn barcode(p: &mut EscPos, bc: &Barcode, profile: &DeviceProfile) -> Result<(), RenderError> {
+    // A printer's own command draws two dots per module at the least, so a
+    // code asked for thin is rasterised whatever the printer can do.
     let native = match bc.symbology {
+        _ if bc.narrow => None,
         Symbology::Code39 if profile.supports_natively(Symbology::Code39) => {
             Some(NativeBarcode::Code39)
         }
@@ -106,7 +109,9 @@ fn barcode(p: &mut EscPos, bc: &Barcode, profile: &DeviceProfile) -> Result<(), 
             p.native_barcode(kind, &bc.payload, BAR_HEIGHT_DOTS as u8, width as u8);
         }
         None => {
-            let scale = if m.is_1d() {
+            let scale = if bc.narrow && m.is_1d() {
+                1
+            } else if m.is_1d() {
                 profile.bar_module_dots(m.width, 2, BAR_MODULE_DOTS, usize::MAX)
             } else {
                 MATRIX_MODULE_DOTS
@@ -270,7 +275,78 @@ mod tests {
     }
 
     #[test]
+    fn a_codes_card_prints_its_heading_and_every_code_in_every_mode() {
+        use taskologic_core::print::{CodeLine, build_codes_job};
+        let user = User {
+            uid: 1,
+            username: "alice".into(),
+            is_admin: false,
+            timezone: chrono_tz::UTC,
+            prefs: UserPrefs::default(),
+            has_pin: false,
+            created_at: DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        let lines = vec![
+            CodeLine { label: "move left".into(), payload: "--1ML--".into(), symbology: Symbology::Code39, narrow: false },
+            CodeLine { label: "press t".into(), payload: "--1Kt--".into(), symbology: Symbology::Code128, narrow: false },
+        ];
+        let job = build_codes_job("Navigation and keys", lines, &user, DateTime::from_timestamp(0, 0).unwrap());
+        assert_eq!(job.kind, taskologic_core::print::PrintJobKind::Codes);
+        // The plan ignores the printer's layout: heading, then the codes.
+        let ops = crate::layout::plan(&job, 32, &crate::slip::SlipLayout::reminder());
+        let labels: Vec<&str> = ops
+            .iter()
+            .filter_map(|o| match o {
+                crate::layout::Op::Barcode { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["move left", "press t"]);
+        assert!(matches!(&ops[0], crate::layout::Op::Line(l) if l.text == "Navigation and keys" && l.bold));
+        // Every output mode takes it: the bitmap is a picture, ESC/POS and
+        // text carry the payloads as characters.
+        for output in [OutputMode::EscPos, OutputMode::Bitmap, OutputMode::Text] {
+            let profile = DeviceProfile { output, ..Default::default() };
+            let bytes = render(&job, &profile).unwrap();
+            assert!(!bytes.is_empty(), "{output:?}");
+            if output != OutputMode::Bitmap {
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("--1ML--"), "{output:?}");
+            }
+        }
+        let escpos = render(&job, &DeviceProfile { output: OutputMode::EscPos, ..Default::default() }).unwrap();
+        assert_eq!(count(&escpos, &[0x1D, b'k']), 2, "two native codes");
+    }
+
+    #[test]
+    fn a_narrow_code_is_rasterised_thin_even_on_a_printer_that_draws_its_own() {
+        use taskologic_core::print::{CodeLine, build_codes_job};
+        let user = User {
+            uid: 1,
+            username: "alice".into(),
+            is_admin: false,
+            timezone: chrono_tz::UTC,
+            prefs: UserPrefs::default(),
+            has_pin: false,
+            created_at: DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        let line = |narrow| CodeLine {
+            label: "scanner check".into(),
+            payload: "--1PING--".into(),
+            symbology: Symbology::Code39,
+            narrow,
+        };
+        let profile = show_everything(escpos());
+        let thick = render(&build_codes_job("strip", vec![line(false)], &user, DateTime::from_timestamp(0, 0).unwrap()), &profile).unwrap();
+        let thin = render(&build_codes_job("strip", vec![line(true)], &user, DateTime::from_timestamp(0, 0).unwrap()), &profile).unwrap();
+        assert_eq!(count(&thick, &[0x1D, b'k']), 1, "the printer draws the normal one");
+        assert_eq!(count(&thin, &[0x1D, b'k']), 0, "the thin one is a picture");
+        assert_eq!(count(&thin, &[0x1D, b'v', b'0']), 1);
+    }
+
+    #[test]
     fn native_code39_when_supported_else_raster() {
+
         let both = show_everything(escpos());
         let bytes = render(&job(true, Symbology::Code39), &both).unwrap();
         assert_eq!(

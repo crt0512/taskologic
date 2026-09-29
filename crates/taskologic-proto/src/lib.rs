@@ -27,4 +27,9 @@ pub use message::*;
 /// 4 is 0.1.13. A step's "next day at" start rule became "so many days
 /// later at", and a program carries how many finished tasks its estimate
 /// needs; a 0.1.12 client cannot read the first and would drop the second.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// 5 is 0.2.0, barcode controls. Boards, templates and programs carry a
+/// short id, which an older client cannot read a board without; `Resolve`
+/// and `Lookup` are new requests, `PrintTask` takes a slip choice, and the
+/// codes card is a new print job kind.
+pub const PROTOCOL_VERSION: u32 = 5;

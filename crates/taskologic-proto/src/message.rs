@@ -3,9 +3,8 @@ use serde::{Deserialize, Serialize};
 use taskologic_core::barcode::ScanAction;
 use taskologic_core::board::{Board, ColumnRole};
 use taskologic_core::event::EventKind;
-use taskologic_core::ids::{
-    BoardId, ColumnId, PrintJobId, ProgramId, RunId, ShortId, TaskId, TemplateId, Uid,
-};
+use taskologic_core::control::SlipChoice;
+use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, ProgramId, RunId, ShortId, TaskId, TemplateId, Uid};
 use taskologic_core::prefs::{CardFields, UserPrefs};
 use taskologic_core::print::PrintJob;
 use taskologic_core::program::{Program, ProgramDraft};
@@ -335,6 +334,18 @@ pub enum Request {
     Scan {
         payload: String,
     },
+    /// The task a scanned code names, and its board, without doing anything
+    /// to it: what a control code armed for "the next scanned task" asks
+    /// before it acts through the ordinary requests.
+    Resolve {
+        short_id: ShortId,
+    },
+    /// The board, template or program a targeted control code names, with
+    /// the board it lives on, without doing anything to it.
+    Lookup {
+        kind: LookupKind,
+        short_id: ShortId,
+    },
     Search {
         query: String,
         #[serde(default)]
@@ -342,6 +353,9 @@ pub enum Request {
     },
     PrintTask {
         task_id: TaskId,
+        /// Which slip: the task slip when absent, as the `p` key prints.
+        #[serde(default)]
+        slip: Option<SlipChoice>,
     },
     /// Report the outcome of rendering and spooling a `PrintJob` event.
     AckPrintJob {
@@ -385,6 +399,13 @@ pub enum Response {
     Task {
         task: Task,
     },
+    /// The answer to `Resolve`.
+    Resolved {
+        task: Box<Task>,
+        board: Box<Board>,
+    },
+    /// The answer to `Lookup`.
+    Found(Found),
     Tasks {
         tasks: Vec<Task>,
     },
@@ -863,4 +884,23 @@ mod tests {
             Err(crate::codec::CodecError::TooLong(_))
         ));
     }
+}
+
+/// What a `Lookup` is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookupKind {
+    Board,
+    Template,
+    Program,
+}
+
+/// What a `Lookup` found. A template or program comes with its board, so
+/// the client can pick a column and open the right dialog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Found {
+    Board { board: Box<Board> },
+    Template { template: Box<Template>, board: Box<Board> },
+    Program { program: Box<Program>, board: Box<Board> },
 }

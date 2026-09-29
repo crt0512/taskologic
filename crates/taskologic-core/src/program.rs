@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::barcode::ScanAction;
 use crate::board::Board;
-use crate::ids::{BoardId, ColumnId, ProgramId, RunId, TaskId, Uid};
+use crate::ids::{BoardId, ColumnId, ProgramId, RunId, ShortId, TaskId, Uid};
 use crate::offset::{MAX_OFFSET_AMOUNT, Offset};
 use crate::template::DEFAULT_MIN_SAMPLES;
 use crate::print::{PrintRule, SlipKind};
@@ -33,6 +33,8 @@ pub const MAX_NAME_CHARS: usize = 120;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Program {
     pub id: ProgramId,
+    /// Six characters a barcode can name the program by.
+    pub short_id: ShortId,
     pub board_id: BoardId,
     /// Whoever saved it. Managing the program follows the template rules:
     /// this user, the board owner or an admin.

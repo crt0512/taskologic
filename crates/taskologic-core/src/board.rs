@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BoardId, ColumnId, Uid};
+use crate::ids::{BoardId, ColumnId, ShortId, Uid};
 use crate::prefs::CardFields;
 
 /// Default archive delay for finished tasks, one week.
@@ -52,6 +52,9 @@ impl ColumnRole {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Board {
     pub id: BoardId,
+    /// Six characters a barcode can name the board by. Stable across an
+    /// export and import unless the target already has it.
+    pub short_id: ShortId,
     pub name: String,
     /// What the board is for. Shown on its card and in its settings.
     pub description: String,
@@ -290,6 +293,7 @@ pub mod test_support {
         }
         Board {
             id,
+            short_id: crate::ids::ShortId::from_index(0),
             name: "Test board".into(),
             description: String::new(),
             owner_uid: owner,

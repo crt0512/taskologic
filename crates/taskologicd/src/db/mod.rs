@@ -33,6 +33,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0010_programs.sql")),
         M::up(include_str!("../../migrations/0011_auto_start.sql")),
         M::up(include_str!("../../migrations/0012_program_min_samples.sql")),
+        M::up(include_str!("../../migrations/0013_short_ids.sql")),
     ])
 }
 
@@ -61,6 +62,9 @@ impl Db {
         migrations()
             .to_latest(&mut conn)
             .context("running migrations")?;
+        // Rows from before 0013 have no short id yet; SQLite cannot make a
+        // base36 one, so they get theirs here, once.
+        repo::backfill_short_ids(&conn).context("giving boards, templates and programs short ids")?;
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -228,6 +232,18 @@ mod migration_tests {
             )
             .unwrap();
         assert_eq!(min, 3);
+        // 0.2.0: short ids on boards, templates and programs. The columns
+        // arrive empty and the daemon fills them the first time it opens the
+        // database, so an old row is nameable by a barcode from then on.
+        let empty: i64 = conn
+            .query_row("SELECT count(*) FROM boards WHERE short_id IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert!(empty >= 1, "the migration itself leaves them empty");
+        repo::backfill_short_ids(&conn).unwrap();
+        let empty: i64 = conn
+            .query_row("SELECT count(*) FROM boards WHERE short_id IS NULL OR length(short_id) != 6", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(empty, 0);
 
         // The rebuilt bookkeeping table keeps what it knew, labelled.
         let (kind, anchor): (String, i64) = conn
