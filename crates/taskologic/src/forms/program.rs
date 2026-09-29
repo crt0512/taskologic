@@ -13,7 +13,7 @@ use taskologic_core::program::{
     Program, ProgramDraft, ROOT_KEY, Step, start_rule_summary, triggers_summary,
 };
 
-use super::{Row, button_bar, button_h, button_row, frame_block, label, popup, split_label};
+use super::{Row, button_bar, button_h, button_row, frame_block, label, split_label};
 use crate::ui::adapter::{
     ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, HasScreenCursor,
     ListState, Outcome, Regular, TextInputState, field, list, render_button,
@@ -300,8 +300,15 @@ impl ProgramForm {
     pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
         let bh = button_h(t);
         // Most of the screen, whatever its size, with three cells of desktop
-        // around it: a program is read as a list and wants the room.
-        let p = popup(area, area.width.saturating_sub(6), area.height.saturating_sub(6));
+        // around it: a program is read as a list and wants the room. Two
+        // more at the top with bigger buttons, which is where they are.
+        let top = if t.touch { 5 } else { 3 };
+        let p = Rect::new(
+            area.x + 3,
+            area.y + top,
+            area.width.saturating_sub(6),
+            area.height.saturating_sub(top + 3),
+        );
         f.render_widget(Clear, p);
         let title = if self.program_id.is_some() {
             " Edit program "
@@ -428,8 +435,9 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut form = ProgramForm::create(BoardId(1));
-        for (w, h) in [(100u16, 40u16), (80, 24), (160, 60)] {
-            let theme = crate::ui::theme::Theme::default();
+        // With bigger buttons the window starts two rows lower.
+        for (w, h, touch) in [(100u16, 40u16, false), (80, 24, false), (160, 60, false), (100, 40, true)] {
+            let theme = crate::ui::theme::Theme::default().with_touch(touch);
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| form.render(f, f.area(), &theme)).unwrap();
             let out = term.backend().to_string();
@@ -440,12 +448,13 @@ mod tests {
                 .filter(|(_, l)| l.contains('│') || l.contains('─'))
                 .map(|(y, _)| y)
                 .collect();
-            assert_eq!((framed[0], *framed.last().unwrap()), (3, h as usize - 4), "{w}x{h}:\n{out}");
+            let top_row = if touch { 5 } else { 3 };
+            assert_eq!((framed[0], *framed.last().unwrap()), (top_row, h as usize - 4), "{w}x{h} touch {touch}:\n{out}");
             // The test backend quotes each line; count in characters past it.
-            let top = lines[3].trim_matches('"');
+            let top = lines[top_row].trim_matches('"');
             let first = top.chars().take_while(|c| c.is_whitespace()).count();
             let last = top.trim_end().chars().count() - 1;
-            assert_eq!((first, last), (3, w as usize - 4), "{w}x{h}:\n{out}");
+            assert_eq!((first, last), (3, w as usize - 4), "{w}x{h} touch {touch}:\n{out}");
         }
     }
 
