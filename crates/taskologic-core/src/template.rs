@@ -42,7 +42,8 @@ pub const DEFAULT_MIN_SAMPLES: u32 = 3;
 #[serde(default)]
 pub struct TemplateOptions {
     /// Set when the template prefills the start date of the tasks it stamps
-    /// out, counted forward from the moment it is used.
+    /// out, counted forward from the moment it is used. Stamped out as a
+    /// dependency, it counts from when the task needing it starts instead.
     pub start_prefill: Option<Offset>,
     /// The same for the due date. It doubles as the fallback when
     /// `due_from_average` is set but there is not enough history yet.
@@ -178,6 +179,43 @@ pub fn expansion_order(
     // order stamps that one out themselves.
     out.pop();
     out
+}
+
+/// The moment each dependency template counts its prefills from when `root`
+/// is stamped out with a task starting at `root_start`. A dependency's "now"
+/// is when the task that needs it starts, so pushing the root task out moves
+/// everything it stamps out along with it, level by level. A dependency that
+/// several tasks need goes with the earliest of them.
+pub fn prefill_anchors(
+    options: &HashMap<TemplateId, TemplateOptions>,
+    root: TemplateId,
+    root_start: DateTime<Utc>,
+) -> HashMap<TemplateId, DateTime<Utc>> {
+    let deps_of: HashMap<TemplateId, Vec<TemplateId>> = options
+        .iter()
+        .map(|(id, o)| (*id, o.dep_templates.clone()))
+        .collect();
+    let mut anchors: HashMap<TemplateId, DateTime<Utc>> = HashMap::new();
+    let hand_down =|anchors: &mut HashMap<_, DateTime<Utc>>, from: TemplateId, at| {
+        for dep in deps_of.get(&from).into_iter().flatten() {
+            anchors
+                .entry(*dep)
+                .and_modify(|a| *a = (*a).min(at))
+                .or_insert(at);
+        }
+    };
+    hand_down(&mut anchors, root, root_start);
+    // Dependencies come first in the expansion order, so backwards every
+    // task that needs a template has handed its start down before it is read.
+    for id in expansion_order(&deps_of, root).into_iter().rev() {
+        let anchor = *anchors.entry(id).or_insert(root_start);
+        let start = options
+            .get(&id)
+            .and_then(|o| o.start_for(anchor))
+            .unwrap_or(anchor);
+        hand_down(&mut anchors, id, start);
+    }
+    anchors
 }
 
 fn walk(
@@ -319,5 +357,37 @@ mod tests {
         // looped on.
         let bad = g(&[(1, &[2]), (2, &[1])]);
         assert_eq!(ids(&expansion_order(&bad, TemplateId(1))), vec![2]);
+    }
+
+    #[test]
+    fn dependencies_count_from_when_the_task_needing_them_starts() {
+        let opts = |start: Option<Offset>, deps: &[i64]| TemplateOptions {
+            start_prefill: start,
+            dep_templates: deps.iter().map(|d| TemplateId(*d)).collect(),
+            ..Default::default()
+        };
+        // 1 -> 2, 3; 2 -> 4, 5; 3 -> 4. Only 2 and 4 prefill a start.
+        let options: HashMap<_, _> = [
+            (1, opts(None, &[2, 3])),
+            (2, opts(Some(hours(5)), &[4, 5])),
+            (3, opts(None, &[4])),
+            (4, opts(Some(hours(1)), &[])),
+            (5, opts(None, &[])),
+        ]
+        .into_iter()
+        .map(|(id, o)| (TemplateId(id), o))
+        .collect();
+        let root_start = now() + TimeDelta::days(3);
+        let anchors = prefill_anchors(&options, TemplateId(1), root_start);
+        let at = |id| anchors[&TemplateId(id)];
+
+        assert_eq!(at(2), root_start);
+        assert_eq!(at(3), root_start);
+        // Needed by 2, which starts 5h in, and by 3, which has no start of
+        // its own and so starts with the root: the earlier one wins.
+        assert_eq!(at(4), root_start);
+        // Needed only by 2, so it goes with 2's own start.
+        assert_eq!(at(5), root_start + TimeDelta::hours(5));
+        assert!(!anchors.contains_key(&TemplateId(1)));
     }
 }

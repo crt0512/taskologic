@@ -720,7 +720,20 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
             };
             let now = Utc::now();
             let (deps, task) = state.db.tx(|c| {
-                let graph = repo::template_deps_graph(c, board.id)?;
+                let options: HashMap<TemplateId, TemplateOptions> =
+                    repo::list_templates(c, board.id)?
+                        .into_iter()
+                        .map(|t| (t.id, t.options))
+                        .collect();
+                let graph = options
+                    .iter()
+                    .map(|(id, o)| (*id, o.dep_templates.clone()))
+                    .collect();
+                // The dependencies are dated from when the task needing them
+                // starts, not from now, so starting the task later moves them
+                // too. A start in the past does not drag them back there.
+                let root_start = draft.start_at.map_or(now, |s| s.max(now));
+                let anchors = template::prefill_anchors(&options, tpl.id, root_start);
                 let mut deps: Vec<Task> = Vec::new();
                 for id in template::expansion_order(&graph, tpl.id) {
                     // A dependency template deleted since it was linked is
@@ -728,8 +741,9 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                     let Some(dep_tpl) = repo::get_template(c, id)? else {
                         continue;
                     };
+                    let anchor = anchors.get(&id).copied().unwrap_or(root_start);
                     let mut dep_draft = dep_tpl.draft;
-                    dep_draft.start_at = dep_tpl.options.start_for(now);
+                    dep_draft.start_at = dep_tpl.options.start_for(anchor);
                     let history = dep_tpl
                         .options
                         .due_from_average
@@ -740,7 +754,7 @@ pub fn handle(state: &Arc<AppState>, s: &Session, req: Request) -> R {
                     dep_draft.due_at =
                         dep_tpl
                             .options
-                            .due_for(now, dep_draft.start_at, history);
+                            .due_for(anchor, dep_draft.start_at, history);
                     deps.push(repo::create_task(
                         c,
                         &board,
@@ -1990,6 +2004,72 @@ mod tests {
                 .due_at,
             None,
             "a template without a prefill rule still carries no due date"
+        );
+    }
+
+    #[test]
+    fn dependency_templates_are_dated_from_when_the_task_starts() {
+        let st = state();
+        let board = make_board(&st, 1, false, &[]);
+        let soap = make_template(
+            &st,
+            1,
+            &board,
+            "Buy soap",
+            TemplateOptions {
+                start_prefill: Some(Offset {
+                    amount: 0,
+                    unit: OffsetUnit::Hours,
+                }),
+                due_prefill: Some(Offset {
+                    amount: 2,
+                    unit: OffsetUnit::Hours,
+                }),
+                ..Default::default()
+            },
+        );
+        let wash = make_template(
+            &st,
+            1,
+            &board,
+            "Wash up",
+            TemplateOptions {
+                dep_templates: vec![soap.id],
+                ..Default::default()
+            },
+        );
+
+        let later = Utc::now() + chrono::TimeDelta::days(3);
+        let draft = TaskDraft {
+            title: "Wash up".into(),
+            start_at: Some(later),
+            ..Default::default()
+        };
+        handle(
+            &st,
+            &session(1),
+            Request::CreateFromTemplate {
+                template_id: wash.id,
+                column_id: None,
+                draft,
+            },
+        )
+        .unwrap();
+
+        let tasks = st
+            .db
+            .with(|c| repo::list_tasks(c, board.id, false))
+            .unwrap();
+        let soap_task = tasks.iter().find(|t| t.title == "Buy soap").unwrap();
+        let start = soap_task.start_at.unwrap();
+        assert!(
+            (start - later).num_seconds().abs() <= 1,
+            "\"now\" is when the washing up starts, was {start}"
+        );
+        let due = soap_task.due_at.unwrap();
+        assert!(
+            (due - later - chrono::TimeDelta::hours(2)).num_seconds().abs() <= 1,
+            "and the due date counts from there too, was {due}"
         );
     }
 
