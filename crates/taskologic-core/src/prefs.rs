@@ -28,6 +28,34 @@ pub enum ThemePreset {
     Custom,
 }
 
+/// How dark a dark theme is: the desktop and the greys of dialogs, cards,
+/// the bar and buttons move together.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Darkness {
+    /// A true black desktop under the darkest greys.
+    Black,
+    /// The darkest greys on the faintest grey desktop.
+    Darker,
+    #[default]
+    Default,
+    /// A shade lighter than default all round.
+    Lighter,
+}
+
+impl Darkness {
+    pub const ALL: [Darkness; 4] = [Darkness::Black, Darkness::Darker, Darkness::Default, Darkness::Lighter];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Darkness::Black => "black",
+            Darkness::Darker => "darker",
+            Darkness::Default => "default",
+            Darkness::Lighter => "lighter",
+        }
+    }
+}
+
 impl ThemePreset {
     pub const ALL: [ThemePreset; 7] = [
         ThemePreset::Default,
@@ -38,6 +66,19 @@ impl ThemePreset {
         ThemePreset::DarkGreen,
         ThemePreset::Custom,
     ];
+
+    /// The dark themes: dark surfaces, an accent each, and a darkness
+    /// level.
+    pub fn is_dark(self) -> bool {
+        matches!(
+            self,
+            ThemePreset::DarkBlue
+                | ThemePreset::DarkRed
+                | ThemePreset::DarkOrange
+                | ThemePreset::DarkYellow
+                | ThemePreset::DarkGreen
+        )
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -86,15 +127,15 @@ impl Default for CustomColors {
     /// moved off it.
     fn default() -> Self {
         Self {
-            screen: "16".into(),
-            bar: "236".into(),
-            surface: "234".into(),
-            card: "236".into(),
+            screen: "233".into(),
+            bar: "238".into(),
+            surface: "235".into(),
+            card: "238".into(),
             text: "253".into(),
             muted: "245".into(),
             accent: "45".into(),
             select: "45".into(),
-            button: "237".into(),
+            button: "240".into(),
             warn: "214".into(),
             danger: "203".into(),
             ok: "114".into(),
@@ -162,6 +203,8 @@ pub struct UiPrefs {
     pub show_board_tabs: bool,
     pub theme: ThemePreset,
     pub custom_colors: CustomColors,
+    /// How dark a dark theme's greys are, the desktop included.
+    pub darkness: Darkness,
     /// Overrides the board's own card fields when set.
     pub card_fields: Option<CardFields>,
     /// Bigger buttons.
@@ -181,6 +224,7 @@ impl Default for UiPrefs {
             show_board_tabs: true,
             theme: ThemePreset::default(),
             custom_colors: CustomColors::default(),
+            darkness: Darkness::default(),
             card_fields: None,
             touchscreen: false,
             scanner_enabled: true,

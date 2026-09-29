@@ -497,10 +497,11 @@ fn dashboard_body(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
 
     app.board_areas.clear();
     app.hit_areas.clear();
+    app.dash_up = None;
+    app.dash_down = None;
     // One blank line between cards, so they do not run into each other.
     let gap = 1;
     let h = card::max_board_card_height(t.touch);
-    let per_page = (list.height / (h + gap)).max(1) as usize;
     let len = if searching {
         app.hits.len()
     } else {
@@ -520,6 +521,25 @@ fn dashboard_body(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         f.render_widget(Paragraph::new(text).style(t.dim()), list);
         return;
     }
+    // When the cards do not all fit, the last row belongs to the scroll
+    // arrows, like a column's.
+    let card_height = |i: usize| {
+        if searching {
+            h
+        } else {
+            card::board_card_height(&app.boards[i], t.touch)
+        }
+    };
+    let need: u32 = (0..len).map(|i| u32::from(card_height(i) + gap)).sum::<u32>() - u32::from(gap);
+    let fits = need <= u32::from(list.height);
+    let list = if fits {
+        app.dash_scroll = 0;
+        list
+    } else {
+        Rect::new(list.x, list.y, list.width, list.height.saturating_sub(1))
+    };
+    let per_page = (list.height / (h + gap)).max(1) as usize;
+    app.dash_page = per_page;
     // Keep the selection on screen. per_page uses the tallest card, so at
     // least that many always fit.
     if sel < app.dash_scroll {
@@ -533,11 +553,7 @@ fn dashboard_body(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
     let mut y = list.y;
     let mut shown = 0;
     for i in app.dash_scroll..len {
-        let card_h = if searching {
-            h
-        } else {
-            card::board_card_height(&app.boards[i], t.touch)
-        };
+        let card_h = card_height(i);
         if y + card_h > list.bottom() {
             break;
         }
@@ -552,13 +568,25 @@ fn dashboard_body(app: &mut App, f: &mut Frame, area: Rect, t: &Theme) {
         y += card_h + gap;
         shown += 1;
     }
+    if fits || area.height < 3 {
+        return;
+    }
+    let row = Rect::new(list.x, list.bottom(), list.width, 1);
+    if app.dash_scroll > 0 {
+        let r = Rect::new(row.right().saturating_sub(7), row.y, 3, 1);
+        f.render_widget(Paragraph::new(" ^ ").style(t.hover_if(t.button(), r)), r);
+        app.dash_up = Some(r);
+    }
     if app.dash_scroll + shown < len {
+        let r = Rect::new(row.right().saturating_sub(4), row.y, 3, 1);
+        f.render_widget(Paragraph::new(" v ").style(t.hover_if(t.button(), r)), r);
+        app.dash_down = Some(r);
         let more = format!("{} more below", len - (app.dash_scroll + shown));
         f.render_widget(
             Paragraph::new(more)
                 .style(t.dim())
                 .alignment(Alignment::Right),
-            Rect::new(list.x, list.bottom().saturating_sub(1), list.width, 1),
+            Rect::new(row.x, row.y, row.width.saturating_sub(8), 1),
         );
     }
 }
@@ -1464,6 +1492,62 @@ mod tests {
         assert!(
             matches!(&cmds[0], Cmd::Send(m) if matches!(m.request, taskologic_proto::Request::GetBoard { board_id } if board_id == taskologic_core::ids::BoardId(2)))
         );
+    }
+
+    #[test]
+    fn the_boards_list_grows_scroll_arrows_when_it_overflows() {
+        use crate::app::Msg;
+        use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use taskologic_core::ids::BoardId;
+        use taskologic_proto::BoardSummary;
+        let click = |app: &mut App, r: Rect| {
+            app.update(Msg::Term(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x + 1,
+                row: r.y,
+                modifiers: KeyModifiers::NONE,
+            })));
+        };
+        // Two boards fit, so there is nothing to scroll and no arrows.
+        let mut app = ready_app(false);
+        let out = render(&mut app, 100, 24);
+        assert!(app.dash_up.is_none() && app.dash_down.is_none());
+        assert!(!out.contains(" v "));
+
+        for i in 3..=12 {
+            app.boards.push(BoardSummary {
+                id: BoardId(i),
+                name: format!("Board {i}"),
+                description: String::new(),
+                owner_uid: 1,
+                is_locked: false,
+                is_private: false,
+                is_member: true,
+                task_count: 0,
+            });
+        }
+        let out = render(&mut app, 100, 24);
+        let down = app.dash_down.expect("more below, so a down arrow");
+        assert!(app.dash_up.is_none(), "nothing above yet");
+        assert!(out.contains(" v ") && out.contains("more below"));
+        assert!(!out.contains(" ^ "));
+        assert!(
+            app.board_areas.iter().all(|a| a.bottom() <= down.y),
+            "the arrow row is not shared with a card"
+        );
+
+        // A tap scrolls one card; the selection follows the view.
+        click(&mut app, down);
+        assert_eq!(app.dash_scroll, 1);
+        assert_eq!(app.board_sel, 1);
+        let out = render(&mut app, 100, 24);
+        assert_eq!(app.dash_scroll, 1, "the render keeps the scrolled view");
+        assert!(out.contains(" ^ ") && out.contains(" v "));
+        let up = app.dash_up.expect("scrolled, so an up arrow");
+        click(&mut app, up);
+        assert_eq!(app.dash_scroll, 0);
+        render(&mut app, 100, 24);
+        assert!(app.dash_up.is_none());
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use serde::Deserialize;
-use taskologic_core::prefs::{CustomColors, ThemePreset};
+use taskologic_core::prefs::{CustomColors, Darkness, ThemePreset};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,35 +182,49 @@ impl Accent {
     fn colors(self) -> (Color, Color, Color, Color) {
         match self {
             Accent::Blue => (Color::Indexed(45), Color::Cyan, Color::Indexed(16), Color::Black),
-            Accent::Red => (Color::Indexed(203), Color::Red, Color::Indexed(231), Color::White),
+            Accent::Red => (Color::Indexed(196), Color::Red, Color::Indexed(231), Color::White),
             Accent::Orange => (Color::Indexed(214), Color::Yellow, Color::Indexed(16), Color::Black),
-            Accent::Yellow => (Color::Indexed(227), Color::LightYellow, Color::Indexed(16), Color::Black),
-            Accent::Green => (Color::Indexed(114), Color::Green, Color::Indexed(16), Color::Black),
+            Accent::Yellow => (Color::Indexed(226), Color::LightYellow, Color::Indexed(16), Color::Black),
+            Accent::Green => (Color::Indexed(46), Color::Green, Color::Indexed(16), Color::Black),
         }
     }
 }
 
-/// Dark surfaces with the accent in the borders, titles and selections. The
-/// desktop behind everything is true black; dialogs and cards sit on greys
-/// above it.
+/// The greys of a dark theme at each darkness level, in the 256 colour
+/// palette: desktop, dialogs, cards and bar, buttons. The sixteen colour
+/// palette has no such steps and uses the same three greys throughout.
+fn dark_greys(level: Darkness) -> (Color, Color, Color, Color) {
+    let i = Color::Indexed;
+    match level {
+        Darkness::Black => (i(16), i(234), i(236), i(237)),
+        Darkness::Darker => (i(233), i(234), i(236), i(237)),
+        Darkness::Default => (i(233), i(235), i(238), i(240)),
+        Darkness::Lighter => (i(234), i(236), i(239), i(241)),
+    }
+}
+
+/// Dark surfaces with the accent in the borders, titles and selections;
+/// dialogs and cards sit on greys above the desktop, at the default level
+/// until [`Theme::with_darkness`] says otherwise.
 fn dark_palette(full: bool, accent: Accent) -> Palette {
     let c = |f: Color, a: Color| Some(if full { f } else { a });
     let (accent_full, accent_ansi, on_full, on_ansi) = accent.colors();
+    let (screen, surface, card, button) = dark_greys(Darkness::Default);
     Palette {
-        screen_bg: c(Color::Indexed(16), Color::Black),
+        screen_bg: c(screen, Color::Black),
         screen_fg: c(Color::Indexed(253), Color::White),
-        bar_bg: c(Color::Indexed(236), Color::DarkGray),
+        bar_bg: c(card, Color::DarkGray),
         bar_fg: c(Color::Indexed(231), Color::White),
-        surface_bg: c(Color::Indexed(234), Color::Black),
+        surface_bg: c(surface, Color::Black),
         surface_fg: c(Color::Indexed(253), Color::White),
         surface_muted: c(Color::Indexed(245), Color::Gray),
-        card_bg: c(Color::Indexed(236), Color::Black),
+        card_bg: c(card, Color::Black),
         card_fg: c(Color::Indexed(253), Color::White),
         card_muted: c(Color::Indexed(245), Color::Gray),
         accent: c(accent_full, accent_ansi),
         select_bg: c(accent_full, accent_ansi),
         select_fg: c(on_full, on_ansi),
-        button_bg: c(Color::Indexed(237), Color::Gray),
+        button_bg: c(button, Color::Gray),
         button_fg: c(Color::Indexed(231), Color::White),
         warn: c(Color::Indexed(214), Color::Yellow),
         danger: c(Color::Indexed(203), Color::Red),
@@ -260,6 +274,8 @@ pub struct Theme {
     pub mode: ColorMode,
     pub ascii: bool,
     pub touch: bool,
+    /// One of the dark presets, which the black background toggle applies to.
+    pub dark: bool,
     /// Where the pointer is, so anything clickable can light up under it.
     pub mouse: Option<(u16, u16)>,
     pub palette: Palette,
@@ -290,6 +306,7 @@ impl Theme {
             mode,
             ascii,
             touch: false,
+            dark: preset.is_dark(),
             mouse: None,
             palette,
         }
@@ -297,6 +314,21 @@ impl Theme {
 
     pub fn with_touch(mut self, touch: bool) -> Theme {
         self.touch = touch;
+        self
+    }
+
+    /// How dark a dark theme is: moves the desktop, dialogs, cards, bar and
+    /// buttons together. The light and custom themes ignore it, and so does
+    /// a sixteen colour terminal, which has no steps between its greys.
+    pub fn with_darkness(mut self, level: Darkness) -> Theme {
+        if self.dark && self.mode == ColorMode::Full {
+            let (screen, surface, card, button) = dark_greys(level);
+            self.palette.screen_bg = Some(screen);
+            self.palette.surface_bg = Some(surface);
+            self.palette.card_bg = Some(card);
+            self.palette.bar_bg = Some(card);
+            self.palette.button_bg = Some(button);
+        }
         self
     }
 
@@ -643,10 +675,10 @@ mod tests {
     fn the_dark_themes_differ_in_their_accent_and_nothing_else() {
         let blue = Theme::preset(ThemePreset::DarkBlue, &CustomColors::default(), ColorMode::Full, false).palette;
         for (preset, accent) in [
-            (ThemePreset::DarkRed, Color::Indexed(203)),
+            (ThemePreset::DarkRed, Color::Indexed(196)),
             (ThemePreset::DarkOrange, Color::Indexed(214)),
-            (ThemePreset::DarkYellow, Color::Indexed(227)),
-            (ThemePreset::DarkGreen, Color::Indexed(114)),
+            (ThemePreset::DarkYellow, Color::Indexed(226)),
+            (ThemePreset::DarkGreen, Color::Indexed(46)),
         ] {
             let p = Theme::preset(preset, &CustomColors::default(), ColorMode::Full, false).palette;
             assert_eq!(p.accent, Some(accent), "{preset:?}");
@@ -656,6 +688,24 @@ mod tests {
             assert_eq!(p.card_bg, blue.card_bg, "{preset:?}");
             assert_eq!(p.button_bg, blue.button_bg, "{preset:?}");
         }
+        // The darkness level moves the greys together, darker to lighter,
+        // and only on a dark theme.
+        let plain = Theme::preset(ThemePreset::DarkGreen, &CustomColors::default(), ColorMode::Full, false);
+        assert_eq!(plain.palette.screen_bg, Some(Color::Indexed(233)), "default level");
+        assert_eq!(plain.palette.surface_bg, Some(Color::Indexed(235)));
+        let black = plain.with_darkness(Darkness::Black);
+        assert_eq!(black.palette.screen_bg, Some(Color::Indexed(16)));
+        assert_eq!(black.palette.surface_bg, Some(Color::Indexed(234)));
+        assert_eq!(black.palette.button_bg, Some(Color::Indexed(237)));
+        let darker = plain.with_darkness(Darkness::Darker);
+        assert_eq!(darker.palette.screen_bg, Some(Color::Indexed(233)));
+        assert_eq!(darker.palette.surface_bg, black.palette.surface_bg);
+        let lighter = plain.with_darkness(Darkness::Lighter);
+        assert_eq!(lighter.palette.surface_bg, Some(Color::Indexed(236)));
+        assert_eq!(lighter.palette.card_bg, Some(Color::Indexed(239)));
+        assert_eq!(black.palette.accent, plain.palette.accent, "the accent never moves");
+        let light = Theme::preset(ThemePreset::Default, &CustomColors::default(), ColorMode::Full, false);
+        assert_eq!(light.with_darkness(Darkness::Black).palette.screen_bg, light.palette.screen_bg);
         // A custom theme nobody has touched is dark blue.
         let custom = Theme::preset(ThemePreset::Custom, &CustomColors::default(), ColorMode::Full, false).palette;
         assert_eq!(custom.screen_bg, blue.screen_bg);

@@ -19,7 +19,7 @@ use taskologic_core::control::{self, Control, Value};
 use crate::control::{Armed, ControlState, Waiting, named_key_event, values_date, values_minutes, values_text};
 use taskologic_core::board::{Board, ColumnRole};
 use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, TaskId, Uid};
-use taskologic_core::prefs::{CardFields, CustomColors, ThemePreset};
+use taskologic_core::prefs::{CardFields, CustomColors, Darkness, ThemePreset};
 use taskologic_core::print::PrintJob;
 use taskologic_core::program::Question;
 use taskologic_core::task::Task;
@@ -528,6 +528,11 @@ pub struct App {
     pub board_sel: usize,
     pub board_areas: Vec<Rect>,
     pub dash_scroll: usize,
+    /// The scroll arrows under the boards list, drawn only when the boards
+    /// do not all fit, and how many cards a page is sure to hold.
+    pub dash_up: Option<Rect>,
+    pub dash_down: Option<Rect>,
+    pub dash_page: usize,
     pub tab_areas: Vec<(Rect, taskologic_core::ids::BoardId)>,
     pub search: TextInputState,
     pub search_area: Rect,
@@ -572,6 +577,9 @@ impl App {
             board_sel: 0,
             board_areas: Vec::new(),
             dash_scroll: 0,
+            dash_up: None,
+            dash_down: None,
+            dash_page: 1,
             tab_areas: Vec::new(),
             search: TextInputState::named("search"),
             search_area: Rect::default(),
@@ -605,17 +613,18 @@ impl App {
     /// Colours and glyphs, rebuilt per frame so a prefs change shows at once.
     /// While the settings form is open it previews what is picked there.
     pub fn theme(&self) -> Theme {
-        let (preset, colors) = match &self.overlay {
+        let (preset, colors, darkness) = match &self.overlay {
             Some(Overlay::Settings(form)) => form.preview(),
             Some(Overlay::Colors { back, .. }) => back.preview(),
             Some(Overlay::Printer { back, .. }) => back.preview(),
             Some(Overlay::Codes { back, .. }) => back.preview(),
             _ => match &self.user {
-                Some(u) => (u.prefs.ui.theme, u.prefs.ui.custom_colors.clone()),
-                None => (ThemePreset::default(), CustomColors::default()),
+                Some(u) => (u.prefs.ui.theme, u.prefs.ui.custom_colors.clone(), u.prefs.ui.darkness),
+                None => (ThemePreset::default(), CustomColors::default(), Darkness::default()),
             },
         };
         Theme::preset(preset, &colors, self.color_mode, self.ascii)
+            .with_darkness(darkness)
             .with_touch(self.touchscreen())
             .with_mouse(self.mouse_pos)
     }
@@ -4468,10 +4477,32 @@ impl App {
                     return Vec::new();
                 }
                 self.search.focus().set(false);
+                // The arrows scroll the list one card, like a column's; the
+                // selection is always kept on screen, so it follows.
+                let at = Position::new(x, y);
+                if self.dash_up.is_some_and(|r| r.contains(at)) {
+                    self.dash_scroll = self.dash_scroll.saturating_sub(1);
+                    let last = self.dash_scroll + self.dash_page.max(1) - 1;
+                    if self.hits.is_empty() {
+                        self.board_sel = self.board_sel.min(last);
+                    } else {
+                        self.hit_sel = self.hit_sel.min(last);
+                    }
+                    return Vec::new();
+                }
+                if self.dash_down.is_some_and(|r| r.contains(at)) {
+                    self.dash_scroll += 1;
+                    if self.hits.is_empty() {
+                        self.board_sel = self.board_sel.max(self.dash_scroll);
+                    } else {
+                        self.hit_sel = self.hit_sel.max(self.dash_scroll);
+                    }
+                    return Vec::new();
+                }
                 if let Some(i) = self
                     .hit_areas
                     .iter()
-                    .position(|a| a.contains(Position::new(x, y)))
+                    .position(|a| a.contains(at))
                 {
                     self.hit_sel = i;
                     return self.dashboard_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
