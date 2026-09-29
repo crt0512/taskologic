@@ -7,6 +7,26 @@ use chrono::{DateTime, Datelike, Months, TimeDelta, Utc};
 use chrono_tz::Tz;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use taskologic_core::control::{Control, NamedKey, Unit, Value};
+use taskologic_core::ids::{ColumnId, TaskId};
+use taskologic_core::task::TaskDraft;
+
+/// How to take back one change a control code made to a task, recorded
+/// once the daemon confirmed the change.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UndoStep {
+    /// Back to the column and place it was in.
+    Move { task: TaskId, column: ColumnId, position: i64 },
+    /// The fields as they were. `version` is the row's version right after
+    /// the change, learned from the daemon's answer.
+    Update { task: TaskId, draft: TaskDraft, version: u64 },
+    /// It was archived.
+    Restore { task: TaskId },
+    Checklist { task: TaskId, index: usize, done: bool },
+    Exclude { task: TaskId, excluded: bool },
+}
+
+/// How many changes `--1UNDO--` can walk back through.
+pub const UNDO_DEPTH: usize = 3;
 
 /// A command that arrived without the value it needs, waiting for one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,10 +69,12 @@ impl Armed {
 }
 
 /// What the client remembers between control scans.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ControlState {
     pub waiting: Option<Waiting>,
     pub armed: Option<Armed>,
+    /// Changes made by control codes, latest last, for `--1UNDO--`.
+    pub undo: Vec<UndoStep>,
     /// When the state was last set or used, for the timeout.
     pub since_ms: u64,
 }

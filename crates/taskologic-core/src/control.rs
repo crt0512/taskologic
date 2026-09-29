@@ -463,6 +463,8 @@ pub enum Control {
     Search { archive: bool },
     /// Toasts "scanner ok".
     Ping,
+    /// Undo the last change a control code made to a task.
+    Undo,
     // Data entry into the focused field. Both want a value.
     Insert,
     Replace,
@@ -509,6 +511,7 @@ impl Control {
             Search { archive: false } => "Q".into(),
             Search { archive: true } => "QA".into(),
             Ping => "PING".into(),
+            Undo => "UNDO".into(),
             Insert => "I".into(),
             Replace => "R".into(),
             Value(v) => v.encode(),
@@ -552,6 +555,7 @@ impl Control {
             Search { archive: false } => "search".into(),
             Search { archive: true } => "search, archive included".into(),
             Ping => "scanner check".into(),
+            Undo => "undo the last change".into(),
             Insert => "insert".into(),
             Replace => "replace".into(),
             Value(v) => v.label(),
@@ -618,6 +622,7 @@ impl Control {
             "Q" => Search { archive: false },
             "QA" => Search { archive: true },
             "PING" => Ping,
+            "UNDO" => Undo,
             "I" => Insert,
             "R" => Replace,
             "N" => Value(self::Value::Now),
@@ -963,6 +968,7 @@ pub fn entries(category: Category) -> Vec<Entry> {
             v.push(Entry::asking("Search", vec![Search { archive: false }], Asks::Text));
             v.push(Entry::asking("Search, archive included", vec![Search { archive: true }], Asks::Text));
             v.push(Entry::plain("Scanner check", vec![Ping]));
+            v.push(Entry::plain("Undo the last change", vec![Undo]));
             v
         }
         Category::DataEntry => vec![
@@ -1087,7 +1093,7 @@ mod tests {
             Set(Field::Title), Set(Field::RemindDue), Set(Field::StartAndDue), Set(Field::ChecklistItem(4)), Set(Field::ExcludeFromStats),
             Show(None), Show(Some(id("K4M9Q2"))), Selected, Sticky,
             Key('T'), Key('n'), Key('?'), Named(NamedKey::BackTab), Named(NamedKey::F(1)), Named(NamedKey::F(12)), NamedTimes(NamedKey::Tab, 3), NamedTimes(NamedKey::BackTab, 12), Dashboard, NextBoard, PrevBoard,
-            Search { archive: false }, Search { archive: true }, Ping, Insert, Replace,
+            Search { archive: false }, Search { archive: true }, Ping, Undo, Insert, Replace,
             Value(self::Value::Now), Value(self::Value::Today), Value(self::Value::Time),
             Value(self::Value::Plus(2, Unit::Hours)), Value(self::Value::Minus(30, Unit::Minutes)),
             Value(self::Value::Plus(1, Unit::Months)), Value(self::Value::Split), Value(self::Value::Me), Value(self::Value::Clear),

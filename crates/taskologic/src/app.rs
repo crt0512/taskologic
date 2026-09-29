@@ -16,7 +16,7 @@ use ratatui::layout::{Position, Rect};
 use taskologic_core::barcode::{Expired, Feed, ScanAction, ScanDetector, ScanPayload};
 use taskologic_core::control::{self, Control, Value};
 
-use crate::control::{Armed, ControlState, Waiting, named_key_event, values_date, values_minutes, values_text};
+use crate::control::{Armed, ControlState, UNDO_DEPTH, UndoStep, Waiting, named_key_event, values_date, values_minutes, values_text};
 use taskologic_core::board::{Board, ColumnRole};
 use taskologic_core::ids::{BoardId, ColumnId, PrintJobId, TaskId, Uid};
 use taskologic_core::prefs::{CardFields, CustomColors, Darkness, ThemePreset};
@@ -559,6 +559,9 @@ pub struct App {
     pub mouse_pos: Option<(u16, u16)>,
     pub now_ms: u64,
     pending: HashMap<RequestId, Pending>,
+    /// Requests whose success is worth taking back: what undoes each, kept
+    /// until the daemon answers.
+    undoable: HashMap<RequestId, UndoStep>,
     next_id: RequestId,
     scan: ScanDetector,
 }
@@ -599,6 +602,7 @@ impl App {
             mouse_pos: None,
             now_ms: 0,
             pending: HashMap::new(),
+            undoable: HashMap::new(),
             next_id: 1,
             scan: ScanDetector::new(),
             control: ControlState::default(),
@@ -781,6 +785,54 @@ impl App {
         Cmd::Send(ClientMessage { id, request })
     }
 
+    /// Mark a request as taking back with `step`, once it succeeds.
+    fn undoable(&mut self, cmd: Cmd, step: UndoStep) -> Cmd {
+        if let Cmd::Send(ClientMessage { id, .. }) = &cmd {
+            self.undoable.insert(*id, step);
+        }
+        cmd
+    }
+
+    /// The change went through: keep how to reverse it.
+    fn remember_undo(&mut self, mut step: UndoStep, response: &Response) {
+        if let (UndoStep::Update { version, .. }, Response::Task { task }) = (&mut step, response) {
+            *version = task.version;
+        }
+        let stack = &mut self.control.undo;
+        stack.push(step);
+        if stack.len() > UNDO_DEPTH {
+            stack.remove(0);
+        }
+    }
+
+    /// A move by control code that `--1UNDO--` can put back.
+    fn send_move_undo(&mut self, task: &Task, to: ColumnId, position: Option<i64>) -> Cmd {
+        let cmd = self.send_move(task.id, to, position, false, None);
+        self.undoable(cmd, UndoStep::Move { task: task.id, column: task.column_id, position: task.position })
+    }
+
+    /// Take back the latest change a control code made.
+    fn control_undo(&mut self) -> Vec<Cmd> {
+        let Some(step) = self.control.undo.pop() else {
+            self.toast(Severity::Warning, "nothing to undo");
+            return vec![self.bell()];
+        };
+        self.toast(Severity::Info, "undone");
+        match step {
+            UndoStep::Move { task, column, position } => vec![self.send_move(task, column, Some(position), false, None)],
+            UndoStep::Update { task, draft, version } => {
+                vec![self.send(Request::UpdateTask { task_id: task, version, draft }, Pending::ControlOp)]
+            }
+            UndoStep::Restore { task } => vec![self.send(Request::RestoreTask { task_id: task }, Pending::Restore)],
+            UndoStep::Checklist { task, index, done } => {
+                vec![self.send(Request::SetChecklistItem { task_id: task, index, done }, Pending::ChecklistOp)]
+            }
+            UndoStep::Exclude { task, excluded } => {
+                vec![self.send(Request::SetExcludeFromStats { task_id: task, excluded }, Pending::ExcludeFromStats)]
+            }
+        }
+    }
+
     pub fn toast(&mut self, severity: Severity, text: impl Into<String>) {
         self.toast = Some(Toast {
             text: text.into(),
@@ -831,10 +883,14 @@ impl App {
             Msg::Server(msg) => match *msg {
                 ServerMessage::Ok { id, response } => {
                     let pending = self.pending.remove(&id);
+                    if let Some(step) = self.undoable.remove(&id) {
+                        self.remember_undo(step, &response);
+                    }
                     self.on_response(pending, response)
                 }
                 ServerMessage::Err { id, error } => {
                     let pending = self.pending.remove(&id);
+                    self.undoable.remove(&id);
                     self.on_error(pending, error)
                 }
                 ServerMessage::Event { event } => self.on_event(event),
@@ -1876,6 +1932,7 @@ impl App {
                 Vec::new()
             }
             Selected => self.control_selected(),
+            Undo => self.control_undo(),
             Show(Some(id)) => {
                 self.control.arm(Armed { command: Show(None), values: Vec::new(), sticky: false }, self.now_ms);
                 vec![self.send(Request::Resolve { short_id: id }, Pending::Resolve)]
@@ -2075,7 +2132,7 @@ impl App {
             MoveLeft | MoveRight => {
                 let to = if armed.command == MoveLeft { col_idx.checked_sub(1) } else { Some(col_idx + 1) };
                 match to.and_then(|i| board.columns.get(i)) {
-                    Some(c) => vec![self.send_move(task_id, c.id, None, false, None)],
+                    Some(c) => vec![self.send_move_undo(&task, c.id, None)],
                     None => refuse(self, "already in the outermost column"),
                 }
             }
@@ -2096,7 +2153,7 @@ impl App {
                     MoveBottom if idx + 1 < siblings.len() => Some(siblings[siblings.len() - 1].1 + 1),
                     _ => return refuse(self, "it is there already"),
                 };
-                vec![self.send_move(task_id, task.column_id, position, false, None)]
+                vec![self.send_move_undo(&task, task.column_id, position)]
             }
             MoveTo(None) => {
                 let roles = [
@@ -2122,16 +2179,20 @@ impl App {
                 Vec::new()
             }
             MoveTo(Some(col)) => match Self::column_for(&board, col) {
-                Some(c) => vec![self.send_move(task_id, c, None, false, None)],
+                Some(c) => vec![self.send_move_undo(&task, c, None)],
                 None => refuse(self, "this board has no such column"),
             },
-            Delete => vec![self.send(Request::DeleteTask { task_id }, Pending::DeleteTask)],
+            Delete => {
+                let cmd = self.send(Request::DeleteTask { task_id }, Pending::DeleteTask);
+                vec![self.undoable(cmd, UndoStep::Restore { task: task_id })]
+            }
             Print(slip) => vec![self.send(Request::PrintTask { task_id, slip: Some(slip) }, Pending::Print)],
             AssignMe | UnassignMe | ToggleAssign => {
                 let Some(me) = self.user.as_ref().map(|u| u.uid) else {
                     return Vec::new();
                 };
-                let mut draft = task.draft();
+                let old = task.draft();
+                let mut draft = old.clone();
                 let has = draft.assignees.contains(&me);
                 match armed.command {
                     AssignMe if !has => draft.assignees.push(me),
@@ -2140,10 +2201,13 @@ impl App {
                     ToggleAssign => draft.assignees.push(me),
                     _ => return refuse(self, "nothing to change"),
                 }
-                vec![self.send(
-                    Request::UpdateTask { task_id, version: task.version, draft },
-                    Pending::ControlOp,
-                )]
+                {
+                    let cmd = self.send(
+                        Request::UpdateTask { task_id, version: task.version, draft },
+                        Pending::ControlOp,
+                    );
+                    vec![self.undoable(cmd, UndoStep::Update { task: task_id, draft: old, version: 0 })]
+                }
             }
             Set(field) if armed.values.is_empty() => {
                 let cmds = self.open_task_form(
@@ -2175,7 +2239,7 @@ impl App {
             KeyCode::Char(c @ '1'..='9') => {
                 let i = usize::from(c as u8 - b'1');
                 if let Some((col, _)) = options.get(i) {
-                    return vec![self.send_move(task.id, *col, None, false, None)];
+                    return vec![self.send_move_undo(&task, *col, None)];
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -2184,7 +2248,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some((col, _)) = options.get(sel) {
-                    return vec![self.send_move(task.id, *col, None, false, None)];
+                    return vec![self.send_move_undo(&task, *col, None)];
                 }
             }
             _ => {}
@@ -2203,7 +2267,8 @@ impl App {
             .map(|u| (u.timezone, u.uid))
             .unwrap_or((chrono_tz::UTC, 0));
         let now = chrono::Utc::now();
-        let mut draft = task.draft();
+        let old = task.draft();
+        let mut draft = old.clone();
         let text = self.control_text(values);
         let fail = |app: &mut Self, why: String| {
             app.toast(Severity::Warning, why);
@@ -2284,22 +2349,26 @@ impl App {
                 let Some(item) = task.checklist.get(index) else {
                     return fail(self, format!("the task has no checklist item {n}"));
                 };
-                return vec![self.send(
-                    Request::SetChecklistItem { task_id, index, done: !item.done },
+                let was = item.done;
+                let cmd = self.send(
+                    Request::SetChecklistItem { task_id, index, done: !was },
                     Pending::ChecklistOp,
-                )];
+                );
+                return vec![self.undoable(cmd, UndoStep::Checklist { task: task_id, index, done: was })];
             }
             ExcludeFromStats => {
-                return vec![self.send(
+                let cmd = self.send(
                     Request::SetExcludeFromStats { task_id, excluded: !task.exclude_from_stats },
                     Pending::ExcludeFromStats,
-                )];
+                );
+                return vec![self.undoable(cmd, UndoStep::Exclude { task: task_id, excluded: task.exclude_from_stats })];
             }
         }
-        vec![self.send(
+        let cmd = self.send(
             Request::UpdateTask { task_id, version: task.version, draft },
             Pending::ControlOp,
-        )]
+        );
+        vec![self.undoable(cmd, UndoStep::Update { task: task_id, draft: old, version: 0 })]
     }
 
     /// What a run of values spells, in the user's zone.
@@ -5572,6 +5641,74 @@ mod tests {
             assert!((draft.due_at.unwrap() - want).num_minutes().abs() <= 1, "{code}");
             assert!(app.control.armed.is_none(), "{code}: one shot");
         }
+    }
+
+    #[test]
+    fn undo_takes_back_the_last_control_change_and_only_confirmed_ones() {
+        let mut app = ready_app(true);
+        open_board(&mut app);
+        let task_now = |app: &App| app.board.as_ref().unwrap().detail.tasks.iter().find(|t| t.id == TaskId(10)).cloned().unwrap();
+        let orig = task_now(&app);
+        let ok = |app: &mut App, id: RequestId, task: Task| {
+            app.update(server(ServerMessage::Ok { id, response: Response::Task { task } }));
+        };
+        let sent = |cmds: &[Cmd]| match cmds.first() {
+            Some(Cmd::Send(m)) => (m.id, m.request.clone()),
+            other => panic!("{other:?}"),
+        };
+        // Nothing yet.
+        let cmds = inject_all(&mut app, "--1UNDO--");
+        assert!(matches!(cmds.as_slice(), [Cmd::Bell]), "{cmds:?}");
+        // A move that fails is never remembered.
+        let cmds = inject_all(&mut app, "--1MR/SEL--");
+        let (id, _) = sent(&cmds);
+        app.update(server(ServerMessage::Err { id, error: ErrorBody::new(ErrorCode::Internal, "no") }));
+        assert!(app.control.undo.is_empty());
+        // A confirmed move is, and undo moves it back to where it was.
+        let cmds = inject_all(&mut app, "--1MR/SEL--");
+        let (id, req) = sent(&cmds);
+        let Request::MoveTask { to_column, .. } = req else { panic!() };
+        let mut moved = orig.clone();
+        moved.column_id = to_column;
+        ok(&mut app, id, moved);
+        let cmds = inject_all(&mut app, "--1UNDO--");
+        let (_, req) = sent(&cmds);
+        assert!(
+            matches!(req, Request::MoveTask { task_id, to_column, position, .. }
+                if task_id == orig.id && to_column == orig.column_id && position == Some(orig.position)),
+            "{req:?}"
+        );
+        assert!(app.control.undo.is_empty());
+        // An edit is undone with the old fields and the version it left behind.
+        let cmds = inject_all(&mut app, "--1SB/P30/SEL--");
+        let (id, _) = sent(&cmds);
+        let mut edited = task_now(&app);
+        edited.version += 1;
+        ok(&mut app, id, edited.clone());
+        let cmds = inject_all(&mut app, "--1UNDO--");
+        let (_, req) = sent(&cmds);
+        match req {
+            Request::UpdateTask { task_id, version, draft } => {
+                assert_eq!(task_id, orig.id);
+                assert_eq!(version, edited.version);
+                assert_eq!(draft.start_at, orig.start_at);
+                assert_eq!(draft.due_at, orig.due_at);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Only the last three are kept.
+        app.control.undo.clear();
+        for i in 0..5 {
+            app.remember_undo(UndoStep::Restore { task: TaskId(100 + i) }, &Response::Done);
+        }
+        assert_eq!(app.control.undo.len(), 3);
+        assert_eq!(app.control.undo[0], UndoStep::Restore { task: TaskId(102) });
+        // Delete is undone by restoring.
+        let cmds = inject_all(&mut app, "--1DEL/SEL--");
+        let (id, _) = sent(&cmds);
+        ok(&mut app, id, orig.clone());
+        let cmds = inject_all(&mut app, "--1UNDO--");
+        assert!(matches!(sent(&cmds).1, Request::RestoreTask { task_id } if task_id == orig.id));
     }
 
     #[test]

@@ -55,6 +55,7 @@ Control codes are the other kind, framed by `--` on both ends, and they can do .
     - Programs panel
   - The ids survive a server move, since export and import keep them ([transfer.md](transfer.md)).
 - **A check.** `--1PING--` toasts "scanner ok".
+- **Undo.** `--1UNDO--` takes back the last change a control code made to a task (a move, a set field, an assign, a checklist tick, an archive), and again for the one before, up to 3. Only confirmed changes count; see the cheatsheet for what it does not cover.
 
 **Long codes** may come on several barcodes: Enter between the pieces is ignored until the closing `--`. The status line says a long code is being read; Esc drops it. Settings has "control codes wait": how many seconds a code waits for its next piece, its value, a task scan for an armed command, or an answer on screen; 0 waits forever, and every scan resets it.
 
