@@ -41,13 +41,13 @@ The short version of [barcode-commands.md](barcode-commands.md). Print the codes
 | `X`                   | clear the field                                                                                                               |
 | `V.<text>`            | free text, last in the frame                                                                                                  |
 
-**Next scanned task.** These arm a command; the next task slip you scan (or `--1SEL--`, the task highlighted on screen) gets it instead of being started. One shot, unless printed sticky (`/STK`). End any of them with `/SEL` to act on the highlighted task in the same scan: `--1MR/SEL--`, `--1SB/P30/SEL--`.
+**Next scanned task.** These arm a command; the next task slip you scan (or `--1SEL--`, the task highlighted on screen) gets it instead of being started. One shot, unless printed sticky (`/STK`). A slip from another board than the open one opens that board first, then the command acts. End any of them with `/SEL` to act on the highlighted task in the same scan: `--1MR/SEL--`, `--1SB/P30/SEL--`.
 
 | Code                                        | Does                                               |
 |---------------------------------------------|----------------------------------------------------|
 | `--1ML--` `--1MR--`                         | move left / right one column                       |
-| `--1MU--` `--1MD--`                         | up / down one place (board must be open)           |
-| `--1MT--` `--1MB--`                         | to top / bottom of the column (board must be open) |
+| `--1MU--` `--1MD--`                         | up / down one place                                |
+| `--1MT--` `--1MB--`                         | to top / bottom of the column                      |
 | `--1MCT--` `--1MCP--` `--1MCD--` `--1MCF--` | to todo / paused / doing / done                    |
 | `--1MC1--`..`--1MC9--`, `--1MCL--`          | to column number / the last column                 |
 | `--1DEL--`                                  | archive, no confirmation                           |
@@ -135,7 +135,7 @@ Only changes the daemon confirmed count: a code that failed or was refused leave
 
 ## Sticky reordering
 
-Sticky keeps a command armed for every scan until Esc or the "control codes wait" timeout (20 seconds by default, and every scan resets it). Reordering needs the board open, because positions live in the board detail.
+Sticky keeps a command armed for every scan until Esc or the "control codes wait" timeout (20 seconds by default, and every scan resets it). Reordering needs the task's board open, because positions live in the board detail; scanning a slip from another board opens it for you.
 
 1. Open the board: `--1GB<id>--`, or `--1GD--` and pick it.
 2. Highlight the task with the arrow codes: `--1XD--` / `--1XU--` between tasks, `--1XR--` / `--1XL--` between columns.

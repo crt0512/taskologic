@@ -30,7 +30,7 @@ Control codes are the other kind, framed by `--` on both ends, and they can do .
   - `--1SEL--` applies the armed command to the task highlighted on screen instead of a scan. 
   - A code printed sticky (`/STK`) stays armed for every scan until Esc or the timeout.
   - A "move to" without a column (`--1MC--`) asks on screen, columns numbered; a digit or Enter picks.
-  - Moving up, down, to the top or bottom of a column needs that board open.
+  - A task from another board than the open one opens its board first (highlighting the task), then the command acts, so the change shows and moving up, down, to the top or bottom works. With no board open the command acts on the task without opening anything.
 - **Setting a field.**
   - `--1SU/N/P2H--` then a task code sets its due date to two hours from now
   - `--1ST--` alone opens the task form on the title

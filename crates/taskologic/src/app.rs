@@ -562,6 +562,9 @@ pub struct App {
     /// Requests whose success is worth taking back: what undoes each, kept
     /// until the daemon answers.
     undoable: HashMap<RequestId, UndoStep>,
+    /// A control command waiting for another board to open: it acts on this
+    /// task once the board is there.
+    after_open: Option<(Armed, TaskId)>,
     next_id: RequestId,
     scan: ScanDetector,
 }
@@ -603,6 +606,7 @@ impl App {
             now_ms: 0,
             pending: HashMap::new(),
             undoable: HashMap::new(),
+            after_open: None,
             next_id: 1,
             scan: ScanDetector::new(),
             control: ControlState::default(),
@@ -981,6 +985,19 @@ impl App {
                     && self.overlay.is_none()
                 {
                     self.ask_question(&task, QuestionThen::Answer);
+                }
+                // The command that brought us here acts now.
+                if let Some((armed, id)) = self.after_open.take_if(|(_, id)| Some(*id) == focus_task) {
+                    let found = self.board.as_ref().and_then(|b| {
+                        b.detail.tasks.iter().find(|t| t.id == id).cloned().map(|t| (t, b.detail.board.clone()))
+                    });
+                    return match found {
+                        Some((task, board)) => self.apply_armed(armed, task, board),
+                        None => {
+                            self.toast(Severity::Warning, "that task is not on the board any more");
+                            Vec::new()
+                        }
+                    };
                 }
                 Vec::new()
             }
@@ -1491,6 +1508,9 @@ impl App {
     }
 
     fn on_error(&mut self, pending: Option<Pending>, error: ErrorBody) -> Vec<Cmd> {
+        if matches!(pending, Some(Pending::OpenBoard { .. })) {
+            self.after_open = None;
+        }
         match (pending, error.code) {
             (Some(Pending::Welcome), _) => {
                 self.conn = Conn::Lost;
@@ -2094,6 +2114,16 @@ impl App {
             // Cancelled while the answer was on its way.
             return Vec::new();
         };
+        // A task from another board than the open one: go there first, so
+        // the change shows and the moves within a column have their board.
+        let open = self.board.as_ref().map(|b| b.detail.board.id);
+        if open.is_some_and(|id| id != board.id) {
+            self.after_open = Some((armed, task.id));
+            return vec![self.send(
+                Request::GetBoard { board_id: board.id },
+                Pending::OpenBoard { focus_task: Some(task.id) },
+            )];
+        }
         self.apply_armed(armed, task, board)
     }
 
@@ -5731,6 +5761,41 @@ mod tests {
             panic!("{cmds:?}");
         };
         assert_eq!((*task_id, draft.title.as_str()), (TaskId(10), "Water the ferns"));
+    }
+
+    #[test]
+    fn a_task_from_another_board_opens_that_board_before_the_command_acts() {
+        let mut app = ready_app(true);
+        open_board(&mut app);
+        assert_eq!(app.board.as_ref().unwrap().detail.board.id, BoardId(1));
+        let mut other = board_with_members(1, &[1]);
+        other.id = BoardId(2);
+        let mut a = task_on(&other, 1);
+        a.id = TaskId(50);
+        let mut b = task_on(&other, 1);
+        b.id = TaskId(51);
+        (a.position, b.position) = (0, 10);
+        let col = other.columns[0].id;
+        (a.column_id, b.column_id) = (col, col);
+        // Move up needs its own board's positions: b, second in the column.
+        inject_all(&mut app, "--1MU--");
+        let cmds = inject_all(&mut app, &payload());
+        let cmds = answer_resolve(&mut app, &cmds, &b, &other);
+        let Some(Cmd::Send(ClientMessage { id, request: Request::GetBoard { board_id } })) = cmds.first() else {
+            panic!("expected the board to open first: {cmds:?}");
+        };
+        assert_eq!(*board_id, BoardId(2));
+        let cmds = app.update(server(ServerMessage::Ok {
+            id: *id,
+            response: Response::Board(BoardDetail { board: other.clone(), tasks: vec![a, b.clone()], estimates: Vec::new() }),
+        }));
+        assert_eq!(app.board.as_ref().unwrap().detail.board.id, BoardId(2), "now on that board");
+        assert_eq!(app.board.as_ref().unwrap().selected_task().map(|t| t.id), Some(TaskId(51)), "and on the task");
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::Send(ClientMessage { request: Request::MoveTask { task_id, .. }, .. })] if *task_id == TaskId(51)),
+            "then the move runs: {cmds:?}"
+        );
+        assert!(app.after_open.is_none());
     }
 
     #[test]
