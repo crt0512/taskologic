@@ -63,6 +63,8 @@ struct Ask {
     sticky_ok: bool,
     /// Plus or minus, for an offset.
     minus: bool,
+    /// Set on the first of two offsets: the sign the second one takes.
+    then_minus: Option<bool>,
     text: TextInputState,
     unit: ChoiceState<Unit>,
     /// The highlighted column option.
@@ -95,6 +97,9 @@ pub struct CodesPanel {
     clicks: RowClicks,
     /// Print overrides so they stay armed until Esc.
     sticky: CheckboxState,
+    /// Print armed commands with `/SEL` on the end: one scan does it to the
+    /// highlighted task.
+    on_selected: CheckboxState,
     print_btn: ButtonState,
     all_btn: ButtonState,
     combine_btn: ButtonState,
@@ -123,6 +128,7 @@ impl CodesPanel {
             arrows: ListArrows::default(),
             clicks: RowClicks::default(),
             sticky: CheckboxState::named("sticky"),
+            on_selected: CheckboxState::named("on_selected"),
             print_btn: ButtonState::new(),
             all_btn: ButtonState::new(),
             combine_btn: ButtonState::new(),
@@ -174,6 +180,7 @@ impl CodesPanel {
                     .widget(&self.all_btn)
                     .widget(&self.combine_btn)
                     .widget(&self.sticky)
+                    .widget(&self.on_selected)
                     .widget(&self.back_btn)
                     .widget(&self.close_btn);
             }
@@ -189,6 +196,9 @@ impl CodesPanel {
         if sticky_ok && self.sticky.checked() {
             commands.push(Control::Sticky);
         }
+        if sticky_ok && self.on_selected.checked() {
+            commands.push(Control::Selected);
+        }
         CodesOutcome::Print {
             heading: label.clone(),
             codes: vec![(label, commands)],
@@ -201,6 +211,8 @@ impl CodesPanel {
         unit.set_value(Unit::Hours);
         if kind == Asks::Offset {
             text.set_text("1");
+        } else if kind == Asks::Count {
+            text.set_text("2");
         }
         text.focus().set(true);
         self.view = View::Ask {
@@ -211,6 +223,7 @@ impl CodesPanel {
                 base,
                 sticky_ok,
                 minus,
+                then_minus: None,
                 text,
                 unit,
                 sel: 0,
@@ -223,8 +236,17 @@ impl CodesPanel {
     fn choose_entry(&mut self, from: Category, e: &Entry) -> CodesOutcome {
         match e.asks {
             Asks::Nothing => self.print_one(e.label.to_string(), e.commands.clone(), e.sticky),
+            Asks::OffsetPair => {
+                // "start minus, due plus": the first sign now, the second after.
+                let (start, due) = e.label.split_once(", start ").map_or(("", ""), |(_, r)| r.split_once(", due ").unwrap_or(("", "")));
+                self.open_ask(from, Asks::Offset, e.label.to_string(), e.commands.clone(), e.sticky, start == "minus");
+                if let View::Ask { ask, .. } = &mut self.view {
+                    ask.then_minus = Some(due == "minus");
+                }
+                CodesOutcome::Changed
+            }
             kind => {
-                let minus = e.label.starts_with("Minus");
+                let minus = e.label.contains("inus");
                 self.open_ask(from, kind, e.label.to_string(), e.commands.clone(), e.sticky, minus);
                 CodesOutcome::Changed
             }
@@ -277,10 +299,43 @@ impl CodesPanel {
                 }
                 Control::MoveTo(Some(col))
             }
-            Asks::Nothing => unreachable!("nothing to ask"),
+            Asks::Count => {
+                let n: u8 = match text.parse() {
+                    Ok(n) if (1..=99).contains(&n) => n,
+                    _ => {
+                        self.error = Some("a whole number, 1 to 99".into());
+                        return CodesOutcome::Changed;
+                    }
+                };
+                // "Tab several times" becomes the code with its count.
+                match commands.pop() {
+                    Some(Control::Named(k)) => Control::NamedTimes(k, n),
+                    other => {
+                        commands.extend(other);
+                        return CodesOutcome::Changed;
+                    }
+                }
+            }
+            // A pair is asked one offset at a time, as plain offsets.
+            Asks::Nothing | Asks::OffsetPair => unreachable!("nothing to ask"),
         };
-        let label = if commands.is_empty() || matches!(added, Control::MoveTo(_)) {
+        if let Some(then_minus) = ask.then_minus {
+            // The first of two offsets: ask for the due date's next.
+            commands.push(added);
+            commands.push(Control::Value(Value::Split));
+            self.open_ask(from, Asks::Offset, label, commands, sticky_ok, then_minus);
+            return CodesOutcome::Changed;
+        }
+        let pair = commands.contains(&Control::Value(Value::Split));
+        let label = if pair {
+            let mut all = commands.clone();
+            all.push(added.clone());
+            all.iter().map(Control::label).collect::<Vec<_>>().join(", ")
+        } else if commands.is_empty() || matches!(added, Control::MoveTo(_) | Control::NamedTimes(..)) {
             added.label()
+        } else if ask.kind == Asks::Offset {
+            // "Set the due date, plus so much" reads "Set the due date, plus 30 minutes".
+            format!("{}, {}", label.split(", ").next().unwrap_or(&label), added.label())
         } else {
             format!("{label}, {}", added.label())
         };
@@ -355,8 +410,13 @@ impl CodesPanel {
             return self.back();
         }
         self.sticky.handle(ev, Regular);
+        self.on_selected.handle(ev, Regular);
         if key == Some(KeyCode::Char('s')) && matches!(self.view, View::Entries(_)) {
             self.sticky.flip_checked();
+            return CodesOutcome::Changed;
+        }
+        if key == Some(KeyCode::Char('t')) && matches!(self.view, View::Entries(_)) {
+            self.on_selected.flip_checked();
             return CodesOutcome::Changed;
         }
         let enter = self.print_btn.handle(ev, Regular) == ButtonOutcome::Pressed
@@ -389,7 +449,7 @@ impl CodesPanel {
         let all = self.all_btn.handle(ev, Regular) == ButtonOutcome::Pressed
             || key == Some(KeyCode::Char('a'));
         if all && let View::Entries(cat) = self.view {
-            let sticky = self.sticky.checked();
+            let (sticky, on_selected) = (self.sticky.checked(), self.on_selected.checked());
             let codes: Vec<(String, Vec<Control>)> = control::entries(cat)
                 .iter()
                 .filter(|e| e.asks == Asks::Nothing)
@@ -397,6 +457,9 @@ impl CodesPanel {
                     let mut c = e.commands.clone();
                     if sticky && e.sticky {
                         c.push(Control::Sticky);
+                    }
+                    if on_selected && e.sticky {
+                        c.push(Control::Selected);
                     }
                     (e.label.to_string(), c)
                 })
@@ -512,7 +575,10 @@ impl CodesPanel {
             View::Ask { ask, .. } => match ask.kind {
                 Asks::Key => "which key? one character, case as pressed".to_string(),
                 Asks::Text => "the text the code will type or search for".to_string(),
-                Asks::Offset => "how much, and in what".to_string(),
+                Asks::Offset | Asks::OffsetPair if ask.then_minus.is_some() => "the start date: how much, and in what; the due date is next".to_string(),
+                Asks::Offset | Asks::OffsetPair if ask.base.contains(&Control::Value(Value::Split)) => "the due date: how much, and in what".to_string(),
+                Asks::Offset | Asks::OffsetPair => "how much, and in what".to_string(),
+                Asks::Count => "how many times, 1 to 99".to_string(),
                 Asks::Column => "which column, by role or counted from the left".to_string(),
                 Asks::Nothing => String::new(),
             },
@@ -553,8 +619,13 @@ impl CodesPanel {
                     }
                     _ => {
                         let (lab, w) = split_label(rows[0], lw);
-                        label(f, lab, if ask.kind == Asks::Key { "Key" } else { "Text" }, t);
-                        let width = if ask.kind == Asks::Key { 4 } else { w.width.saturating_sub(1) };
+                        let name = match ask.kind {
+                            Asks::Key => "Key",
+                            Asks::Count => "Times",
+                            _ => "Text",
+                        };
+                        label(f, lab, name, t);
+                        let width = if matches!(ask.kind, Asks::Key | Asks::Count) { 4 } else { w.width.saturating_sub(1) };
                         let mut r = Row::new(w);
                         f.render_stateful_widget(field(t), r.take(width), &mut ask.text);
                     }
@@ -619,6 +690,16 @@ impl CodesPanel {
                     1,
                 );
                 f.render_stateful_widget(checkbox_at("sticky".into(), cb, t), cb, &mut self.sticky);
+                let used2 = used + check_w("sticky") + 1;
+                let cb2 = Rect::new(
+                    buttons.x + used2,
+                    buttons.y + buttons.height / 2,
+                    check_w("on selected").min(buttons.width.saturating_sub(used2)),
+                    1,
+                );
+                if cb2.width > 0 {
+                    f.render_stateful_widget(checkbox_at("on selected".into(), cb2, t), cb2, &mut self.on_selected);
+                }
             }
             View::Combine { .. } => {
                 let labels = [" Pick ", " Back "];
@@ -734,6 +815,114 @@ mod tests {
             p.handle(&key(KeyCode::Down));
         }
         assert_eq!(payload(p.handle(&key(KeyCode::Enter))), "--1MC3--", "todo, paused, doing, done, 1, 2, 3");
+    }
+
+    #[test]
+    fn the_dates_category_prints_start_and_due_codes() {
+        let mut p = CodesPanel::new();
+        let at = Category::ALL.iter().position(|c| *c == Category::Dates).unwrap();
+        p.list.select(Some(at));
+        p.handle(&key(KeyCode::Enter));
+        let entries = control::entries(Category::Dates);
+        let pick = |p: &mut CodesPanel, label: &str| {
+            p.list.select(Some(entries.iter().position(|e| e.label == label).unwrap()));
+            p.handle(&key(KeyCode::Enter))
+        };
+        assert_eq!(payload(pick(&mut p, "Set the start date to now")), "--1SS/N--");
+        assert_eq!(payload(pick(&mut p, "Clear the due date")), "--1SU/X--");
+        pick(&mut p, "Set the due date, plus so much");
+        if let View::Ask { ask, .. } = &mut p.view {
+            ask.text.set_text("30".to_string());
+            ask.unit.set_value(Unit::Minutes);
+        }
+        assert_eq!(payload(p.handle(&key(KeyCode::Enter))), "--1SU/P30--");
+        pick(&mut p, "Set the start date, minus so much");
+        if let View::Ask { ask, .. } = &mut p.view {
+            ask.text.set_text("2".to_string());
+        }
+        assert_eq!(payload(p.handle(&key(KeyCode::Enter))), "--1SS/M2H--");
+    }
+
+    #[test]
+    fn on_selected_prints_the_code_with_sel_on_the_end() {
+        let mut p = CodesPanel::new();
+        let at = Category::ALL.iter().position(|c| *c == Category::Dates).unwrap();
+        p.list.select(Some(at));
+        p.handle(&key(KeyCode::Enter));
+        p.handle(&key(KeyCode::Char('t')));
+        assert!(p.on_selected.checked());
+        let entries = control::entries(Category::Dates);
+        p.list.select(Some(entries.iter().position(|e| e.label == "Set start and due to now").unwrap()));
+        assert_eq!(payload(p.handle(&key(KeyCode::Enter))), "--1SB/N/SEL--");
+        // An offset asked for, then SEL; with sticky too it reads /STK/SEL.
+        p.list.select(Some(entries.iter().position(|e| e.label == "Set start and due, minus so much").unwrap()));
+        p.handle(&key(KeyCode::Enter));
+        if let View::Ask { ask, .. } = &mut p.view {
+            ask.text.set_text("30".to_string());
+            ask.unit.set_value(Unit::Minutes);
+        }
+        assert_eq!(payload(p.handle(&key(KeyCode::Enter))), "--1SB/M30/SEL--");
+        p.handle(&key(KeyCode::Char('s')));
+        p.list.select(Some(entries.iter().position(|e| e.label == "Set start and due to now").unwrap()));
+        assert_eq!(payload(p.handle(&key(KeyCode::Enter))), "--1SB/N/STK/SEL--");
+    }
+
+    #[test]
+    fn start_and_due_take_two_offsets_in_one_code() {
+        use control::Value;
+        assert_eq!(
+            control::parse("SB/P30/U/P2D").unwrap().len(),
+            4,
+            "set, offset, split, offset"
+        );
+        assert!(control::parse("SB/P30/U/P2D").unwrap().contains(&Control::Value(Value::Split)));
+        let mut p = CodesPanel::new();
+        let at = Category::ALL.iter().position(|c| *c == Category::Dates).unwrap();
+        p.list.select(Some(at));
+        p.handle(&key(KeyCode::Enter));
+        let entries = control::entries(Category::Dates);
+        p.list.select(Some(entries.iter().position(|e| e.label == "Set start and due, start plus, due minus").unwrap()));
+        assert_eq!(p.handle(&key(KeyCode::Enter)), CodesOutcome::Changed, "asks for the start");
+        if let View::Ask { ask, .. } = &mut p.view {
+            ask.text.set_text("30".to_string());
+            ask.unit.set_value(Unit::Minutes);
+        }
+        assert_eq!(p.handle(&key(KeyCode::Enter)), CodesOutcome::Changed, "then for the due date");
+        if let View::Ask { ask, .. } = &mut p.view {
+            ask.text.set_text("2".to_string());
+            ask.unit.set_value(Unit::Days);
+        }
+        assert_eq!(payload(p.handle(&key(KeyCode::Enter))), "--1SB/P30/U/M2D--");
+    }
+
+    #[test]
+    fn function_keys_print_and_parse() {
+        let code = control::encode(&[Control::Named(control::NamedKey::F(2))]);
+        assert_eq!(code, "--1XF2--");
+        assert_eq!(control::parse("XF12").unwrap(), vec![Control::Named(control::NamedKey::F(12))]);
+        assert!(control::parse("XF13").is_err());
+        assert!(control::parse("XF0").is_err());
+    }
+
+    #[test]
+    fn a_key_can_repeat_and_the_menu_asks_how_often() {
+        use control::NamedKey::{BackTab, Tab};
+        assert_eq!(control::parse("XT3").unwrap(), vec![Control::NamedTimes(Tab, 3)]);
+        assert_eq!(control::parse("xb12").unwrap(), vec![Control::NamedTimes(BackTab, 12)]);
+        assert_eq!(control::encode(&[Control::NamedTimes(Tab, 3)]), "--1XT3--");
+        for bad in ["XT0", "XT100", "XF12X", "XF3X2", "X3"] {
+            assert!(control::parse(bad).is_err(), "{bad}");
+        }
+        let mut p = CodesPanel::new();
+        p.list.select(Some(1));
+        p.handle(&key(KeyCode::Enter));
+        let entries = control::entries(Category::Navigation);
+        p.list.select(Some(entries.iter().position(|e| e.label == "Shift+Tab several times").unwrap()));
+        assert_eq!(p.handle(&key(KeyCode::Enter)), CodesOutcome::Changed, "asks");
+        if let View::Ask { ask, .. } = &mut p.view {
+            ask.text.set_text("4".to_string());
+        }
+        assert_eq!(payload(p.handle(&key(KeyCode::Enter))), "--1XB4--");
     }
 
     #[test]

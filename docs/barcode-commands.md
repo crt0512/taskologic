@@ -40,6 +40,7 @@ Control codes are the other kind, framed by `--` on both ends, and they can do .
   - `--1SC2--` ticks the second
   - `--1SX--` toggles exclude from stats.
   - Offsets count from what the field holds, or from now when it holds nothing.
+  - With a task form open, a set code fills that field of the form at once instead of waiting for a scan: `--1ST/V.Buy soap--`, `--1SC/V.Check--`, `--1SS/P30--`, then `--1XF2--` to save. Without a value it simply moves the cursor there.
 - **Boards, templates and programs.**
   - Each has a six character short id like tasks.
   - `--1GB<id>--` opens the board
@@ -59,7 +60,7 @@ Control codes are the other kind, framed by `--` on both ends, and they can do .
 
 ## Printing them
 
-Settings -> Print codes. Pick a category, Enter prints the highlighted code on a card, `a` prints the whole category as one strip. An entry that needs something first asks in a popup: which key, what text, which column, plus or minus how much in what. `c` combines the highlighted command with a value into one code ("insert now, plus 2 hours" prints as `--1I/N/P2H--`), and the sticky box prints a next scan code as the variant that stays armed until Esc or the timeout.
+Settings -> Print codes. Pick a category, Enter prints the highlighted code on a card, `a` prints the whole category as one strip. An entry that needs something first asks in a popup: which key, what text, which column, plus or minus how much in what. `c` combines the highlighted command with a value into one code ("insert now, plus 2 hours" prints as `--1I/N/P2H--`), and the sticky box prints a next scan code as the variant that stays armed until Esc or the timeout. The "on selected" box (`t`) adds `/SEL`, so the code acts on the highlighted task at once instead of waiting for a scan: `--1SB/P30/SEL--`.
 
 A code prints in CODE39 when it fits the configured paper at the usual bar width and in CODE128 when it does not, keys and free text are always CODE128, so a scanner has to read CODE128 for those. On 58 mm paper about twelve characters of CODE39 fit at normal bar width, fifteen of CODE128, on 80 mm about twenty and twenty-four.
 
@@ -90,6 +91,7 @@ Anything that waits for a value takes one of these, alone or combined:
 | `TM`                 | the current time, time only; a date already in the field is kept                                                                                                                                |
 | `P<n><u>`, `M<n><u>` | plus or minus n units, applied to the field's current value, or to now when it has none; units `H` hours, `D` days, `W` weeks, `MO` months, `Y` years, none means minutes: `P30`, `M2H`, `P1MO` |
 | `ME`                 | my username                                                                                                                                                                                     |
+| `U`                  | then the due date: ends the start date's values in `SB`; a side left empty is left alone |
 | `X`                  | clear the field                                                                                                                                                                                 |
 | `V.<text>`           | free text, last in the frame                                                                                                                                                                    |
 
@@ -113,7 +115,7 @@ Labels are what the slip says above the code. Payloads are shown without the fra
 | Show task                               | `SH` (7)                   | opens the next scanned task's view                                                                     |
 | Selected element                        | `SEL` (8)                  | completes the armed override on the highlighted task                                                   |
 
-Fields: `T` title, `D` description, `S` start, `U` due, `RS` reminder before start, `RU` reminder before due (minutes), `A` assign (a username as the value, `SA/V.alice`; `SA/X` unassigns), `C` checklist (`SC/V.text` adds an item, `SC3` ticks item 3), `X` exclude from stats (toggle). Clearing is the value `X`: `SU/X` clears the due date.
+Fields: `T` title, `D` description, `S` start, `U` due, `B` start and due together (one value applies to each on its own; `SB/P30/U/P2D` gives them different ones, `U` being "then the due date"), `RS` reminder before start, `RU` reminder before due (minutes), `A` assign (a username as the value, `SA/V.alice`; `SA/X` unassigns), `C` checklist (`SC/V.text` adds an item, `SC3` ticks item 3), `X` exclude from stats (toggle). Clearing is the value `X`: `SU/X` clears the due date.
 
 ### Navigation and keys (always CODE128)
 | Label                         | Payload                     | Notes                                                               |
@@ -121,12 +123,17 @@ Fields: `T` title, `D` description, `S` start, `U` due, `RS` reminder before sta
 | Press a key                   | `K<c>` (7)                  | one character, case as printed: `KT` is Templates, `Kn` is new task |
 | Up / Down / Left / Right      | `XU`, `XD`, `XL`, `XR` (7)  |                                                                     |
 | Esc / Enter / Tab / Shift+Tab | `XE`, `XN`, `XT`, `XB` (7)  | `XE` also cancels whatever is armed or waiting                      |
+| F1 to F12                     | `XF1`..`XF12` (8 or 9)      | `XF2` saves the task form                                           |
+| A key several times           | `XT3`, `XB2`, `XD5` (8)     | key letter plus a count, 1 to 99; not for F keys; the print menu asks how many for Tab and Shift+Tab |
 | Dashboard (all boards)        | `GD` (7)                    |                                                                     |
 | Next / previous board         | `GN`, `GP` (7)              | in dashboard order; no key does this today                          |
 | Search                        | `Q/V.<text>`, `QA/V.<text>` | the second includes the archive                                     |
 | Scanner check                 | `PING` (9)                  | toasts "scanner ok", printed on the test strip at two widths        |
 
 Keys are injected into the same path an unmatched key takes today, so whatever the screen would do with the key, it does.
+
+### Start and due dates (Print codes -> Start and due dates)
+Ready made `S` codes for the two date fields, each armed for the next scanned task: `SS/N`, `SU/N` and `SB/N` (both) set to now, `SS/TD`, `SU/TD` and `SB/TD` to today, `SS/X`, `SU/X` and `SB/X` clear, and "plus so much" / "minus so much" ask for a number and a unit (`SU/P30`, `SS/M2H`). Offsets count from what the field holds.
 
 ### Data entry (the focused field)
 | Label   | Payload     | Notes                                                              |

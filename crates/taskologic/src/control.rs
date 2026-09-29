@@ -144,6 +144,7 @@ pub fn values_date(
             }
             Value::Clear => None,
             Value::Me | Value::Text(_) => return Err("that is text, not a date".into()),
+            Value::Split => return Err("only start and due together take a second value".into()),
         };
     }
     Ok(cur)
@@ -180,6 +181,19 @@ pub fn values_minutes(values: &[Value]) -> Result<Option<u32>, String> {
     Ok(out)
 }
 
+/// The values for start and for due when both are set in one code: what
+/// comes before `Split` is the start's, what follows is the due's. With no
+/// split the same values go to both, and a side left empty is left alone.
+pub fn split_values(values: &[Value]) -> (Option<&[Value]>, Option<&[Value]>) {
+    match values.iter().position(|v| *v == Value::Split) {
+        None => (Some(values), Some(values)),
+        Some(i) => {
+            let (a, b) = (&values[..i], &values[i + 1..]);
+            ((!a.is_empty()).then_some(a), (!b.is_empty()).then_some(b))
+        }
+    }
+}
+
 /// The key event a named key stands for.
 pub fn named_key_event(k: NamedKey) -> KeyEvent {
     let (code, m) = match k {
@@ -191,6 +205,7 @@ pub fn named_key_event(k: NamedKey) -> KeyEvent {
         NamedKey::Enter => (KeyCode::Enter, KeyModifiers::NONE),
         NamedKey::Tab => (KeyCode::Tab, KeyModifiers::NONE),
         NamedKey::BackTab => (KeyCode::BackTab, KeyModifiers::SHIFT),
+        NamedKey::F(n) => (KeyCode::F(n), KeyModifiers::NONE),
     };
     KeyEvent::new(code, m)
 }
@@ -220,6 +235,7 @@ pub fn values_text(values: &[Value], now: DateTime<Utc>, tz: Tz, username: &str)
             }
             Value::Me => text.push_str(username),
             Value::Clear => text.clear(),
+            Value::Split => {}
             Value::Text(s) => text.push_str(s),
         }
     }

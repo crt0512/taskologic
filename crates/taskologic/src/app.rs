@@ -950,10 +950,11 @@ impl App {
                 if let Some(b) = &mut self.board
                     && b.detail.board.id == task.board_id
                 {
+                    let was_selected = b.selected_task().is_some_and(|t| t.id == moved);
                     b.upsert(task);
-                    // Keep the cursor on the picked up card, or moving it
-                    // twice in a row works on the wrong task.
-                    if b.picked == Some(moved) {
+                    // Keep the cursor on the picked up or highlighted card,
+                    // or moving it twice in a row works on the wrong task.
+                    if b.picked == Some(moved) || was_selected {
                         b.select_task(moved);
                     }
                 }
@@ -1818,6 +1819,13 @@ impl App {
                 }
                 self.route_key(named_key_event(k))
             }
+            NamedTimes(k, n) => {
+                let mut out = Vec::new();
+                for _ in 0..n {
+                    out.extend(self.route_key(named_key_event(k)));
+                }
+                out
+            }
             Dashboard => {
                 if self.overlay.is_some() {
                     return busy(self);
@@ -1871,6 +1879,21 @@ impl App {
             Show(Some(id)) => {
                 self.control.arm(Armed { command: Show(None), values: Vec::new(), sticky: false }, self.now_ms);
                 vec![self.send(Request::Resolve { short_id: id }, Pending::Resolve)]
+            }
+            // With a task form open the field is the form's: no scan needed,
+            // and no tabbing to it.
+            Set(field) if matches!(self.overlay, Some(Overlay::TaskForm(_))) => {
+                let name = self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+                let Some(Overlay::TaskForm(form)) = &mut self.overlay else { return Vec::new() };
+                if values.is_empty() {
+                    form.focus_field(field);
+                    return Vec::new();
+                }
+                if let Err(why) = form.set_field(field, &values, &name) {
+                    self.toast(Severity::Warning, why);
+                    return vec![self.bell()];
+                }
+                Vec::new()
             }
             MoveLeft | MoveRight | MoveUp | MoveDown | MoveTop | MoveBottom | MoveTo(_) | Delete
             | Print(_) | AssignMe | UnassignMe | ToggleAssign | Set(_) | Show(None) => {
@@ -2202,6 +2225,18 @@ impl App {
                 Ok(d) => draft.due_at = d,
                 Err(e) => return fail(self, e),
             },
+            StartAndDue => {
+                let (sv, dv) = crate::control::split_values(values);
+                let start = sv.map_or(Ok(task.start_at), |v| values_date(v, task.start_at, now, tz));
+                let due = dv.map_or(Ok(task.due_at), |v| values_date(v, task.due_at, now, tz));
+                match (start, due) {
+                    (Ok(s), Ok(d)) => {
+                        draft.start_at = s;
+                        draft.due_at = d;
+                    }
+                    (Err(e), _) | (_, Err(e)) => return fail(self, e),
+                }
+            }
             RemindStart => match values_minutes(values) {
                 Ok(m) => draft.reminder_start_minutes = m,
                 Err(e) => return fail(self, e),
@@ -5123,6 +5158,28 @@ mod tests {
     }
 
     #[test]
+    fn the_highlight_follows_a_task_moved_by_a_sticky_select() {
+        let mut app = ready_app(true);
+        open_board(&mut app);
+        let selected = |app: &App| app.board.as_ref().unwrap().selected_task().map(|t| t.id);
+        assert_eq!(selected(&app), Some(TaskId(10)));
+        inject_all(&mut app, "--1MD/STK--");
+        {
+            let step = 0;
+            let cmds = inject_all(&mut app, "--1SEL--");
+            let Some(Cmd::Send(ClientMessage { id, request: Request::MoveTask { task_id, position, .. } })) = cmds.first() else {
+                panic!("step {step}: {cmds:?}");
+            };
+            assert_eq!(*task_id, TaskId(10));
+            let mut moved = app.board.as_ref().unwrap().detail.tasks.iter().find(|t| t.id == TaskId(10)).cloned().unwrap();
+            moved.position = position.expect("a position");
+            app.update(server(ServerMessage::Ok { id: *id, response: Response::Task { task: moved } }));
+            assert_eq!(selected(&app), Some(TaskId(10)), "step {step}: the highlight stays on the moved task");
+        }
+        assert!(app.control.armed.is_some(), "sticky stays armed");
+    }
+
+    #[test]
     fn delete_print_set_and_assign_by_scan_send_the_ordinary_requests() {
         use taskologic_core::control::SlipChoice;
         let mut app = ready_app(true);
@@ -5424,6 +5481,97 @@ mod tests {
                 .as_ref()
                 .is_some_and(|t| t.text.contains("not a member"))
         );
+    }
+
+    #[test]
+    fn set_codes_fill_the_open_task_form_directly_and_f2_saves_it() {
+        let mut app = ready_app(true);
+        open_board(&mut app);
+        inject_all(&mut app, "--1Kn--");
+        assert!(matches!(app.overlay, Some(Overlay::TaskForm(_))));
+        inject_all(&mut app, "--1ST/V.Buy soap--");
+        inject_all(&mut app, "--1SC/V.Check the price--");
+        inject_all(&mut app, "--1SS/P30--");
+        assert!(app.control.armed.is_none(), "nothing waits for a scan");
+        let cmds = inject_all(&mut app, "--1XF2--");
+        let Some(Cmd::Send(ClientMessage { request: Request::CreateTask { draft, .. }, .. })) = cmds.first() else {
+            panic!("{cmds:?}");
+        };
+        assert_eq!(draft.title, "Buy soap");
+        assert_eq!(draft.checklist.len(), 1);
+        assert_eq!(draft.checklist[0].text, "Check the price");
+        let start = draft.start_at.expect("a start date");
+        assert!((start - chrono::Utc::now() - chrono::TimeDelta::minutes(30)).num_minutes().abs() <= 1);
+    }
+
+    #[test]
+    fn one_code_sets_start_and_due_together() {
+        let near = |d: Option<chrono::DateTime<chrono::Utc>>, mins: i64| {
+            (d.expect("a date") - chrono::Utc::now() - chrono::TimeDelta::minutes(mins)).num_minutes().abs() <= 1
+        };
+        // On an existing task: each date counts from its own value, or now.
+        let mut app = ready_app(true);
+        let (mut task, board) = task_and_board();
+        task.start_at = None;
+        task.due_at = Some(chrono::Utc::now() + chrono::TimeDelta::hours(2));
+        inject_all(&mut app, "--1SB/P30--");
+        let cmds = inject_all(&mut app, &payload());
+        let cmds = answer_resolve(&mut app, &cmds, &task, &board);
+        let [Cmd::Send(ClientMessage { request: Request::UpdateTask { draft, .. }, .. })] = cmds.as_slice() else {
+            panic!("{cmds:?}");
+        };
+        assert!(near(draft.start_at, 30), "from now");
+        assert!(near(draft.due_at, 150), "from its own value");
+        // In an open form.
+        let mut app = ready_app(true);
+        open_board(&mut app);
+        inject_all(&mut app, "--1Kn--");
+        inject_all(&mut app, "--1ST/V.Buy soap--");
+        inject_all(&mut app, "--1SB/P1H--");
+        let cmds = inject_all(&mut app, "--1XF2--");
+        let Some(Cmd::Send(ClientMessage { request: Request::CreateTask { draft, .. }, .. })) = cmds.first() else {
+            panic!("{cmds:?}");
+        };
+        assert!(near(draft.start_at, 60) && near(draft.due_at, 60));
+        // Different values: start plus 30 minutes, due plus 2 days; a side
+        // left empty stays as it is.
+        let mut app = ready_app(true);
+        let (mut task, board) = task_and_board();
+        task.start_at = None;
+        task.due_at = Some(chrono::Utc::now() + chrono::TimeDelta::hours(2));
+        inject_all(&mut app, "--1SB/P30/U/P2D--");
+        let cmds = inject_all(&mut app, &payload());
+        let cmds = answer_resolve(&mut app, &cmds, &task, &board);
+        let [Cmd::Send(ClientMessage { request: Request::UpdateTask { draft, .. }, .. })] = cmds.as_slice() else {
+            panic!("{cmds:?}");
+        };
+        assert!(near(draft.start_at, 30));
+        assert!(near(draft.due_at, 120 + 2 * 24 * 60));
+        inject_all(&mut app, "--1SB/U/M1H--");
+        let cmds = inject_all(&mut app, &payload());
+        let cmds = answer_resolve(&mut app, &cmds, &task, &board);
+        let [Cmd::Send(ClientMessage { request: Request::UpdateTask { draft, .. }, .. })] = cmds.as_slice() else {
+            panic!("{cmds:?}");
+        };
+        assert_eq!(draft.start_at, None, "an empty start side leaves it alone");
+        assert!(near(draft.due_at, 60));
+    }
+
+    #[test]
+    fn a_set_code_joined_with_sel_changes_the_highlighted_task_in_one_scan() {
+        let mut app = ready_app(true);
+        open_board(&mut app);
+        for (code, mins) in [("--1SB/P30/SEL--", 30), ("--1SB/M30/SEL--", -30)] {
+            let cmds = inject_all(&mut app, code);
+            let Some(Cmd::Send(ClientMessage { request: Request::UpdateTask { task_id, draft, .. }, .. })) = cmds.first() else {
+                panic!("{code}: {cmds:?}");
+            };
+            assert_eq!(*task_id, TaskId(10), "the highlighted task");
+            let want = chrono::Utc::now() + chrono::TimeDelta::minutes(mins);
+            assert!((draft.start_at.unwrap() - want).num_minutes().abs() <= 1, "{code}");
+            assert!((draft.due_at.unwrap() - want).num_minutes().abs() <= 1, "{code}");
+            assert!(app.control.armed.is_none(), "{code}: one shot");
+        }
     }
 
     #[test]

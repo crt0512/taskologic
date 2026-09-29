@@ -541,7 +541,7 @@ impl TaskForm {
         match field {
             Field::Title => focus.focus(&self.title),
             Field::Description => focus.focus(&self.description),
-            Field::Start => focus.focus(&self.start),
+            Field::Start | Field::StartAndDue => focus.focus(&self.start),
             Field::Due => focus.focus(&self.due),
             Field::RemindStart => {
                 self.remind_start_override.set_checked(true);
@@ -561,6 +561,106 @@ impl TaskForm {
             }
             Field::ExcludeFromStats => focus.focus(&self.title),
         }
+    }
+
+    /// Fill one field straight from control values, no tabbing. Dates and
+    /// reminders count offsets from what the field holds, or from now.
+    pub fn set_field(
+        &mut self,
+        field: taskologic_core::control::Field,
+        values: &[taskologic_core::control::Value],
+        username: &str,
+    ) -> Result<(), String> {
+        use crate::control::{values_date, values_minutes, values_text};
+        use taskologic_core::control::Field;
+        let now = Utc::now();
+        let text = values_text(values, now, self.tz, username);
+        let when_text = |d: Option<DateTime<Utc>>, tz: Tz| {
+            d.map(|d| d.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
+        };
+        match field {
+            Field::Title => self.title.set_text(text),
+            Field::Description => self.description.set_text(&text),
+            Field::Start => {
+                let cur = parse_when(self.start.text().trim(), self.tz, "start").ok().flatten();
+                self.start.set_text(when_text(values_date(values, cur, now, self.tz)?, self.tz));
+            }
+            Field::Due => {
+                let cur = parse_when(self.due.text().trim(), self.tz, "due").ok().flatten();
+                self.due.set_text(when_text(values_date(values, cur, now, self.tz)?, self.tz));
+            }
+            Field::StartAndDue => {
+                let (sv, dv) = crate::control::split_values(values);
+                let start = parse_when(self.start.text().trim(), self.tz, "start").ok().flatten();
+                let due = parse_when(self.due.text().trim(), self.tz, "due").ok().flatten();
+                let start = sv.map_or(Ok(start), |v| values_date(v, start, now, self.tz))?;
+                let due = dv.map_or(Ok(due), |v| values_date(v, due, now, self.tz))?;
+                self.start.set_text(when_text(start, self.tz));
+                self.due.set_text(when_text(due, self.tz));
+            }
+            Field::RemindStart | Field::RemindDue => {
+                let minutes = values_minutes(values)?;
+                let (on, hours) = if field == Field::RemindStart {
+                    (&mut self.remind_start_override, &mut self.remind_start_hours)
+                } else {
+                    (&mut self.remind_override, &mut self.remind_hours)
+                };
+                on.set_checked(minutes.is_some());
+                hours.set_text(minutes.map(reminder_hours_text).unwrap_or_default());
+            }
+            Field::Checklist => {
+                let item = text.trim();
+                if item.is_empty() {
+                    return Err("a checklist item needs text".into());
+                }
+                let old = self.checklist.text();
+                let joined = if old.trim().is_empty() { item.to_string() } else { format!("{}\n{item}", old.trim_end()) };
+                self.checklist.set_text(&joined);
+            }
+            Field::ChecklistItem(n) => {
+                let old = self.checklist.text();
+                let mut lines: Vec<String> = old.lines().map(str::to_string).collect();
+                let line = lines
+                    .get_mut(usize::from(n).saturating_sub(1))
+                    .ok_or_else(|| format!("the form has no checklist item {n}"))?;
+                *line = if let Some(rest) = line.strip_prefix("[x]") {
+                    format!("[ ]{rest}")
+                } else if let Some(rest) = line.strip_prefix("[ ]") {
+                    format!("[x]{rest}")
+                } else {
+                    format!("[x] {line}")
+                };
+                self.checklist.set_text(&lines.join("\n"));
+            }
+            Field::Assign => {
+                let names: Vec<&str> = values
+                    .iter()
+                    .filter_map(|v| match v {
+                        taskologic_core::control::Value::Text(t) => Some(t.as_str()),
+                        taskologic_core::control::Value::Me => Some(username),
+                        _ => None,
+                    })
+                    .collect();
+                let clear = values.iter().any(|v| matches!(v, taskologic_core::control::Value::Clear));
+                if clear {
+                    self.preselect.clear();
+                    for m in &mut self.members {
+                        m.check.set_checked(false);
+                    }
+                }
+                for name in names {
+                    match self.members.iter_mut().find(|m| m.name.eq_ignore_ascii_case(name)) {
+                        Some(m) => {
+                            m.check.set_checked(true);
+                        }
+                        None => return Err(format!("{name} is not a member of this board")),
+                    }
+                }
+            }
+            Field::ExcludeFromStats => return Err("exclude from stats is not on the form".into()),
+        }
+        self.error = None;
+        Ok(())
     }
 
     pub fn set_version(&mut self, version: u64) {

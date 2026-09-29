@@ -178,6 +178,9 @@ pub enum Value {
     Clear,
     /// Free text, last in the frame.
     Text(String),
+    /// Ends the start date's values: what follows is for the due date
+    /// (`SB/P30/U/P60`). Only start and due together look at it.
+    Split,
 }
 
 impl Value {
@@ -190,6 +193,7 @@ impl Value {
             Value::Minus(n, u) => format!("M{n}{}", u.code()),
             Value::Me => "ME".into(),
             Value::Clear => "X".into(),
+            Value::Split => "U".into(),
             Value::Text(t) => format!("{TEXT}{t}"),
         }
     }
@@ -203,6 +207,7 @@ impl Value {
             Value::Minus(n, u) => format!("minus {}", u.label(*n)),
             Value::Me => "my name".into(),
             Value::Clear => "clear".into(),
+            Value::Split => "then the due date".into(),
             Value::Text(t) => format!("\"{t}\""),
         }
     }
@@ -229,6 +234,8 @@ pub enum Field {
     /// Tick the n-th checklist item.
     ChecklistItem(u8),
     ExcludeFromStats,
+    /// Start and due together, the same value applied to each on its own.
+    StartAndDue,
 }
 
 impl Field {
@@ -244,6 +251,7 @@ impl Field {
             Field::Checklist => "C".into(),
             Field::ChecklistItem(n) => format!("C{}", n.clamp(1, 9)),
             Field::ExcludeFromStats => "X".into(),
+            Field::StartAndDue => "B".into(),
         }
     }
 
@@ -258,6 +266,7 @@ impl Field {
             "A" => Some(Field::Assign),
             "C" => Some(Field::Checklist),
             "X" => Some(Field::ExcludeFromStats),
+            "B" => Some(Field::StartAndDue),
             _ => {
                 let mut it = s.chars();
                 match (it.next(), it.next(), it.next()) {
@@ -280,6 +289,7 @@ impl Field {
             Field::Checklist => "checklist item".into(),
             Field::ChecklistItem(n) => format!("checklist item {n}"),
             Field::ExcludeFromStats => "exclude from stats".into(),
+            Field::StartAndDue => "start and due".into(),
         }
     }
 }
@@ -340,10 +350,12 @@ pub enum NamedKey {
     Enter,
     Tab,
     BackTab,
+    /// F1 to F12, printed `XF1` to `XF12`.
+    F(u8),
 }
 
 impl NamedKey {
-    pub const ALL: [NamedKey; 8] = [
+    pub const ALL: [NamedKey; 20] = [
         NamedKey::Up,
         NamedKey::Down,
         NamedKey::Left,
@@ -352,45 +364,62 @@ impl NamedKey {
         NamedKey::Enter,
         NamedKey::Tab,
         NamedKey::BackTab,
+        NamedKey::F(1),
+        NamedKey::F(2),
+        NamedKey::F(3),
+        NamedKey::F(4),
+        NamedKey::F(5),
+        NamedKey::F(6),
+        NamedKey::F(7),
+        NamedKey::F(8),
+        NamedKey::F(9),
+        NamedKey::F(10),
+        NamedKey::F(11),
+        NamedKey::F(12),
     ];
 
-    fn code(self) -> char {
+    fn code(self) -> String {
         match self {
-            NamedKey::Up => 'U',
-            NamedKey::Down => 'D',
-            NamedKey::Left => 'L',
-            NamedKey::Right => 'R',
-            NamedKey::Esc => 'E',
-            NamedKey::Enter => 'N',
-            NamedKey::Tab => 'T',
-            NamedKey::BackTab => 'B',
+            NamedKey::Up => "U".into(),
+            NamedKey::Down => "D".into(),
+            NamedKey::Left => "L".into(),
+            NamedKey::Right => "R".into(),
+            NamedKey::Esc => "E".into(),
+            NamedKey::Enter => "N".into(),
+            NamedKey::Tab => "T".into(),
+            NamedKey::BackTab => "B".into(),
+            NamedKey::F(n) => format!("F{n}"),
         }
     }
 
-    fn from_code(c: char) -> Option<Self> {
+    fn from_code(c: &str) -> Option<Self> {
         match c {
-            'U' => Some(NamedKey::Up),
-            'D' => Some(NamedKey::Down),
-            'L' => Some(NamedKey::Left),
-            'R' => Some(NamedKey::Right),
-            'E' => Some(NamedKey::Esc),
-            'N' => Some(NamedKey::Enter),
-            'T' => Some(NamedKey::Tab),
-            'B' => Some(NamedKey::BackTab),
-            _ => None,
+            "U" => Some(NamedKey::Up),
+            "D" => Some(NamedKey::Down),
+            "L" => Some(NamedKey::Left),
+            "R" => Some(NamedKey::Right),
+            "E" => Some(NamedKey::Esc),
+            "N" => Some(NamedKey::Enter),
+            "T" => Some(NamedKey::Tab),
+            "B" => Some(NamedKey::BackTab),
+            _ => {
+                let n: u8 = c.strip_prefix('F')?.parse().ok()?;
+                (1..=12).contains(&n).then_some(NamedKey::F(n))
+            }
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            NamedKey::Up => "up",
-            NamedKey::Down => "down",
-            NamedKey::Left => "left",
-            NamedKey::Right => "right",
-            NamedKey::Esc => "Esc",
-            NamedKey::Enter => "Enter",
-            NamedKey::Tab => "Tab",
-            NamedKey::BackTab => "Shift+Tab",
+            NamedKey::F(n) => format!("F{n}"),
+            NamedKey::Up => "up".into(),
+            NamedKey::Down => "down".into(),
+            NamedKey::Left => "left".into(),
+            NamedKey::Right => "right".into(),
+            NamedKey::Esc => "Esc".into(),
+            NamedKey::Enter => "Enter".into(),
+            NamedKey::Tab => "Tab".into(),
+            NamedKey::BackTab => "Shift+Tab".into(),
         }
     }
 }
@@ -425,6 +454,8 @@ pub enum Control {
     // Navigation and keys.
     Key(char),
     Named(NamedKey),
+    /// A named key pressed several times, printed `XT3`; not for F keys.
+    NamedTimes(NamedKey, u8),
     Dashboard,
     NextBoard,
     PrevBoard,
@@ -471,6 +502,7 @@ impl Control {
             Sticky => "STK".into(),
             Key(c) => format!("K{c}"),
             Named(k) => format!("X{}", k.code()),
+            NamedTimes(k, n) => format!("X{}{n}", k.code()),
             Dashboard => "GD".into(),
             NextBoard => "GN".into(),
             PrevBoard => "GP".into(),
@@ -513,6 +545,7 @@ impl Control {
             Sticky => "sticky".into(),
             Key(c) => format!("press {c}"),
             Named(k) => format!("press {}", k.label()),
+            NamedTimes(k, n) => format!("press {} {n} times", k.label()),
             Dashboard => "show all boards".into(),
             NextBoard => "next board".into(),
             PrevBoard => "previous board".into(),
@@ -592,6 +625,7 @@ impl Control {
             "TM" => Value(self::Value::Time),
             "ME" => Value(self::Value::Me),
             "X" => Value(self::Value::Clear),
+            "U" => Value(self::Value::Split),
             _ => {
                 let mut chars = t.chars();
                 let first = chars.next().ok_or_else(bad)?;
@@ -606,7 +640,20 @@ impl Control {
                     ('P' | 'M', Some(d)) if d.is_ascii_digit() => parse_offset(t).ok_or_else(bad)?,
                     ('S', Some(_)) if t.len() <= 3 => Set(Field::from_code(&t[1..]).ok_or_else(bad)?),
                     ('S', Some('H')) => Show(Some(id_after("SH")?)),
-                    ('X', Some(c)) if t.len() == 2 => Named(NamedKey::from_code(c).ok_or_else(bad)?),
+                    ('X', Some(_)) if t.len() >= 2 => {
+                        let rest = &t[1..];
+                        match NamedKey::from_code(rest) {
+                            Some(k) => Named(k),
+                            None if rest.is_char_boundary(1) => {
+                                // `T3`: a key letter and how many times.
+                                let (k, n) = rest.split_at(1);
+                                let n: u8 = n.parse().ok().filter(|n| (1..=99).contains(n)).ok_or_else(bad)?;
+                                let k = NamedKey::from_code(k).ok_or_else(bad)?;
+                                NamedTimes(k, n)
+                            }
+                            None => return Err(bad()),
+                        }
+                    }
                     ('G', Some('B')) => ShowBoard(id_after("GB")?),
                     ('G', Some('A')) => Analytics(id_after("GA")?),
                     ('R', Some('P')) => StartProgram(id_after("RP")?),
@@ -767,14 +814,16 @@ pub enum Category {
     Navigation,
     DataEntry,
     Values,
+    Dates,
 }
 
 impl Category {
-    pub const ALL: [Category; 4] = [
+    pub const ALL: [Category; 5] = [
         Category::NextScan,
         Category::Navigation,
         Category::DataEntry,
         Category::Values,
+        Category::Dates,
     ];
 
     pub fn label(self) -> &'static str {
@@ -783,6 +832,7 @@ impl Category {
             Category::Navigation => "Navigation and keys",
             Category::DataEntry => "Data entry",
             Category::Values => "Dates, times and values",
+            Category::Dates => "Start and due dates",
         }
     }
 
@@ -792,6 +842,7 @@ impl Category {
             Category::Navigation => "keys and screens, for a terminal without a keyboard",
             Category::DataEntry => "type into whatever field has the focus",
             Category::Values => "what a waiting command takes: combinable, plus and minus stack",
+            Category::Dates => "scan one, then a task's code: sets its start or due date to now, today or an offset",
         }
     }
 }
@@ -808,6 +859,10 @@ pub enum Asks {
     Key,
     /// Free text.
     Text,
+    /// How many times, for a key pressed repeatedly.
+    Count,
+    /// Two offsets, one for the start date and one for the due date.
+    OffsetPair,
 }
 
 /// One printable line of the menu: a label, the commands, and what has to
@@ -881,6 +936,7 @@ pub fn entries(category: Category) -> Vec<Entry> {
                 Field::Description,
                 Field::Start,
                 Field::Due,
+                Field::StartAndDue,
                 Field::RemindStart,
                 Field::RemindDue,
                 Field::Assign,
@@ -901,6 +957,8 @@ pub fn entries(category: Category) -> Vec<Entry> {
             for k in NamedKey::ALL {
                 v.push(Entry::plain(named_key_entry_label(k), vec![Named(k)]));
             }
+            v.push(Entry::asking("Tab several times", vec![Named(NamedKey::Tab)], Asks::Count));
+            v.push(Entry::asking("Shift+Tab several times", vec![Named(NamedKey::BackTab)], Asks::Count));
             v.push(Entry::asking("Press a key", vec![], Asks::Key));
             v.push(Entry::asking("Search", vec![Search { archive: false }], Asks::Text));
             v.push(Entry::asking("Search, archive included", vec![Search { archive: true }], Asks::Text));
@@ -926,8 +984,55 @@ pub fn entries(category: Category) -> Vec<Entry> {
             Entry::asking("Minus so much", vec![], Asks::Offset),
             Entry::plain("My name", vec![Value(self::Value::Me)]),
             Entry::plain("Clear", vec![Value(self::Value::Clear)]),
+            Entry::plain("Then the due date", vec![Value(self::Value::Split)]),
             Entry::asking("Text", vec![], Asks::Text),
         ],
+        Category::Dates => {
+            let mut v = Vec::new();
+            for f in [Field::Start, Field::Due, Field::StartAndDue] {
+                let (now, today, plus, minus, clear) = if f == Field::StartAndDue {
+                    (
+                        "Set start and due to now",
+                        "Set start and due to today",
+                        "Set start and due, plus so much",
+                        "Set start and due, minus so much",
+                        "Clear start and due",
+                    )
+                } else if f == Field::Start {
+                    (
+                        "Set the start date to now",
+                        "Set the start date to today",
+                        "Set the start date, plus so much",
+                        "Set the start date, minus so much",
+                        "Clear the start date",
+                    )
+                } else {
+                    (
+                        "Set the due date to now",
+                        "Set the due date to today",
+                        "Set the due date, plus so much",
+                        "Set the due date, minus so much",
+                        "Clear the due date",
+                    )
+                };
+                v.push(Entry::armed(now, vec![Set(f), Value(self::Value::Now)]));
+                v.push(Entry::armed(today, vec![Set(f), Value(self::Value::Today)]));
+                v.push(Entry { asks: Asks::Offset, ..Entry::armed(plus, vec![Set(f)]) });
+                v.push(Entry { asks: Asks::Offset, ..Entry::armed(minus, vec![Set(f)]) });
+                if f == Field::StartAndDue {
+                    for (label, base) in [
+                        ("Set start and due, start plus, due plus", vec![Set(f)]),
+                        ("Set start and due, start plus, due minus", vec![Set(f)]),
+                        ("Set start and due, start minus, due plus", vec![Set(f)]),
+                        ("Set start and due, start minus, due minus", vec![Set(f)]),
+                    ] {
+                        v.push(Entry { asks: Asks::OffsetPair, ..Entry::armed(label, base) });
+                    }
+                }
+                v.push(Entry::armed(clear, vec![Set(f), Value(self::Value::Clear)]));
+            }
+            v
+        }
     }
 }
 
@@ -943,11 +1048,16 @@ fn field_entry_label(f: Field) -> &'static str {
         Field::Checklist => "Add a checklist item",
         Field::ChecklistItem(_) => "Tick a checklist item",
         Field::ExcludeFromStats => "Toggle exclude from stats",
+        Field::StartAndDue => "Set start and due dates",
     }
 }
 
 fn named_key_entry_label(k: NamedKey) -> &'static str {
     match k {
+        NamedKey::F(n) => {
+            const NAMES: [&str; 12] = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"];
+            NAMES[usize::from(n.clamp(1, 12) - 1)]
+        }
         NamedKey::Up => "Up",
         NamedKey::Down => "Down",
         NamedKey::Left => "Left",
@@ -974,13 +1084,13 @@ mod tests {
             MoveLeft, MoveRight, MoveUp, MoveDown, MoveTop, MoveBottom,
             MoveTo(None), MoveTo(Some(ColumnRef::Todo)), MoveTo(Some(ColumnRef::Index(3))), MoveTo(Some(ColumnRef::Last)),
             Delete, Print(SlipChoice::Pause), AssignMe, UnassignMe, ToggleAssign,
-            Set(Field::Title), Set(Field::RemindDue), Set(Field::ChecklistItem(4)), Set(Field::ExcludeFromStats),
+            Set(Field::Title), Set(Field::RemindDue), Set(Field::StartAndDue), Set(Field::ChecklistItem(4)), Set(Field::ExcludeFromStats),
             Show(None), Show(Some(id("K4M9Q2"))), Selected, Sticky,
-            Key('T'), Key('n'), Key('?'), Named(NamedKey::BackTab), Dashboard, NextBoard, PrevBoard,
+            Key('T'), Key('n'), Key('?'), Named(NamedKey::BackTab), Named(NamedKey::F(1)), Named(NamedKey::F(12)), NamedTimes(NamedKey::Tab, 3), NamedTimes(NamedKey::BackTab, 12), Dashboard, NextBoard, PrevBoard,
             Search { archive: false }, Search { archive: true }, Ping, Insert, Replace,
             Value(self::Value::Now), Value(self::Value::Today), Value(self::Value::Time),
             Value(self::Value::Plus(2, Unit::Hours)), Value(self::Value::Minus(30, Unit::Minutes)),
-            Value(self::Value::Plus(1, Unit::Months)), Value(self::Value::Me), Value(self::Value::Clear),
+            Value(self::Value::Plus(1, Unit::Months)), Value(self::Value::Split), Value(self::Value::Me), Value(self::Value::Clear),
             ShowBoard(id("000001")), Analytics(id("ABCDEF")), StartProgram(id("K4M9Q2")), StartProgramNow(id("K4M9Q2")),
             NewFromTemplate(id("K4M9Q2"), ColumnRef::Index(1)), NewFromTemplateAsk(id("K4M9Q2"), ColumnRef::Finished),
         ];
