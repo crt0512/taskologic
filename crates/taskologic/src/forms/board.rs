@@ -36,8 +36,10 @@ pub enum BoardOutcome {
     Update(Box<UpdateBoard>),
     OpenMembers,
     OpenColumns,
-    /// Print the board's own control codes.
-    PrintCode,
+    /// Print the code that opens this board.
+    PrintBoardCode,
+    /// Print the code that opens this board's analytics.
+    PrintAnalyticsCode,
 }
 
 enum Mode {
@@ -75,7 +77,8 @@ pub struct BoardForm {
     users: Vec<(Uid, String, CheckboxState)>,
     members_btn: ButtonState,
     columns_btn: ButtonState,
-    code_btn: ButtonState,
+    board_code_btn: ButtonState,
+    analytics_code_btn: ButtonState,
     save: ButtonState,
     cancel: ButtonState,
     pub error: Option<String>,
@@ -108,7 +111,8 @@ impl BoardForm {
             users: Vec::new(),
             members_btn: ButtonState::new(),
             columns_btn: ButtonState::new(),
-            code_btn: ButtonState::new(),
+            board_code_btn: ButtonState::new(),
+            analytics_code_btn: ButtonState::new(),
             save: ButtonState::new(),
             cancel: ButtonState::new(),
             error: None,
@@ -220,7 +224,10 @@ impl BoardForm {
             }
         }
         if self.is_edit() {
-            b.widget(&self.members_btn).widget(&self.columns_btn).widget(&self.code_btn);
+            b.widget(&self.members_btn)
+                .widget(&self.columns_btn)
+                .widget(&self.board_code_btn)
+                .widget(&self.analytics_code_btn);
         }
         b.widget(&self.save).widget(&self.cancel);
         b.build()
@@ -256,8 +263,11 @@ impl BoardForm {
             if self.columns_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
                 return BoardOutcome::OpenColumns;
             }
-            if self.code_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
-                return BoardOutcome::PrintCode;
+            if self.board_code_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
+                return BoardOutcome::PrintBoardCode;
+            }
+            if self.analytics_code_btn.handle(ev, Regular) == ButtonOutcome::Pressed {
+                return BoardOutcome::PrintAnalyticsCode;
             }
         }
         self.name.handle(ev, Regular);
@@ -419,7 +429,7 @@ impl BoardForm {
         };
         let bh = button_h(t);
         let pad = if t.touch { 2 } else { 0 };
-        let height = if edit { 17 + bh } else { 19 + bh + user_rows };
+        let height = if edit { 18 + bh } else { 20 + bh + user_rows };
         let p = popup(area, 76, height);
         f.render_widget(Clear, p);
         let title = if edit {
@@ -449,6 +459,7 @@ impl BoardForm {
             Constraint::Length(1), // archive
             Constraint::Length(1), // retention
             Constraint::Length(1), // cards
+            Constraint::Length(1), // cards, second row
             Constraint::Length(1), // flags
             Constraint::Length(user_rows),
             Constraint::Min(1),
@@ -567,6 +578,10 @@ impl BoardForm {
             cb,
             &mut self.card_deps,
         );
+        // Six boxes are wider than the window; the rest go on a second row.
+        let (_, w) = split_label(rows[i], lw);
+        i += 1;
+        let mut r = Row::new(w);
         let cb = r.take(check_w("description"));
         f.render_stateful_widget(
             checkbox_at("description".into(), cb, t),
@@ -613,8 +628,10 @@ impl BoardForm {
             render_button(f, m, " Members ", &mut self.members_btn, t);
             let c = r.take(super::button_w(" Columns ") + pad);
             render_button(f, c, " Columns ", &mut self.columns_btn, t);
-            let k = r.take(super::button_w(" Print code ") + pad);
-            render_button(f, k, " Print code ", &mut self.code_btn, t);
+            let k = r.take(super::button_w(" Board code ") + pad);
+            render_button(f, k, " Board code ", &mut self.board_code_btn, t);
+            let k = r.take(super::button_w(" Analytics code ") + pad);
+            render_button(f, k, " Analytics code ", &mut self.analytics_code_btn, t);
         } else if self.is_private.checked() {
             label(f, l, "Members", t);
             if self.users.is_empty() {
@@ -695,6 +712,23 @@ impl BoardForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cards_rows_and_the_code_buttons_fit_the_smallest_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let board = taskologic_core::board::test_support::board_with_members(1, &[1]);
+        let mut form = BoardForm::edit(&board, 1);
+        for touch in [false, true] {
+            let theme = crate::ui::theme::Theme::default().with_touch(touch);
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| form.render(f, f.area(), &theme)).unwrap();
+            let out = term.backend().to_string();
+            for word in ["start", "due date", "assignees", "dependencies", "description", "estimate", "Members", "Columns", "Board code", "Analytics code"] {
+                assert!(out.contains(word), "touch {touch}: {word} cut off:\n{out}");
+            }
+        }
+    }
     use taskologic_core::board::test_support::board_with_members;
 
     #[test]

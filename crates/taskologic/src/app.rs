@@ -4045,18 +4045,19 @@ impl App {
             }
             BoardOutcome::OpenMembers => self.open_members(),
             BoardOutcome::OpenColumns => self.open_columns(),
-            BoardOutcome::PrintCode => {
+            BoardOutcome::PrintBoardCode => {
                 let Some(board) = self.board.as_ref().map(|b| b.detail.board.clone()) else {
                     return Vec::new();
                 };
-                let sid = board.short_id;
-                self.print_codes_for(
-                    &format!("Board {}", board.name),
-                    vec![
-                        (format!("show board {}", board.name), Control::ShowBoard(sid)),
-                        (format!("analytics of {}", board.name), Control::Analytics(sid)),
-                    ],
-                )
+                let label = format!("show board {}", board.name);
+                self.print_codes_for(&label, vec![(label.clone(), Control::ShowBoard(board.short_id))])
+            }
+            BoardOutcome::PrintAnalyticsCode => {
+                let Some(board) = self.board.as_ref().map(|b| b.detail.board.clone()) else {
+                    return Vec::new();
+                };
+                let label = format!("analytics of {}", board.name);
+                self.print_codes_for(&label, vec![(label.clone(), Control::Analytics(board.short_id))])
             }
             BoardOutcome::Create(req) => {
                 form.saving = true;
