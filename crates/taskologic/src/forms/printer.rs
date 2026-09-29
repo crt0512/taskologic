@@ -136,13 +136,14 @@ pub fn codepage_label(c: Codepage) -> &'static str {
 pub fn profile_summary(p: Option<&DeviceProfile>) -> String {
     match p {
         Some(p) => format!(
-            "queue {}, {}, {}, {}{}{}",
+            "queue {}, {}, {}, {}{}{}{}",
             p.queue,
             p.output.label(),
             paper_label(p.paper),
             codepage_label(p.codepage),
             if p.auto_cutter { ", cutter" } else { "" },
-            if p.use_raw() { ", raw" } else { "" }
+            if p.use_raw() { ", raw" } else { "" },
+            if p.wide_barcodes { ", wide barcodes" } else { "" }
         ),
         None => "no printer on this client".into(),
     }
@@ -166,6 +167,8 @@ pub struct PrinterForm {
     output: ChoiceState<OutputMode>,
     rotation: ChoiceState<Rotation>,
     raw: CheckboxState,
+    /// 1D barcodes drawn as wide as the paper allows.
+    wide: CheckboxState,
     /// What each kind of slip shows, edited in its own panel.
     slips: SlipSet,
     /// Which of the two the slip panel is editing.
@@ -228,6 +231,8 @@ impl PrinterForm {
         cutter.set_checked(d.auto_cutter);
         let mut raw = CheckboxState::named("raw");
         raw.set_checked(d.raw);
+        let mut wide = CheckboxState::named("wide");
+        wide.set_checked(d.wide_barcodes);
         Self {
             detected: Vec::new(),
             detect_error: None,
@@ -241,6 +246,7 @@ impl PrinterForm {
             output,
             rotation,
             raw,
+            wide,
             slips: d.slips.clone(),
             editing_reminder: false,
             media_mm: None,
@@ -431,8 +437,8 @@ impl PrinterForm {
             // ESC/POS notions. The rest render as notes, with nothing to land
             // on.
             match self.output.value() {
-                OutputMode::Bitmap => b.widget(&self.rotation),
-                OutputMode::EscPos => b.widget(&self.codepage).widget(&self.raw),
+                OutputMode::Bitmap => b.widget(&self.rotation).widget(&self.wide),
+                OutputMode::EscPos => b.widget(&self.codepage).widget(&self.raw).widget(&self.wide),
                 OutputMode::Text => &mut b,
             };
             b.widget(&self.back);
@@ -654,6 +660,7 @@ impl PrinterForm {
         self.rotation.handle(ev, Regular);
         self.codepage.handle(ev, Regular);
         self.raw.handle(ev, Regular);
+        self.wide.handle(ev, Regular);
         if paper_was != (self.paper.value(), self.custom_mm.text().to_string()) {
             self.paper_touched = true;
         }
@@ -720,6 +727,7 @@ impl PrinterForm {
             slips: self.slips.clone(),
             raw: self.raw.checked(),
             native_symbologies: self.symbologies.clone(),
+            wide_barcodes: self.wide.checked(),
         }))
     }
 
@@ -932,7 +940,7 @@ impl PrinterForm {
     fn render_advanced(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
         let bh = button_h(t);
         let pad = if t.touch { 2 } else { 0 };
-        let p = popup(area, 78, 20 + bh);
+        let p = popup(area, 78, 23 + bh);
         f.render_widget(Clear, p);
         let hint = " Tab moves   F2 saves   Esc goes back ";
         let block = frame_block(" Printer setup - advanced ", hint, t);
@@ -955,6 +963,9 @@ impl PrinterForm {
             Constraint::Length(1),
             Constraint::Length(1), // raw
             Constraint::Length(1), // raw explanation
+            Constraint::Length(1),
+            Constraint::Length(1), // barcodes
+            Constraint::Length(1), // barcodes explanation
             Constraint::Length(1),
             Constraint::Length(1),  // error
             Constraint::Length(bh), // back
@@ -1133,11 +1144,40 @@ impl PrinterForm {
             Rect::new(w.x, w.y, w.width, 2),
         );
 
+        let (l, w) = split_label(rows[17], lw);
+        label(f, l, "Barcodes", t);
+        if escpos || bitmap {
+            let mut r = Row::new(w);
+            let cb = r.take(super::check_w("as wide as the paper"));
+            f.render_stateful_widget(
+                checkbox_at("as wide as the paper".into(), cb, t),
+                cb,
+                &mut self.wide,
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new("no barcodes in this mode").style(t.surface_dim()),
+                w,
+            );
+        }
+        let (_, w) = split_label(rows[18], lw);
+        f.render_widget(
+            Paragraph::new(if escpos || bitmap {
+                "the bars of a CODE39 or CODE128 grow to fill the width, which scans from \
+                 further away. Square codes keep their size."
+            } else {
+                "text output has nothing to scan."
+            })
+            .style(t.surface_dim())
+            .wrap(Wrap { trim: true }),
+            Rect::new(w.x, w.y, w.width, 2),
+        );
+
         if let Some(e) = &self.error {
-            let (_, w) = split_label(rows[17], 0);
+            let (_, w) = split_label(rows[20], 0);
             f.render_widget(Paragraph::new(e.clone()).style(t.error()), w);
         }
-        let mut r = Row::new(rows[18]);
+        let mut r = Row::new(rows[21]);
         let bb = r.take(button_w(" Back ") + pad);
         render_button(
             f,
@@ -1347,6 +1387,28 @@ mod tests {
         form.queue.set_value("office_laser".to_string());
         form.set_media("office_laser", Some(216)); // Letter
         assert_eq!(form.paper.value(), PaperKind::Mm80, "an A4 queue does not reshape a receipt slip");
+    }
+
+    #[test]
+    fn wide_barcodes_are_offered_wherever_there_are_barcodes_and_saved() {
+        let mut form = PrinterForm::new(None);
+        form.open_advanced();
+        let names = |f: &PrinterForm| format!("{:?}", f.focus());
+        form.output.set_value(OutputMode::Text);
+        assert!(!names(&form).contains("wide"), "text output has no barcodes: {}", names(&form));
+        for mode in [OutputMode::Bitmap, OutputMode::EscPos] {
+            form.output.set_value(mode);
+            assert!(names(&form).contains("wide"), "{mode:?}: {}", names(&form));
+        }
+        form.queue.set_value("receipt".to_string());
+        assert!(!form.values().unwrap().unwrap().wide_barcodes, "off unless asked");
+        form.wide.set_checked(true);
+        let saved = form.values().unwrap().unwrap();
+        assert!(saved.wide_barcodes);
+        assert!(profile_summary(Some(&saved)).ends_with(", wide barcodes"));
+        // And it comes back when the profile is opened again.
+        let again = PrinterForm::new(Some(&form.values().unwrap().unwrap()));
+        assert!(again.wide.checked());
     }
 
     #[test]

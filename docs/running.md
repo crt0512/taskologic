@@ -140,6 +140,7 @@ codepage = "utf8"            # utf8, cp437, cp850, cp858, wpc1252 (esc_pos only)
 auto_cutter = true
 raw = false                  # true adds `lp -o raw` (esc_pos only)
 native_symbologies = ["code39", "code128"]
+wide_barcodes = false        # true draws CODE39/CODE128 as wide as the paper
 ```
 
 You do not have to write any of this by hand, the client has a setup panel:
@@ -211,6 +212,14 @@ The panel greys out what a mode does not use. Character set and raw are
 ESC/POS notions, so in the other two modes those rows explain themselves
 rather than offering a control that does nothing, and `raw` is ignored
 outright for a bitmap or text job, which exists to be filtered.
+
+Barcodes have one setting of their own, live in both modes that draw them:
+"as wide as the paper" (`wide_barcodes`). Off, a CODE39 or CODE128 is drawn
+at two dots per bar, which is small and quick. On, the bars grow to the
+biggest whole width that still fits the paper, quiet zones included, so the
+code scans from further away and on worse paper; a printer drawing its own
+codes is asked for the same, within the six dots its command allows. Square
+codes keep their size either way, they would take the whole slip otherwise.
 
 ### Raw, and why an ESC/POS printer might print nothing
 

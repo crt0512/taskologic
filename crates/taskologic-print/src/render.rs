@@ -96,13 +96,21 @@ fn barcode(p: &mut EscPos, bc: &Barcode, profile: &DeviceProfile) -> Result<(), 
         }
         _ => None,
     };
+    // Encoded either way: the module count is what sizes a wide barcode.
+    let m = symbology::encode(bc.symbology, &bc.payload)?;
     match native {
         Some(kind) => {
-            p.native_barcode(kind, &bc.payload, BAR_HEIGHT_DOTS as u8, BAR_MODULE_DOTS as u8);
+            // Printers take 2 to 6 dots per module for their own codes, and
+            // draw their own quiet zones, about ten modules each side.
+            let width = profile.bar_module_dots(m.width, 10, BAR_MODULE_DOTS, 6);
+            p.native_barcode(kind, &bc.payload, BAR_HEIGHT_DOTS as u8, width as u8);
         }
         None => {
-            let m = symbology::encode(bc.symbology, &bc.payload)?;
-            let scale = if m.is_1d() { BAR_MODULE_DOTS } else { MATRIX_MODULE_DOTS };
+            let scale = if m.is_1d() {
+                profile.bar_module_dots(m.width, 2, BAR_MODULE_DOTS, usize::MAX)
+            } else {
+                MATRIX_MODULE_DOTS
+            };
             let img = m.scaled(scale, BAR_HEIGHT_DOTS, 2).centered_in(profile.paper.dots());
             let (bpr, rows) = img.packed_rows(profile.paper.dots());
             p.raster(bpr, &rows);
@@ -215,6 +223,50 @@ mod tests {
             "title missing or wrongly encoded"
         );
         assert!(count(&bytes, b"K\x81che") == 1);
+    }
+
+    #[test]
+    fn wide_barcodes_fill_the_paper_native_and_rasterised() {
+        let plain = show_everything(escpos());
+        let wide = DeviceProfile { wide_barcodes: true, ..plain.clone() };
+        // The printer's own command takes the module width right after GS w.
+        let module_width = |bytes: &[u8]| {
+            bytes
+                .windows(3)
+                .find(|w| w[0] == 0x1D && w[1] == b'w')
+                .map(|w| w[2])
+                .expect("a GS w")
+        };
+        let narrow = render(&job(true, Symbology::Code39), &plain).unwrap();
+        assert_eq!(module_width(&narrow), 2);
+        let n = module_width(&render(&job(true, Symbology::Code39), &wide).unwrap());
+        assert!((3..=6).contains(&n), "wider, within what the command takes: {n}");
+
+        // Rasterised, the first image (GS v 0 m xL xH yL yH, then the rows)
+        // carries more black, the text around it being the same.
+        let raster_ink = |bytes: &[u8]| {
+            let at = bytes
+                .windows(3)
+                .position(|w| w == [0x1D, b'v', b'0'])
+                .expect("a raster");
+            let h = &bytes[at + 4..at + 8];
+            let (bpr, rows) = (h[0] as usize + 256 * h[1] as usize, h[2] as usize + 256 * h[3] as usize);
+            bytes[at + 8..at + 8 + bpr * rows].iter().map(|b| b.count_ones()).sum::<u32>()
+        };
+        let rasterised = |p: &DeviceProfile, s| {
+            let p = DeviceProfile { native_symbologies: vec![], ..p.clone() };
+            render(&job(true, s), &p).unwrap()
+        };
+        let (narrow, wider) = (
+            raster_ink(&rasterised(&plain, Symbology::Code39)),
+            raster_ink(&rasterised(&wide, Symbology::Code39)),
+        );
+        assert!(wider > narrow, "the bars got wider: {narrow} -> {wider}");
+        // A square code is left alone: it would take the whole slip.
+        assert_eq!(
+            raster_ink(&rasterised(&wide, Symbology::Qr)),
+            raster_ink(&rasterised(&plain, Symbology::Qr))
+        );
     }
 
     #[test]

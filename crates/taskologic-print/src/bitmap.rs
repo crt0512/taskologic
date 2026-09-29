@@ -179,7 +179,11 @@ pub fn render(ops: &[Op], profile: &DeviceProfile) -> Result<Vec<u8>, RenderErro
                     scale: 1,
                 });
                 let m = symbology::encode(code.symbology, &code.payload)?;
-                let scale = if m.is_1d() { BAR_MODULE_DOTS } else { MATRIX_MODULE_DOTS };
+                let scale = if m.is_1d() {
+                    profile.bar_module_dots(m.width, 2, BAR_MODULE_DOTS, usize::MAX)
+                } else {
+                    MATRIX_MODULE_DOTS
+                };
                 let img = m.scaled(scale, BAR_HEIGHT_DOTS, 2).centered_in(width);
                 let (_, rows) = img.packed_rows(width);
                 c.feed(BARCODE_MARGIN);

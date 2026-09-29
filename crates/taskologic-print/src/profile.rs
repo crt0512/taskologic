@@ -277,6 +277,12 @@ pub struct DeviceProfile {
     /// Anything else is rasterised. DataMatrix is never native, standard
     /// ESC/POS has no command for it.
     pub native_symbologies: Vec<Symbology>,
+    /// Draw 1D barcodes as wide as the paper allows instead of at a fixed
+    /// bar width: the biggest whole number of dots per module that still
+    /// fits, quiet zones included. Wider bars scan from further away and on
+    /// worse paper. Square codes keep their size, they would take the whole
+    /// slip otherwise.
+    pub wide_barcodes: bool,
 }
 
 impl Default for DeviceProfile {
@@ -291,6 +297,7 @@ impl Default for DeviceProfile {
             raw: false,
             slips: SlipSet::default(),
             native_symbologies: vec![Symbology::Code39, Symbology::Code128],
+            wide_barcodes: false,
         }
     }
 }
@@ -299,6 +306,19 @@ impl DeviceProfile {
     /// Dots across, which depends on the mode as well as the paper.
     pub fn dots(&self) -> usize {
         self.output.dots(self.paper)
+    }
+
+    /// Dots per module for a 1D code of `modules` bars and spaces with
+    /// `quiet` modules of white either side: `fixed` unless the profile asks
+    /// for wide barcodes, then as many as fill the paper. Never below one,
+    /// and never more than `max`, which is what the printer's own barcode
+    /// command takes.
+    pub fn bar_module_dots(&self, modules: usize, quiet: usize, fixed: usize, max: usize) -> usize {
+        if !self.wide_barcodes {
+            return fixed;
+        }
+        let across = modules + 2 * quiet;
+        (self.dots() / across.max(1)).clamp(1, max)
     }
 
     /// Characters per line, which depends on the mode as well as the paper.
@@ -321,6 +341,19 @@ impl DeviceProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wide_barcode_takes_the_biggest_module_that_fits() {
+        let p = DeviceProfile { output: OutputMode::EscPos, paper: PaperWidth::Mm80, ..Default::default() };
+        assert_eq!(p.bar_module_dots(100, 2, 2, usize::MAX), 2, "off: the fixed width");
+        let wide = DeviceProfile { wide_barcodes: true, ..p };
+        // 576 dots across, 104 modules with the quiet zones: five each.
+        assert_eq!(wide.bar_module_dots(100, 2, 2, usize::MAX), 5);
+        // A short code would take thirteen, the printer's command stops at six.
+        assert_eq!(wide.bar_module_dots(40, 2, 2, 6), 6);
+        // A code too long for the paper still gets a module, one dot wide.
+        assert_eq!(wide.bar_module_dots(1_000, 2, 2, 6), 1);
+    }
 
     #[test]
     fn presets_keep_their_established_geometry() {
