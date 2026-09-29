@@ -13,11 +13,8 @@ use taskologic_core::ids::{BoardId, RunId, Uid};
 use taskologic_core::task::Task;
 use taskologic_proto::RunEntry;
 
-use super::{ListArrows, button_bar, button_h, frame_block, list_arrow_tap, list_arrows, popup};
-use crate::ui::adapter::{
-    ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, ListState, Outcome,
-    Regular, list, render_button,
-};
+use super::{ListArrows, RowClicks, button_bar, button_h, frame_block, list_arrow_tap, list_double_click, list_with_arrows, popup};
+use crate::ui::adapter::{ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, ListState, Outcome, Regular, render_button};
 use crate::ui::theme::Theme;
 
 #[derive(Debug, PartialEq)]
@@ -37,6 +34,8 @@ pub struct RunsPanel {
     list: ListState,
     /// The scroll arrows drawn last, for taps.
     arrows: ListArrows,
+    /// Click timing per row, for double clicks.
+    clicks: RowClicks,
     view_btn: ButtonState,
     keep_btn: ButtonState,
     delete_btn: ButtonState,
@@ -55,6 +54,7 @@ impl RunsPanel {
             entries: Vec::new(),
             list,
             arrows: ListArrows::default(),
+            clicks: RowClicks::default(),
             view_btn: ButtonState::new(),
             keep_btn: ButtonState::new(),
             delete_btn: ButtonState::new(),
@@ -100,6 +100,11 @@ impl RunsPanel {
     pub fn handle(&mut self, ev: &Event) -> RunsOutcome {
         if list_arrow_tap(ev, self.arrows, &mut self.list) {
             return RunsOutcome::Changed;
+        }
+        if let Some(row) = list_double_click(ev, &mut self.clicks, &self.list) {
+            self.list.select(Some(row));
+            self.list.focus().set(true);
+            return self.handle(&Event::Key(crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)));
         }
         let key = match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => Some(k.code),
@@ -193,8 +198,7 @@ impl RunsPanel {
                 .map(|e| ListItem::new(self.line(e)))
                 .collect()
         };
-        f.render_stateful_widget(list(items, t), l, &mut self.list);
-        self.arrows = list_arrows(f, l, &self.list, t);
+        self.arrows = list_with_arrows(f, l, items, &mut self.list, t);
         f.render_widget(
             Paragraph::new("cancelling stops the run; finished tasks always stay on the board")
                 .style(t.surface_dim()),

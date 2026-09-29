@@ -429,7 +429,7 @@ impl BoardForm {
         };
         let bh = button_h(t);
         let pad = if t.touch { 2 } else { 0 };
-        let height = if edit { 18 + bh } else { 20 + bh + user_rows };
+        let height = if edit { 19 + bh } else { 20 + bh + user_rows };
         let p = popup(area, 76, height);
         f.render_widget(Clear, p);
         let title = if edit {
@@ -462,6 +462,7 @@ impl BoardForm {
             Constraint::Length(1), // cards, second row
             Constraint::Length(1), // flags
             Constraint::Length(user_rows),
+            Constraint::Length(if edit { 1 } else { 0 }), // board id, once it has one
             Constraint::Min(1),
             Constraint::Length(bh),
         ]);
@@ -659,6 +660,17 @@ impl BoardForm {
                 w,
             );
         }
+        // The id the two codes above name, to read out or type into a code.
+        let (l, w) = split_label(rows[i], lw);
+        i += 1;
+        if let Mode::Edit(board) = &self.mode {
+            label(f, l, "Board id", t);
+            f.render_widget(
+                Paragraph::new(format!("{}   what the board's codes name it by", board.short_id))
+                    .style(t.surface_dim()),
+                w,
+            );
+        }
 
         let err_row = rows[i];
         i += 1;
@@ -724,7 +736,7 @@ mod tests {
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
             term.draw(|f| form.render(f, f.area(), &theme)).unwrap();
             let out = term.backend().to_string();
-            for word in ["start", "due date", "assignees", "dependencies", "description", "estimate", "Members", "Columns", "Board code", "Analytics code"] {
+            for word in ["start", "due date", "assignees", "dependencies", "description", "estimate", "Members", "Columns", "Board code", "Analytics code", "Board id"] {
                 assert!(out.contains(word), "touch {touch}: {word} cut off:\n{out}");
             }
         }

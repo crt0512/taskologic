@@ -121,8 +121,13 @@ where
     V: Into<ratatui::text::Line<'a>>,
 {
     let base = t.hover_if(t.field(), area);
+    // The list opens tall enough for every entry, so nothing has to be
+    // scrolled to; a dropdown here never has more than a dozen.
+    let items: Vec<(T, V)> = items.into_iter().collect();
+    let len = items.len().clamp(1, 12) as u16;
     Choice::new()
         .items(items)
+        .popup_len(len)
         .style(base)
         .button_style(base)
         .focus_style(t.field_focus())

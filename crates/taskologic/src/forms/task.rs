@@ -113,6 +113,8 @@ struct Member {
 
 pub struct TaskForm {
     pub mode: FormMode,
+    /// The template's short id while editing one, shown in the title.
+    template_short_id: Option<taskologic_core::ids::ShortId>,
     tz: Tz,
     /// The task being edited, excluded from its own dependency picker.
     self_task: Option<TaskId>,
@@ -242,6 +244,7 @@ impl TaskForm {
         title.focus().set(true);
         Self {
             mode,
+            template_short_id: None,
             tz,
             self_task: None,
             preselect: Vec::new(),
@@ -356,6 +359,7 @@ impl TaskForm {
             },
             tz,
         );
+        f.template_short_id = Some(tpl.short_id);
         f.apply_draft(&tpl.draft);
         f.preselect_templates = tpl.options.dep_templates.clone();
         if let Some(p) = tpl.options.start_prefill {
@@ -1102,18 +1106,20 @@ impl TaskForm {
         let bh = button_h(t);
         let p = popup(area, 78, 32 + bh);
         f.render_widget(Clear, p);
-        let title = match self.mode {
-            FormMode::Create { .. } => " New task ",
-            FormMode::Edit { .. } => " Edit task ",
-            FormMode::TemplateNew { .. } => " New template ",
-            FormMode::TemplateEdit { .. } => " Edit template ",
+        let title = match (&self.mode, self.template_short_id) {
+            (FormMode::Create { .. }, _) => " New task ".to_string(),
+            (FormMode::Edit { .. }, _) => " Edit task ".to_string(),
+            (FormMode::TemplateNew { .. }, _) => " New template ".to_string(),
+            // The id its codes name it by, read off the title.
+            (FormMode::TemplateEdit { .. }, Some(id)) => format!(" Edit template {id} "),
+            (FormMode::TemplateEdit { .. }, None) => " Edit template ".to_string(),
         };
         let hint = if self.saving {
             " saving... "
         } else {
             " Tab moves   F2 saves   Esc cancels "
         };
-        let block = frame_block(title, hint, t);
+        let block = frame_block(&title, hint, t);
         let inner = block.inner(p);
         f.render_widget(block, p);
 

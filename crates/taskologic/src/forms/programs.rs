@@ -10,11 +10,8 @@ use ratatui::widgets::{Clear, ListItem, Paragraph};
 use taskologic_core::ids::{BoardId, Uid};
 use taskologic_core::program::Program;
 
-use super::{ListArrows, button_bar, button_h, clicked_outside, frame_block, list_arrow_tap, list_arrows, popup, tall_item};
-use crate::ui::adapter::{
-    ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, ListState, Outcome,
-    Regular, list, render_button,
-};
+use super::{ListArrows, RowClicks, button_bar, button_h, clicked_outside, frame_block, list_arrow_tap, list_double_click, list_with_arrows, popup, tall_item};
+use crate::ui::adapter::{ButtonOutcome, ButtonState, Focus, FocusBuilder, HandleEvent, HasFocus, ListState, Outcome, Regular, render_button};
 use crate::ui::theme::Theme;
 
 #[derive(Debug, PartialEq)]
@@ -37,6 +34,8 @@ pub struct ProgramsPanel {
     area: Rect,
     /// The scroll arrows drawn last, for taps.
     arrows: ListArrows,
+    /// Click timing per row, for double clicks.
+    clicks: RowClicks,
     privileged: bool,
     programs: Vec<(Program, String)>,
     list: ListState,
@@ -57,6 +56,7 @@ impl ProgramsPanel {
         Self {
             area: Rect::default(),
             arrows: ListArrows::default(),
+            clicks: RowClicks::default(),
             board_id,
             me,
             privileged,
@@ -129,6 +129,11 @@ impl ProgramsPanel {
         };
         if list_arrow_tap(ev, self.arrows, &mut self.list) {
             return ProgramsOutcome::Changed;
+        }
+        if let Some(row) = list_double_click(ev, &mut self.clicks, &self.list) {
+            self.list.select(Some(row));
+            self.list.focus().set(true);
+            return self.handle(&Event::Key(crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)));
         }
         if matches!(key, Some(KeyCode::Esc | KeyCode::Char('q'))) || clicked_outside(ev, self.area) {
             return ProgramsOutcome::Cancel;
@@ -224,8 +229,7 @@ impl ProgramsPanel {
                 })
                 .collect()
         };
-        f.render_stateful_widget(list(items, t), l, &mut self.list);
-        self.arrows = list_arrows(f, l, &self.list, t);
+        self.arrows = list_with_arrows(f, l, items, &mut self.list, t);
         f.render_widget(
             Paragraph::new("a program is a chain of tasks; starting one makes its root task")
                 .style(t.surface_dim()),
@@ -234,7 +238,7 @@ impl ProgramsPanel {
         if let Some(e) = &self.error {
             f.render_widget(Paragraph::new(e.clone()).style(t.error()), err);
         }
-        let labels = [" Start ", " New ", " Edit ", " Runs ", " Code ", " Delete ", " Close "];
+        let labels = [" Start ", " New ", " Edit ", " Runs ", " Print ", " Delete ", " Close "];
         let rects = button_bar(buttons, &labels, t);
         let states = [
             &mut self.start_btn,

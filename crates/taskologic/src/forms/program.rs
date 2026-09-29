@@ -7,7 +7,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Clear, ListItem, Paragraph};
-use taskologic_core::ids::{BoardId, ProgramId};
+use taskologic_core::ids::{BoardId, ProgramId, ShortId};
 use taskologic_core::template::DEFAULT_MIN_SAMPLES;
 use taskologic_core::program::{
     Program, ProgramDraft, ROOT_KEY, Step, start_rule_summary, triggers_summary,
@@ -34,6 +34,8 @@ pub struct ProgramForm {
     pub board_id: BoardId,
     /// None while creating.
     pub program_id: Option<ProgramId>,
+    /// The program's short id, once it has been saved.
+    short_id: Option<ShortId>,
     name: TextInputState,
     description: TextInputState,
     /// Finished tasks of a step before the board shows its estimate.
@@ -61,6 +63,7 @@ impl ProgramForm {
         Self {
             board_id,
             program_id,
+            short_id: None,
             name,
             description: TextInputState::named("description"),
             min_samples: {
@@ -97,6 +100,7 @@ impl ProgramForm {
 
     pub fn edit(program: &Program) -> Self {
         let mut f = Self::blank(program.board_id, Some(program.id), program.steps.clone());
+        f.short_id = Some(program.short_id);
         f.name.set_text(program.name.clone());
         f.description.set_text(program.description.clone());
         f.min_samples.set_text(program.min_samples.to_string());
@@ -310,17 +314,18 @@ impl ProgramForm {
             area.height.saturating_sub(top + 3),
         );
         f.render_widget(Clear, p);
-        let title = if self.program_id.is_some() {
-            " Edit program "
-        } else {
-            " New program "
+        // The id its codes name it by rides in the title once it has one.
+        let title = match (self.program_id, self.short_id) {
+            (Some(_), Some(id)) => format!(" Edit program {id} "),
+            (Some(_), None) => " Edit program ".to_string(),
+            (None, _) => " New program ".to_string(),
         };
         let hint = if self.saving {
             " saving... "
         } else {
             " Enter edits a step   n adds one   F2 saves   Esc cancels "
         };
-        let block = frame_block(title, hint, t);
+        let block = frame_block(&title, hint, t);
         let inner = block.inner(p);
         f.render_widget(block, p);
         let [name_row, desc_row, est_row, heading, steps, step_buttons, err, buttons] = Layout::vertical([

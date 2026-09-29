@@ -165,23 +165,52 @@ fn default_palette(full: bool) -> Palette {
     }
 }
 
-fn dark_palette(full: bool) -> Palette {
+/// The one thing the dark themes differ in: the colour of borders, titles
+/// and the selected row.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Accent {
+    Blue,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+}
+
+impl Accent {
+    /// The accent in the 256 colour palette and in the basic sixteen, and
+    /// the text colour that reads on it as a selection background.
+    fn colors(self) -> (Color, Color, Color, Color) {
+        match self {
+            Accent::Blue => (Color::Indexed(45), Color::Cyan, Color::Indexed(16), Color::Black),
+            Accent::Red => (Color::Indexed(203), Color::Red, Color::Indexed(231), Color::White),
+            Accent::Orange => (Color::Indexed(214), Color::Yellow, Color::Indexed(16), Color::Black),
+            Accent::Yellow => (Color::Indexed(227), Color::LightYellow, Color::Indexed(16), Color::Black),
+            Accent::Green => (Color::Indexed(114), Color::Green, Color::Indexed(16), Color::Black),
+        }
+    }
+}
+
+/// Dark surfaces with the accent in the borders, titles and selections. The
+/// desktop behind everything is true black; dialogs and cards sit on greys
+/// above it.
+fn dark_palette(full: bool, accent: Accent) -> Palette {
     let c = |f: Color, a: Color| Some(if full { f } else { a });
+    let (accent_full, accent_ansi, on_full, on_ansi) = accent.colors();
     Palette {
-        screen_bg: c(Color::Indexed(233), Color::Black),
+        screen_bg: c(Color::Indexed(16), Color::Black),
         screen_fg: c(Color::Indexed(253), Color::White),
-        bar_bg: c(Color::Indexed(238), Color::DarkGray),
+        bar_bg: c(Color::Indexed(236), Color::DarkGray),
         bar_fg: c(Color::Indexed(231), Color::White),
-        surface_bg: c(Color::Indexed(235), Color::Black),
+        surface_bg: c(Color::Indexed(234), Color::Black),
         surface_fg: c(Color::Indexed(253), Color::White),
         surface_muted: c(Color::Indexed(245), Color::Gray),
-        card_bg: c(Color::Indexed(238), Color::Black),
+        card_bg: c(Color::Indexed(236), Color::Black),
         card_fg: c(Color::Indexed(253), Color::White),
         card_muted: c(Color::Indexed(245), Color::Gray),
-        accent: c(Color::Indexed(45), Color::Cyan),
-        select_bg: c(Color::Indexed(45), Color::Cyan),
-        select_fg: c(Color::Indexed(16), Color::Black),
-        button_bg: c(Color::Indexed(240), Color::Gray),
+        accent: c(accent_full, accent_ansi),
+        select_bg: c(accent_full, accent_ansi),
+        select_fg: c(on_full, on_ansi),
+        button_bg: c(Color::Indexed(237), Color::Gray),
         button_fg: c(Color::Indexed(231), Color::White),
         warn: c(Color::Indexed(214), Color::Yellow),
         danger: c(Color::Indexed(203), Color::Red),
@@ -189,9 +218,11 @@ fn dark_palette(full: bool) -> Palette {
     }
 }
 
-/// Custom colours, with the default theme filling in anything unparseable.
+/// Custom colours, with the dark blue theme filling in anything
+/// unparseable: the fields start out as that theme, so a custom theme is
+/// dark blue with whatever was changed.
 fn custom_palette(c: &CustomColors, full: bool) -> Palette {
-    let base = default_palette(full);
+    let base = dark_palette(full, Accent::Blue);
     let p = |s: &str, fallback: Option<Color>| parse_color(s).map(Some).unwrap_or(fallback);
     let screen = p(&c.screen, base.screen_bg);
     let surface = p(&c.surface, base.surface_bg);
@@ -248,7 +279,11 @@ impl Theme {
         let palette = match (mode, preset) {
             (ColorMode::Mono, _) => MONO,
             (m, ThemePreset::Default) => default_palette(m == ColorMode::Full),
-            (m, ThemePreset::Dark) => dark_palette(m == ColorMode::Full),
+            (m, ThemePreset::DarkBlue) => dark_palette(m == ColorMode::Full, Accent::Blue),
+            (m, ThemePreset::DarkRed) => dark_palette(m == ColorMode::Full, Accent::Red),
+            (m, ThemePreset::DarkOrange) => dark_palette(m == ColorMode::Full, Accent::Orange),
+            (m, ThemePreset::DarkYellow) => dark_palette(m == ColorMode::Full, Accent::Yellow),
+            (m, ThemePreset::DarkGreen) => dark_palette(m == ColorMode::Full, Accent::Green),
             (m, ThemePreset::Custom) => custom_palette(custom, m == ColorMode::Full),
         };
         Theme {
@@ -551,7 +586,14 @@ mod tests {
 
     #[test]
     fn sixteen_colour_mode_stays_in_the_basic_palette() {
-        for preset in [ThemePreset::Default, ThemePreset::Dark] {
+        for preset in [
+            ThemePreset::Default,
+            ThemePreset::DarkBlue,
+            ThemePreset::DarkRed,
+            ThemePreset::DarkOrange,
+            ThemePreset::DarkYellow,
+            ThemePreset::DarkGreen,
+        ] {
             let t = Theme::preset(preset, &CustomColors::default(), ColorMode::Ansi16, false);
             for s in styles(&t) {
                 for c in [s.fg, s.bg].into_iter().flatten() {
@@ -586,15 +628,42 @@ mod tests {
         );
         assert_ne!(t.card().bg, t.surface().bg);
         assert_ne!(t.card().bg, t.screen().bg);
-        // The dark theme is the other way round.
+        // The dark themes are the other way round.
         let d = Theme::preset(
-            ThemePreset::Dark,
+            ThemePreset::DarkBlue,
             &CustomColors::default(),
             ColorMode::Ansi16,
             false,
         );
         assert_eq!(d.surface().fg, Some(Color::White));
         assert_ne!(d.screen().bg, t.screen().bg);
+    }
+
+    #[test]
+    fn the_dark_themes_differ_in_their_accent_and_nothing_else() {
+        let blue = Theme::preset(ThemePreset::DarkBlue, &CustomColors::default(), ColorMode::Full, false).palette;
+        for (preset, accent) in [
+            (ThemePreset::DarkRed, Color::Indexed(203)),
+            (ThemePreset::DarkOrange, Color::Indexed(214)),
+            (ThemePreset::DarkYellow, Color::Indexed(227)),
+            (ThemePreset::DarkGreen, Color::Indexed(114)),
+        ] {
+            let p = Theme::preset(preset, &CustomColors::default(), ColorMode::Full, false).palette;
+            assert_eq!(p.accent, Some(accent), "{preset:?}");
+            assert_eq!(p.select_bg, Some(accent), "{preset:?}");
+            assert_eq!(p.screen_bg, blue.screen_bg, "{preset:?}");
+            assert_eq!(p.surface_bg, blue.surface_bg, "{preset:?}");
+            assert_eq!(p.card_bg, blue.card_bg, "{preset:?}");
+            assert_eq!(p.button_bg, blue.button_bg, "{preset:?}");
+        }
+        // A custom theme nobody has touched is dark blue.
+        let custom = Theme::preset(ThemePreset::Custom, &CustomColors::default(), ColorMode::Full, false).palette;
+        assert_eq!(custom.screen_bg, blue.screen_bg);
+        assert_eq!(custom.accent, blue.accent);
+        assert_eq!(custom.select_fg, blue.select_fg);
+        // And the old name for dark blue still loads from saved preferences.
+        assert_eq!(serde_json::from_str::<ThemePreset>("\"dark\"").unwrap(), ThemePreset::DarkBlue);
+        assert_eq!(serde_json::to_string(&ThemePreset::DarkBlue).unwrap(), "\"dark_blue\"");
     }
 
     #[test]
@@ -617,8 +686,8 @@ mod tests {
         let t = Theme::preset(ThemePreset::Custom, &custom, ColorMode::Ansi16, false);
         assert_eq!(
             t.surface().bg,
-            Some(Color::White),
-            "fell back to the default"
+            Some(Color::Black),
+            "fell back to dark blue"
         );
         assert_eq!(
             t.surface_title().fg,

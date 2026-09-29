@@ -1,6 +1,6 @@
 //! The custom colour editor. Twelve fields, each a colour name, a `#rrggbb`
-//! value or a palette index. Anything that does not parse falls back to the
-//! default theme, and the field says so.
+//! value or a palette index. The fields start as the dark blue theme, and
+//! anything that does not parse falls back to it, which the field says.
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::Frame;

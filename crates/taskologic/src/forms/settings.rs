@@ -52,9 +52,13 @@ const FORMAT_ITEMS: [(Symbology, &str); 4] = [
     (Symbology::Qr, "QR"),
     (Symbology::DataMatrix, "DataMatrix"),
 ];
-const THEME_ITEMS: [(ThemePreset, &str); 3] = [
+const THEME_ITEMS: [(ThemePreset, &str); 7] = [
     (ThemePreset::Default, "default"),
-    (ThemePreset::Dark, "dark"),
+    (ThemePreset::DarkBlue, "dark blue"),
+    (ThemePreset::DarkRed, "dark red"),
+    (ThemePreset::DarkOrange, "dark orange"),
+    (ThemePreset::DarkYellow, "dark yellow"),
+    (ThemePreset::DarkGreen, "dark green"),
     (ThemePreset::Custom, "custom"),
 ];
 
@@ -396,7 +400,7 @@ impl SettingsForm {
         let (l, w) = split_label(rows[0], lw);
         label(f, l, "Theme", t);
         let mut r = Row::new(w);
-        let theme_area = r.take(13);
+        let theme_area = r.take(15);
         let (theme_w, theme_popup) = dropdown(THEME_ITEMS, theme_area, t);
         f.render_stateful_widget(theme_w, theme_area, &mut self.theme);
         dropdown_marker(f, &self.theme, t);

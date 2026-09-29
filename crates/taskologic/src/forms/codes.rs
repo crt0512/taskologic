@@ -5,13 +5,13 @@
 //! a small popup; Combine appends a value to a command; sticky prints an
 //! override that stays armed.
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Clear, ListItem, Paragraph, Wrap};
 use taskologic_core::control::{self, Asks, Category, ColumnRef, Control, Entry, Unit, Value};
 
-use super::{ListArrows, Row, button_bar, button_h, check_w, clicked_outside, frame_block, label, list_arrow_tap, list_arrows, popup, split_label, tall_item};
+use super::{ListArrows, Row, RowClicks, button_bar, button_h, check_w, clicked_outside, frame_block, label, list_arrow_tap, list_double_click, list_with_arrows, popup, split_label, tall_item};
 use crate::ui::adapter::{checkbox_at, dropdown, dropdown_marker, dropdown_popup_hover};
 use crate::ui::adapter::{
     ButtonOutcome, ButtonState, CheckboxState, ChoiceState, Focus, FocusBuilder, HandleEvent,
@@ -91,6 +91,8 @@ pub struct CodesPanel {
     area: Rect,
     /// The scroll arrows drawn last, for taps.
     arrows: ListArrows,
+    /// Click timing per row, for double clicks.
+    clicks: RowClicks,
     /// Print overrides so they stay armed until Esc.
     sticky: CheckboxState,
     print_btn: ButtonState,
@@ -119,6 +121,7 @@ impl CodesPanel {
             list,
             area: Rect::default(),
             arrows: ListArrows::default(),
+            clicks: RowClicks::default(),
             sticky: CheckboxState::named("sticky"),
             print_btn: ButtonState::new(),
             all_btn: ButtonState::new(),
@@ -128,22 +131,6 @@ impl CodesPanel {
             open_btn: ButtonState::new(),
             error: None,
         }
-    }
-
-    /// A click on the row that is already selected: what a double click
-    /// amounts to when the first click did the selecting. Rows are three
-    /// tall with bigger buttons on, and the list knows where each one is.
-    fn clicked_selected(&self, ev: &Event) -> bool {
-        let Event::Mouse(m) = ev else { return false };
-        if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return false;
-        }
-        let pos = ratatui::layout::Position::new(m.column, m.row);
-        self.list
-            .row_areas
-            .iter()
-            .position(|r| r.contains(pos))
-            .is_some_and(|i| self.list.selected() == Some(i))
     }
 
     /// The category whose entries are listed, if any.
@@ -314,6 +301,10 @@ impl CodesPanel {
         if list_arrow_tap(ev, self.arrows, &mut self.list) {
             return CodesOutcome::Changed;
         }
+        if let Some(row) = list_double_click(ev, &mut self.clicks, &self.list) {
+            self.list.select(Some(row));
+            return self.open_selected();
+        }
         // An ask has its own keys: Enter answers, Esc goes back.
         if let View::Ask { from, ask } = &mut self.view {
             let from = *from;
@@ -374,9 +365,6 @@ impl CodesPanel {
         if enter {
             return self.open_selected();
         }
-        if self.clicked_selected(ev) {
-            return self.open_selected();
-        }
         let combine = self.combine_btn.handle(ev, Regular) == ButtonOutcome::Pressed
             || key == Some(KeyCode::Char('c'));
         if combine && let View::Entries(cat) = self.view {
@@ -390,6 +378,7 @@ impl CodesPanel {
                         sticky_ok: e.sticky,
                     };
                     self.list.select(Some(0));
+                    self.list.set_offset(0);
                     self.error = None;
                 }
                 Some(_) => self.error = Some("combine a finished code; this one asks first".into()),
@@ -431,6 +420,7 @@ impl CodesPanel {
                 if let Some(cat) = self.list.selected().and_then(|i| Category::ALL.get(i)) {
                     self.view = View::Entries(*cat);
                     self.list.select(Some(0));
+                    self.list.set_offset(0);
                     self.error = None;
                 }
                 CodesOutcome::Changed
@@ -468,15 +458,19 @@ impl CodesPanel {
         match &self.view {
             View::Categories => CodesOutcome::Cancel,
             View::Entries(cat) => {
+                // The entries were scrolled; the short list above starts
+                // at the top again.
                 let at = Category::ALL.iter().position(|c| c == cat).unwrap_or(0);
                 self.view = View::Categories;
                 self.list.select(Some(at));
+                self.list.set_offset(0);
                 self.error = None;
                 CodesOutcome::Changed
             }
             View::Combine { from, .. } | View::Ask { from, .. } => {
                 self.view = View::Entries(*from);
                 self.list.focus().set(true);
+                self.list.set_offset(0);
                 self.error = None;
                 CodesOutcome::Changed
             }
@@ -494,7 +488,7 @@ impl CodesPanel {
             View::Ask { ask, .. } => format!(" {} ", ask.label),
         };
         let hint = match &self.view {
-            View::Categories => " Enter or Open opens a category, a click on the selected one too   Esc closes ",
+            View::Categories => " Enter, Open or a double click opens a category   Esc closes ",
             View::Entries(_) => " Enter prints   a prints all   c combines   s sticky   Esc goes back ",
             View::Combine { .. } => " Enter picks the value   Esc goes back ",
             View::Ask { .. } => " Enter prints   Esc goes back ",
@@ -588,8 +582,7 @@ impl CodesPanel {
                         })
                         .collect(),
                 };
-                f.render_stateful_widget(list(items, t), l, &mut self.list);
-                self.arrows = list_arrows(f, l, &self.list, t);
+                self.arrows = list_with_arrows(f, l, items, &mut self.list, t);
             }
         }
         if let Some(e) = &self.error {
@@ -654,7 +647,7 @@ impl CodesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -744,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_the_selected_row_opens_it_and_the_buttons_do_enter() {
+    fn a_double_click_on_a_row_opens_it_and_a_single_one_only_selects() {
         use crossterm::event::{KeyModifiers, MouseEvent};
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -752,28 +745,33 @@ mod tests {
         let theme = crate::ui::theme::Theme::default().with_touch(true);
         let mut term = Terminal::new(TestBackend::new(100, 44)).unwrap();
         term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
-        // The first category is selected; a click on its row opens it.
-        let row = p.list.row_areas[0];
-        let click = |x, y| {
+        let press = |kind, x, y| {
             Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
+                kind,
                 column: x,
                 row: y,
                 modifiers: KeyModifiers::NONE,
             })
         };
-        assert_eq!(p.handle(&click(row.x + 2, row.y + 1)), CodesOutcome::Changed);
-        assert_eq!(p.category(), Some(Category::NextScan), "opened by the click");
-        // Inside, a click on a row that is not selected only selects it.
-        term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
-        let second = p.list.row_areas[1];
-        let out = p.handle(&click(second.x + 2, second.y + 1));
-        assert_eq!(out, CodesOutcome::Changed);
+        // One click (down and up) on the second category selects it and
+        // nothing more.
+        let row = p.list.row_areas[1];
+        let (x, y) = (row.x + 2, row.y + 1);
+        assert_eq!(p.handle(&press(MouseEventKind::Down(MouseButton::Left), x, y)), CodesOutcome::Changed);
+        assert_eq!(p.handle(&press(MouseEventKind::Up(MouseButton::Left), x, y)), CodesOutcome::Changed);
         assert_eq!(p.list.selected(), Some(1));
-        // And a click on it now prints it.
-        term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
-        let second = p.list.row_areas[1];
-        assert!(matches!(p.handle(&click(second.x + 2, second.y + 1)), CodesOutcome::Print { .. }));
+        assert_eq!(p.category(), None, "a single click does not open");
+        // A quick second click on another row is a click on that row, not a
+        // double click: it selects and does nothing more.
+        let other = p.list.row_areas[2];
+        p.handle(&press(MouseEventKind::Down(MouseButton::Left), other.x + 2, other.y + 1));
+        p.handle(&press(MouseEventKind::Up(MouseButton::Left), other.x + 2, other.y + 1));
+        assert_eq!(p.list.selected(), Some(2));
+        assert_eq!(p.category(), None, "two rows, two clicks");
+        // The same row again right away makes the double click: it opens.
+        p.handle(&press(MouseEventKind::Down(MouseButton::Left), other.x + 2, other.y + 1));
+        assert_eq!(p.handle(&press(MouseEventKind::Up(MouseButton::Left), other.x + 2, other.y + 1)), CodesOutcome::Changed);
+        assert_eq!(p.category(), Some(Category::DataEntry));
     }
 
     #[test]
@@ -785,9 +783,17 @@ mod tests {
         p.handle(&key(KeyCode::Enter)); // next scanned task: thirty odd entries
         let theme = crate::ui::theme::Theme::default().with_touch(true);
         let mut term = Terminal::new(TestBackend::new(100, 44)).unwrap();
-        term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        // The controls follow the list by one frame: draw, then draw again.
+        for _ in 0..2 {
+            term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        }
         assert!(p.arrows.up.is_none(), "at the top");
         let down = p.arrows.down.expect("more below");
+        assert_eq!(down.height, 1, "one row, as drawn");
+        assert!(down.width > 60, "the full width of the box: {down:?}");
+        // The list box ends above the error row and the three-row buttons,
+        // inside the frame: the bar is flush with its bottom edge.
+        assert_eq!(down.bottom(), p.area.bottom() - 1 - 1 - 3, "the bar sits at the bottom of the box: {down:?} in {:?}", p.area);
         let tap = |r: Rect| {
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -799,9 +805,23 @@ mod tests {
         assert_eq!(p.handle(&tap(down)), CodesOutcome::Changed);
         let after = p.list.selected().unwrap();
         assert!(after > 0, "a page down: {after}");
-        term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        for _ in 0..2 {
+            term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        }
         assert!(p.list.offset() > 0, "and the list scrolled with it");
         let up = p.arrows.up.expect("now something is above");
+        assert_eq!(up.height, 1);
+        // Back to the categories: the short list starts at the top, not
+        // scrolled to where the long one was.
+        p.handle(&key(KeyCode::Esc));
+        assert_eq!(p.list.offset(), 0);
+        assert_eq!(p.list.selected(), Some(0));
+        p.handle(&key(KeyCode::Enter));
+        for _ in 0..2 {
+            term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        }
+        // Flush with the top of the box, under the frame and the two note rows.
+        assert_eq!(up.y, p.area.y + 1 + 2, "the bar sits at the top of the box: {up:?} in {:?}", p.area);
         p.handle(&tap(up));
         assert!(p.list.selected().unwrap() < after);
     }

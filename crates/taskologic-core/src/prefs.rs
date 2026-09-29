@@ -13,20 +13,40 @@ pub enum ThemePreset {
     /// Blue desktop, light dialogs, red titles.
     #[default]
     Default,
-    /// Dark surfaces, cyan accents.
-    Dark,
-    /// Whatever the user put in [`CustomColors`].
+    /// Dark surfaces, blue accents. Was called `dark`, which still loads.
+    #[serde(alias = "dark")]
+    DarkBlue,
+    /// The same dark surfaces with red accents.
+    DarkRed,
+    /// With orange accents.
+    DarkOrange,
+    /// With yellow accents.
+    DarkYellow,
+    /// With green accents.
+    DarkGreen,
+    /// Whatever the user put in [`CustomColors`], dark blue to start with.
     Custom,
 }
 
 impl ThemePreset {
-    pub const ALL: [ThemePreset; 3] =
-        [ThemePreset::Default, ThemePreset::Dark, ThemePreset::Custom];
+    pub const ALL: [ThemePreset; 7] = [
+        ThemePreset::Default,
+        ThemePreset::DarkBlue,
+        ThemePreset::DarkRed,
+        ThemePreset::DarkOrange,
+        ThemePreset::DarkYellow,
+        ThemePreset::DarkGreen,
+        ThemePreset::Custom,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             ThemePreset::Default => "default",
-            ThemePreset::Dark => "dark",
+            ThemePreset::DarkBlue => "dark blue",
+            ThemePreset::DarkRed => "dark red",
+            ThemePreset::DarkOrange => "dark orange",
+            ThemePreset::DarkYellow => "dark yellow",
+            ThemePreset::DarkGreen => "dark green",
             ThemePreset::Custom => "custom",
         }
     }
@@ -61,20 +81,23 @@ pub struct CustomColors {
 }
 
 impl Default for CustomColors {
+    /// The dark blue theme, as palette indexes, so a custom theme starts
+    /// from something that looks finished and one field at a time can be
+    /// moved off it.
     fn default() -> Self {
         Self {
-            screen: "blue".into(),
-            bar: "lightblue".into(),
-            surface: "white".into(),
-            card: "gray".into(),
-            text: "black".into(),
-            muted: "darkgray".into(),
-            accent: "red".into(),
-            select: "red".into(),
-            button: "gray".into(),
-            warn: "yellow".into(),
-            danger: "red".into(),
-            ok: "green".into(),
+            screen: "16".into(),
+            bar: "236".into(),
+            surface: "234".into(),
+            card: "236".into(),
+            text: "253".into(),
+            muted: "245".into(),
+            accent: "45".into(),
+            select: "45".into(),
+            button: "237".into(),
+            warn: "214".into(),
+            danger: "203".into(),
+            ok: "114".into(),
         }
     }
 }
