@@ -141,12 +141,12 @@ fn section(out: &mut Vec<Op>, row: &SlipRow, job: &PrintJob, cols: usize) {
         }
         SlipSection::StartDate => {
             if let Some(start) = job.start_at {
-                out.push(row.line(format!("Start: {}", local(start, job))));
+                dated(out, row, "Start", start, job, cols);
             }
         }
         SlipSection::DueDate => {
             if let Some(due) = job.due_at {
-                out.push(row.line(format!("Due: {}", local(due, job))));
+                dated(out, row, "Due", due, job, cols);
             }
         }
         SlipSection::Creator => {
@@ -235,6 +235,31 @@ fn barcodes(out: &mut Vec<Op>, job: &PrintJob, finishing: bool) {
             code: code.clone(),
             label,
         });
+    }
+}
+
+/// "Due: 2027-01-15 09:00" on one line while it fits at the row's size. Set
+/// large it needs twice the columns, which a 58 mm printer and an 80 mm
+/// bitmap one do not have, and the end of the line was simply cut off. Then
+/// the time goes on a line of its own ("At: 09:00") and neither line is bold; a paper too
+/// narrow even for the date drops to body size.
+fn dated(out: &mut Vec<Op>, row: &SlipRow, label: &str, when: DateTime<Utc>, job: &PrintJob, cols: usize) {
+    let stamp = local(when, job);
+    let whole = format!("{label}: {stamp}");
+    if whole.chars().count() <= row.columns(cols) {
+        out.push(row.line(whole));
+        return;
+    }
+    let (date, time) = stamp.split_once(' ').unwrap_or((stamp.as_str(), ""));
+    let mut plain = row.clone();
+    plain.bold = false;
+    let first = format!("{label}: {date}");
+    if first.chars().count() > plain.columns(cols) {
+        plain.large = false;
+    }
+    out.push(plain.line(first));
+    if !time.is_empty() {
+        out.push(plain.line(format!("At: {time}")));
     }
 }
 
@@ -408,6 +433,65 @@ mod tests {
         assert!(before.last().unwrap().starts_with("2027-"), "{before:?}");
         assert!(after.first().unwrap().starts_with("2027-"), "{after:?}");
         assert_eq!(before.len(), after.len(), "the same things, in a different order");
+    }
+
+    #[test]
+    fn a_due_date_too_wide_for_large_type_puts_the_time_on_its_own_line() {
+        let due_lines = |cols: usize, bold: bool| {
+            let mut l = SlipLayout::task();
+            for r in &mut l.rows {
+                if r.section == SlipSection::DueDate {
+                    r.bold = bold;
+                }
+            }
+            let ops = plan(&job(PrintJobKind::Task), cols, &l);
+            let at = ops
+                .iter()
+                .position(|o| matches!(o, Op::Line(t) if t.text.starts_with("Due:")))
+                .expect("a due line");
+            let Op::Line(first) = ops[at].clone() else { unreachable!() };
+            let next = match &ops[at + 1] {
+                Op::Line(t) => Some(t.clone()),
+                _ => None,
+            };
+            (first, next)
+        };
+        // 48 columns at double size holds all 21 characters: one line, as ever.
+        let (one, next) = due_lines(48, false);
+        assert!(one.text.len() > "Due: 2027-01-15".len() && one.scale == 2, "{one:?}");
+        assert!(next.is_none_or(|n| !n.text.contains(':') || n.text.starts_with("Depends")), "nothing split off");
+        // 35 (80 mm bitmap) and 32 (58 mm): the date, then the time by itself,
+        // still large and not bold even when the row asked for bold.
+        for cols in [35, 32] {
+            let (date, time) = due_lines(cols, true);
+            assert!(date.text.starts_with("Due: 2027-01-") && date.text.len() == 15, "{cols}: {date:?}");
+            assert!(!date.bold && date.scale == 2 && date.align == Align::Center, "{cols}: {date:?}");
+            let time = time.expect("the time on a new line");
+            assert!(time.text.starts_with("At: ") && time.text.len() == 9, "{cols}: {time:?}");
+            assert!(time.text.contains(':') && !time.bold && time.scale == 2 && time.align == Align::Center, "{cols}: {time:?}");
+        }
+        // Too narrow even for the date at double size: body size.
+        let (date, time) = due_lines(20, false);
+        assert_eq!(date.scale, 1, "{date:?}");
+        assert_eq!(time.unwrap().scale, 1);
+    }
+
+    #[test]
+    fn the_start_date_splits_the_same_way() {
+        let mut l = SlipLayout::task();
+        for r in &mut l.rows {
+            if r.section == SlipSection::StartDate {
+                r.enabled = true;
+                r.large = true;
+            }
+        }
+        let mut j = job(PrintJobKind::Task);
+        j.start_at = j.due_at;
+        let lines = texts(&plan(&j, 32, &l));
+        let at = lines.iter().position(|t| t.starts_with("Start:")).expect("a start line");
+        assert_eq!(lines[at].len(), "Start: 2027-01-15".len(), "{lines:?}");
+        assert_eq!(lines[at + 1].len(), "At: 09:00".len(), "the time by itself: {lines:?}");
+        assert!(lines[at + 1].starts_with("At: "), "{lines:?}");
     }
 
     #[test]
